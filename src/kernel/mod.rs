@@ -13,7 +13,6 @@ use crate::vm::eval;
 use crate::vm::value::Value;
 use crate::vm::value::Function;
 use serde::{Deserialize, Serialize};
-use event_log::EventLog;
 use std::sync::{OnceLock, Mutex};
 
 /// Kernel pointer wrapper that is Send+Sync (single-threaded REPL usage).
@@ -634,6 +633,33 @@ impl Kernel {
     }
 }
 
+
+
+/// Macro: define a native function with compile-time arity checking.
+macro_rules! define_native_typed {
+    ($k:expr, $name:expr, 0, $func:expr) => {
+        $k.define_native($name, 0, |args| {
+            if !args.is_empty() { return Err(format!("{}: expected 0 args got {}", $name, args.len())); }
+            ($func)()
+        });
+    };
+    ($k:expr, $name:expr, 1, $func:expr) => {
+        $k.define_native($name, 1, |args| {
+            if args.len() != 1 { return Err(format!("{}: expected 1 arg got {}", $name, args.len())); }
+            ($func)(args.into_iter().next().unwrap())
+        });
+    };
+    ($k:expr, $name:expr, 2, $func:expr) => {
+        $k.define_native($name, 2, |args| {
+            if args.len() != 2 { return Err(format!("{}: expected 2 args got {}", $name, args.len())); }
+            let mut iter = args.into_iter();
+            ($func)(iter.next().unwrap(), iter.next().unwrap())
+        });
+    };
+    ($k:expr, $name:expr, v, $func:expr) => {
+        $k.define_native($name, 0, $func);
+    };
+}
 fn kind_name(kind: &SnapshotKind) -> &str {
     match kind {
         SnapshotKind::Full => "full",

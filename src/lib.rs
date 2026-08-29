@@ -1,5 +1,6 @@
 #[macro_use]
 pub mod vm;
+#[macro_use]
 pub mod kernel;
 
 pub use vm::{

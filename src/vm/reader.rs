@@ -198,34 +198,26 @@ fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
 
 fn read_string(input: &str) -> Result<(Value, &str), ReadError> {
     let mut s = String::new();
-    let mut i = 0;
-    let bytes = input.as_bytes();
-    loop {
-        if i >= bytes.len() {
-            return Err(ReadError::UnexpectedEof("unterminated string".into()));
-        }
-        if bytes[i] == b'"' {
+    let mut chars = input.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '"' {
             return Ok((Value::String(s), &input[i+1..]));
         }
-        if bytes[i] == b'\\' {
-            i += 1;
-            if i >= bytes.len() {
-                return Err(ReadError::UnexpectedEof("unterminated string escape".into()));
+        if ch == '\\' {
+            match chars.next() {
+                None => return Err(ReadError::UnexpectedEof("unterminated string escape".into())),
+                Some((_, 'n')) => s.push('\n'),
+                Some((_, 't')) => s.push('\t'),
+                Some((_, 'r')) => s.push('\r'),
+                Some((_, '"')) => s.push('"'),
+                Some((_, '\\')) => s.push('\\'),
+                Some((_, c)) => { s.push('\\'); s.push(c); }
             }
-            match bytes[i] {
-                b'n' => s.push('\n'),
-                b't' => s.push('\t'),
-                b'r' => s.push('\r'),
-                b'"' => s.push('"'),
-                b'\\' => s.push('\\'),
-                c => { s.push('\\'); s.push(c as char); }
-            }
-            i += 1;
         } else {
-            s.push(bytes[i] as char);
-            i += 1;
+            s.push(ch);
         }
     }
+    Err(ReadError::UnexpectedEof("unterminated string".into()))
 }
 
 fn read_atom(input: &str) -> Result<(Value, &str), ReadError> {
@@ -253,18 +245,14 @@ fn read_atom(input: &str) -> Result<(Value, &str), ReadError> {
 
 fn read_raw_symbol<'a>(input: &'a str) -> Result<(String, &'a str), ReadError> {
     let mut s = String::new();
-    let mut idx = 0;
-    let bytes = input.as_bytes();
-    while idx < bytes.len() {
-        let ch = bytes[idx] as char;
+    for (i, ch) in input.char_indices() {
         if ch.is_ascii_whitespace() || "()[]{}'\";,`#".contains(ch) {
-            break;
+            return Ok((s, &input[i..]));
         }
         s.push(ch);
-        idx += 1;
     }
     if s.is_empty() {
         return Err(ReadError::UnexpectedEof("expected a symbol or number".into()));
     }
-    Ok((s, &input[idx..]))
+    Ok((s, ""))
 }

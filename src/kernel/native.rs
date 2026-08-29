@@ -3,6 +3,31 @@ use crate::vm::value::Value;
 use crate::kernel::Kernel;
 use std::collections::HashMap;
 
+/// Helper: make an HTTP POST request and return the JSON response.
+fn http_post(url: &str, api_key: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .header("HTTP-Referer", "http://localhost:5173")
+        .header("X-Title", "Persistent-Agent-Lisp-Harness")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("HTTP request error: {}", e))?;
+
+    let status = resp.status();
+    let json: serde_json::Value = resp.json()
+        .map_err(|e| format!("HTTP parse error: {}", e))?;
+
+    if !status.is_success() {
+        let json_str = json.to_string();
+        let msg = json["error"]["message"].as_str().unwrap_or(&json_str);
+        return Err(format!("HTTP error ({}): {}", status, msg));
+    }
+    Ok(json)
+}
+
 impl Kernel {
     pub fn register_tools(&mut self) {
 
@@ -263,53 +288,31 @@ impl Kernel {
         });
     
 
-        self.define_native("web/search", 1, |args| {
+                self.define_native("web/search", 1, |args| {
             let query = match &args[0] {
                 Value::String(s) => s.clone(),
                 other => return Err(format!("web/search: expected string, got {}", other)),
             };
-
-            // Try Serper API if key is set
             if let Ok(api_key) = std::env::var("SERPER_API_KEY") {
-                let client = reqwest::blocking::Client::new();
                 let body = serde_json::json!({"q": query});
-                match client
-                    .post("https://google.serper.dev/search")
-                    .header("X-API-KEY", &api_key)
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send()
-                {
-                    Ok(resp) => {
-                        match resp.json::<serde_json::Value>() {
-                            Ok(json) => {
-                                // Extract organic results
-                                let results = json["organic"].as_array()
-                                    .map(|arr| {
-                                        arr.iter().map(|item| {
-                                            let title = item["title"].as_str().unwrap_or("");
-                                            let link = item["link"].as_str().unwrap_or("");
-                                            let snippet = item["snippet"].as_str().unwrap_or("");
-                                            Value::string(&format!("{} - {}: {}", title, link, snippet))
-                                        }).collect::<Vec<Value>>()
-                                    })
-                                    .unwrap_or_default();
-                                return Ok(Value::List(results));
-                            }
-                            Err(e) => return Err(format!("web/search: parse error: {}", e)),
-                        }
+                match http_post("https://google.serper.dev/search", &api_key, body) {
+                    Ok(json) => {
+                        let results = json["organic"].as_array().map(|arr| {
+                            arr.iter().map(|item| {
+                                let t = item["title"].as_str().unwrap_or("");
+                                let l = item["link"].as_str().unwrap_or("");
+                                let s = item["snippet"].as_str().unwrap_or("");
+                                Value::string(&format!("{} - {}: {}", t, l, s))
+                            }).collect()
+                        }).unwrap_or_default();
+                        Ok(Value::List(results))
                     }
-                    Err(e) => return Err(format!("web/search: request error: {}", e)),
+                    Err(e) => Err(format!("web/search: {}", e)),
                 }
+            } else {
+                Ok(Value::list(vec![Value::string("no results (set SERPER_API_KEY)")]))
             }
-
-            // Fallback: return placeholder
-            Ok(Value::list(vec![
-                Value::string(&format!("no results for: {} (set SERPER_API_KEY)", query)),
-            ]))
-        });
-
-        self.define_native("fs/read", 1, |args| {
+        }); self.define_native("fs/read", 1, |args| {
             let path = match &args[0] {
                 Value::String(s) => s.clone(),
                 other => return Err(format!("fs/read: expected string, got {}", other)),

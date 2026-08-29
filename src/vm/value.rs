@@ -114,7 +114,16 @@ pub enum Macro {
         literals: Vec<String>,
         rules: Vec<(Vec<Value>, Value)>,
         env_serialized: String,
-    },
+    },}
+
+impl fmt::Display for Macro {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Macro::Native { name, .. } => write!(f, "#<macro {}>", name),
+            Macro::SyntaxRules { .. } => write!(f, "#<macro>"),
+        }
+    }
+
 }
 
 impl Serialize for Macro {
@@ -205,7 +214,6 @@ pub enum Value {
         fields: Vec<Value>,
     },
     KernelRef(KernelRef),
-    Opaque(String),
 }
 
 impl fmt::Display for Value {
@@ -251,7 +259,7 @@ impl fmt::Display for Value {
             },
             Value::Tagged { family, variant, .. } => write!(f, "({}/{} ...)", family, variant),
             Value::KernelRef(kr) => write!(f, "#<{} {}>", kr.kind, kr.id),
-            Value::Opaque(s) => write!(f, "#<opaque {}>", s),
+
         }
     }
 }
@@ -270,6 +278,22 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Function(a), Value::Function(b)) => {
+                // Compare function name and arity, not function pointers
+                use std::fmt::Write;
+                let mut sa = String::new(); let _ = write!(sa, "{}", a);
+                let mut sb = String::new(); let _ = write!(sb, "{}", b);
+                sa == sb
+            }
+            (Value::Macro(a), Value::Macro(b)) => {
+                use std::fmt::Write;
+                let mut sa = String::new(); let _ = write!(sa, "{}", a);
+                let mut sb = String::new(); let _ = write!(sb, "{}", b);
+                sa == sb
+            }
+            (Value::Tagged { family: fa, variant: va, fields: fia },
+             Value::Tagged { family: fb, variant: vb, fields: fib }) => fa == fb && va == vb && fia == fib,
+            (Value::KernelRef(a), Value::KernelRef(b)) => a.kind == b.kind && a.id == b.id,
             _ => false,
         }
     }
@@ -294,7 +318,10 @@ impl std::hash::Hash for Value {
                     v.hash(state);
                 }
             }
-            _ => 255u8.hash(state),
+            Value::Function(f) => (10u8, format!("{}", f)).hash(state),
+            Value::Macro(m) => (11u8, format!("{}", m)).hash(state),
+            Value::Tagged { family, variant, fields } => (12u8, family, variant, fields).hash(state),
+            Value::KernelRef(kr) => (13u8, &kr.kind, &kr.id).hash(state),
         }
     }
 }
