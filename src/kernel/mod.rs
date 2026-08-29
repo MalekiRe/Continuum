@@ -2,7 +2,9 @@
 pub mod snapshot;
 pub mod native;
 pub mod scheduler;
+pub use scheduler::{Scheduler, ReviewDecision};
 pub mod event_log;
+pub use event_log::EventKind;
 pub mod compaction;
 pub mod model;
 
@@ -11,7 +13,7 @@ use crate::vm::eval;
 use crate::vm::value::Value;
 use crate::vm::value::Function;
 use serde::{Deserialize, Serialize};
-use event_log::{EventLog, EventKind};
+use event_log::EventLog;
 use std::sync::{OnceLock, Mutex};
 
 /// Kernel pointer wrapper that is Send+Sync (single-threaded REPL usage).
@@ -295,7 +297,7 @@ impl Kernel {
     }
 
     /// Record an event in the append-only log.
-    fn record_event(&mut self, kind: EventKind, frame_id: Option<String>) -> u64 {
+    pub fn record_event(&mut self, kind: EventKind, frame_id: Option<String>) -> u64 {
         self.event_counter += 1;
         let id = self.event_counter;
 
@@ -319,7 +321,7 @@ impl Kernel {
         id
     }
 
-    fn current_frame_id(&self) -> Option<String> {
+    pub fn current_frame_id(&self) -> Option<String> {
         self.frames.last().map(|f| f.id.clone())
     }
 
@@ -419,6 +421,24 @@ impl Kernel {
     }
 
     /// Perform a snapshot.
+    /// Check if an hourly full snapshot is due, and take one if so.
+    pub fn check_hourly_snapshot(&mut self) {
+        if let Some(ref last) = self.storage.last_full_snapshot {
+            if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last) {
+                let last_utc = last_time.with_timezone(&chrono::Utc);
+                let elapsed = (chrono::Utc::now() - last_utc).num_hours();
+                if elapsed >= self.storage.full_snapshot_interval_hours as i64 {
+                    self.snapshot(SnapshotKind::Full);
+                    self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
+                }
+            }
+        } else {
+            // First full snapshot
+            self.snapshot(SnapshotKind::Full);
+            self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
+        }
+    }
+
     pub fn snapshot(&mut self, kind: SnapshotKind) -> Snapshot {
         let timestamp = chrono::Utc::now().to_rfc3339();
         let id = format!("snap-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
@@ -531,7 +551,23 @@ impl Kernel {
         // Re-register native function pointers (they can't survive serialization)
         kernel.register_natives();
 
-        println!("[kernel] recovered from {} (natives re-registered)", latest_path.display());
+        // Queue (system/Restarted) event for every active frame
+        let downtime = chrono::Utc::now().to_rfc3339();
+        for frame in &mut kernel.frames {
+            let restarted = Value::Tagged {
+                family: "system".into(),
+                variant: "Restarted".into(),
+                fields: vec![
+                    Value::keyword("unclean"),
+                    Value::string(&downtime),
+                ],
+            };
+            frame.message_queue.push(format!("(system/Restarted :kind :unclean :downtime {:?})", downtime));
+            frame.pending_message = Some(format!("{}", restarted));
+        }
+
+        println!("[kernel] recovered from {} (natives re-registered, {} frames notified)", 
+            latest_path.display(), kernel.frames.len());
         Ok(kernel)
     }
 
@@ -796,7 +832,7 @@ impl Kernel {
             name: qualified_name.to_string(),
             arity,
             func,
-            authority: vec![],
+            
         });
         self.env.force_define(qualified_name, val);
     }
@@ -818,6 +854,69 @@ impl Kernel {
         }
         results.sort();
         results
+    }
+
+    /// Build context for the model: agent stack + messages + recent events + summaries.
+    pub fn build_context(&self, frame_idx: usize) -> String {
+        let mut parts = Vec::new();
+
+        // Agent stack
+        parts.push("=== Agent Stack ===".to_string());
+        for (i, frame) in self.frames.iter().enumerate() {
+            let depth = "  ".repeat(i);
+            let status = match frame.status {
+                FrameStatus::Running => "running",
+                FrameStatus::Waiting => "waiting",
+                FrameStatus::Suspended => "suspended",
+                FrameStatus::Cancelled => "cancelled",
+                FrameStatus::Completed => "completed",
+            };
+            parts.push(format!("{}frame {}: {} ({})", depth, frame.name, frame.id, status));
+        }
+
+        // Human messages
+        if let Some(frame) = self.frames.get(frame_idx) {
+            if !frame.message_queue.is_empty() {
+                parts.push("
+=== Messages ===".to_string());
+                for msg in &frame.message_queue {
+                    parts.push(format!("  {}", msg));
+                }
+            }
+        }
+
+        // Recent events from event log
+        parts.push("
+=== Recent Events ===".to_string());
+        if let Ok(events) = std::fs::read_to_string(&self.event_log_path) {
+            let lines: Vec<&str> = events.lines().rev().take(10).collect();
+            for line in lines.iter().rev() {
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                    let kind = &event["kind"];
+                    let id = event["id"].as_u64().unwrap_or(0);
+                    let summary = match kind {
+                        serde_json::Value::Object(m) => {
+                            m.keys().next().cloned().unwrap_or("unknown".to_string())
+                        }
+                        _ => "unknown".to_string(),
+                    };
+                    parts.push(format!("  event {}: {}", id, summary));
+                }
+            }
+        } else {
+            parts.push("  (no event log)".to_string());
+        }
+
+        // Compaction summaries
+        if self.compaction.summary_count() > 0 {
+            parts.push("
+=== Compaction Summaries ===".to_string());
+            // Summaries are not easily accessible from Kernel (they're in CompactionManager)
+            parts.push(format!("  {} summaries available", self.compaction.summary_count()));
+        }
+
+        parts.join("
+")
     }
 
     /// Get the current frame's pending human message, if any.

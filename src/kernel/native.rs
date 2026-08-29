@@ -105,6 +105,37 @@ impl Kernel {
             }
         });
 
+        // proc/pid — returns an opaque kernel reference to the current process
+        self.define_native("proc/pid", 0, |_args| {
+            Ok(Value::KernelRef(crate::vm::value::KernelRef {
+                kind: "process".into(),
+                id: format!("{}", std::process::id()),
+                metadata: std::collections::HashMap::new(),
+            }))
+        });
+
+        // fs/open — returns an opaque kernel reference to an open file
+        self.define_native("fs/open", 1, |args| {
+            let path = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("fs/open: expected string, got {}", other)),
+            };
+            match std::fs::File::open(&path) {
+                Ok(_file) => {
+                    // Use a UUID-based reference since we can't store the File handle
+                    let id = uuid::Uuid::new_v4().to_string();
+                    Ok(Value::KernelRef(crate::vm::value::KernelRef {
+                        kind: "file".into(),
+                        id,
+                        metadata: std::collections::HashMap::from([
+                            ("path".to_string(), path),
+                        ]),
+                    }))
+                }
+                Err(e) => Err(format!("fs/open: {}", e)),
+            }
+        });
+
         self.define_native("message/reply", 1, |args| {
             let text = match &args[0] {
                 Value::String(s) => s.clone(),
@@ -226,7 +257,7 @@ impl Kernel {
             Err(msg)
         });
 
-        // inspect/find — semantic search across all bindings
+        // inspect/find — semantic search returning compact summaries first
         self.define_native("inspect/find", 1, |args| {
             let query = match &args[0] {
                 Value::String(s) => s.clone(),
@@ -235,8 +266,26 @@ impl Kernel {
 
             crate::kernel::with_kernel(|k| {
                 let results = k.find_bindings(&query);
+                // Return compact summaries: just the qualified names
                 let items: Vec<Value> = results.iter().map(|r| Value::string(r)).collect();
                 Ok(Value::List(items))
+            })
+        });
+
+        // inspect/describe — full details for a specific binding
+        self.define_native("inspect/describe", 1, |args| {
+            let name = match &args[0] {
+                Value::Symbol(s) => s.clone(),
+                other => return Err(format!("inspect/describe: expected symbol, got {}", other)),
+            };
+
+            let name_clone = name.clone();
+            crate::kernel::with_kernel(|k| {
+                let qualified = if name_clone.contains('/') { name_clone.clone() } else { format!("user/{}", name_clone) };
+                match k.env.lookup(&qualified) {
+                    Some(val) => Ok(Value::string(&format!("{}", val))),
+                    None => Err(format!("no binding for {}", name_clone)),
+                }
             })
         });
 
@@ -254,6 +303,93 @@ impl Kernel {
                     None => Err(format!("no binding for {}", name)),
                 }
             })
+        });
+
+        // history/read — read a specific event by ID
+        self.define_native("history/read", 1, |args| {
+            let event_id = match &args[0] {
+                Value::Int(id) => *id as u64,
+                other => return Err(format!("history/read: expected integer, got {}", other)),
+            };
+
+            // Read from event log file
+            let log_path = "data/event.log";
+            match std::fs::read_to_string(log_path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                            if event["id"].as_u64() == Some(event_id) {
+                                return Ok(Value::string(&serde_json::to_string_pretty(&event).unwrap_or_default()));
+                            }
+                        }
+                    }
+                    Ok(Value::string(&format!("no event with id {}", event_id)))
+                }
+                Err(e) => Err(format!("history/read: {}", e)),
+            }
+        });
+
+        // history/zoom — zoom into a summary range, returning raw events
+        self.define_native("history/zoom", 2, |args| {
+            let from = match &args[0] {
+                Value::Int(id) => *id as u64,
+                other => return Err(format!("history/zoom: expected integer from, got {}", other)),
+            };
+            let to = match &args[1] {
+                Value::Int(id) => *id as u64,
+                other => return Err(format!("history/zoom: expected integer to, got {}", other)),
+            };
+
+            let log_path = "data/event.log";
+            match std::fs::read_to_string(log_path) {
+                Ok(content) => {
+                    let mut events = Vec::new();
+                    for line in content.lines() {
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(id) = event["id"].as_u64() {
+                                if id >= from && id <= to {
+                                    let summary = format!("event #{}: {}",
+                                        id,
+                                        serde_json::to_string(&event["kind"]).unwrap_or_default()
+                                    );
+                                    events.push(Value::string(&summary));
+                                }
+                                if id > to {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::List(events))
+                }
+                Err(e) => Err(format!("history/zoom: {}", e)),
+            }
+        });
+
+        // history/find — search events by text content
+        self.define_native("history/find", 1, |args| {
+            let query = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("history/find: expected string, got {}", other)),
+            };
+
+            let q = query.to_lowercase();
+            let log_path = "data/event.log";
+            match std::fs::read_to_string(log_path) {
+                Ok(content) => {
+                    let mut results = Vec::new();
+                    for line in content.lines() {
+                        if line.to_lowercase().contains(&q) {
+                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                                let id = event["id"].as_u64().unwrap_or(0);
+                                results.push(Value::string(&format!("#{}", id)));
+                            }
+                        }
+                    }
+                    Ok(Value::List(results))
+                }
+                Err(e) => Err(format!("history/find: {}", e)),
+            }
         });
 
         // Model invocation — calls any OpenAI-compatible API

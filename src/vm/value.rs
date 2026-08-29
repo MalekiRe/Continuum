@@ -13,7 +13,6 @@ pub enum Function {
         name: String,
         arity: u32,
         func: fn(Vec<Value>) -> Result<Value, String>,
-        authority: Vec<String>,
     },
     Interpreted {
         params: Vec<String>,
@@ -30,12 +29,11 @@ pub enum Function {
 impl Serialize for Function {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Function::Native { name, arity, authority, .. } => {
+            Function::Native { name, arity, .. } => {
                 let m = serde_json::json!({
                     "type": "native",
                     "name": name,
                     "arity": arity,
-                    "authority": authority,
                 });
                 serde_json::Value::serialize(&m, serializer)
             }
@@ -72,14 +70,10 @@ impl<'de> Deserialize<'de> for Function {
                 // We create a stub that returns an error if called.
                 let name = m["name"].as_str().unwrap_or("unknown").to_string();
                 let arity = m["arity"].as_u64().unwrap_or(0) as u32;
-                let authority: Vec<String> = m["authority"].as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
                 Ok(Function::Native {
                     name,
                     arity,
                     func: |_| Err("native function not available after deserialization; re-register it".into()),
-                    authority,
                 })
             }
             "interpreted" => {
@@ -362,7 +356,6 @@ macro_rules! lisp_fn {
             name: $name.to_string(),
             arity: $arity,
             func: $func,
-            authority: vec![],
         })
     };
 }

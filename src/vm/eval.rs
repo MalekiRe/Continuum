@@ -164,6 +164,16 @@ fn eval_undefine(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
         Value::Symbol(s) => s.clone(),
         other => return Err(EvalError::InvalidForm(format!("undefine: expected symbol, got {}", other))),
     };
+
+    // Check if this is a data family — if so, remove all constructors atomically
+    // The family name is the full path (e.g., "my/Foo" not just "Foo")
+    if env.is_data_family(&name) {
+        // Undefine the data family, removing all constructors atomically
+        env.undefine_data_family(&name).map_err(|e| EvalError::SyntaxError(e))?;
+        return Ok(Value::Symbol(name));
+    }
+
+    // Regular undefine
     let qualified = if name.contains('/') { name } else { format!("user/{}", name) };
     env.undefine(&qualified).map_err(|e| EvalError::SyntaxError(e))?;
     Ok(Value::Nil)
@@ -844,11 +854,11 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             let mut local: EnvRef = serde_json::from_str(&env_serialized).unwrap_or_else(|_| env.clone());
 
             // Restore native function pointers from current env (they can't survive serialization)
-            if let Some(current_kernel) = env.namespaces.get("kernel") {
-                if let Some(local_kernel) = local.namespaces.get_mut("kernel") {
-                    for (name, val) in &current_kernel.bindings {
+            for (ns_name, current_ns) in &env.namespaces {
+                if let Some(local_ns) = local.namespaces.get_mut(ns_name) {
+                    for (name, val) in &current_ns.bindings {
                         if matches!(val, Value::Function(Function::Native { .. })) {
-                            local_kernel.bindings.insert(name.clone(), val.clone());
+                            local_ns.bindings.insert(name.clone(), val.clone());
                         }
                     }
                 }
