@@ -1,9 +1,268 @@
+use crate::kernel::{with_kernel, SnapshotKind};
 use crate::vm::value::Value;
 use crate::kernel::Kernel;
 use std::collections::HashMap;
 
 impl Kernel {
     pub fn register_tools(&mut self) {
+
+        use crate::lisp_fn;
+        // Arithmetic
+        self.define_native("kernel/+", 2, |args| {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            match (a, b) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+                (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
+                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
+                _ => Err("+: expected numbers".into()),
+            }
+        });
+
+        self.define_native("kernel/-", 2, |args| {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            match (a, b) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
+                (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 - b)),
+                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - b as f64)),
+                _ => Err("-: expected numbers".into()),
+            }
+        });
+
+        self.define_native("kernel/*", 2, |args| {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            match (a, b) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
+                (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 * b)),
+                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * b as f64)),
+                _ => Err("*: expected numbers".into()),
+            }
+        });
+
+        self.define_native("kernel//", 2, |args| {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            match (a, b) {
+                (Value::Int(a), Value::Int(b)) => {
+                    if b == 0 { Err("/: division by zero".into()) } else { Ok(Value::Float(a as f64 / b as f64)) }
+                }
+                (Value::Float(a), Value::Float(b)) => {
+                    if b == 0.0 { Err("/: division by zero".into()) } else { Ok(Value::Float(a / b)) }
+                }
+                _ => Err("/: expected numbers".into()),
+            }
+        });
+
+        self.define_native("kernel/=", 2, |args| {
+            Ok(Value::Bool(args[0] == args[1]))
+        });
+
+        self.define_native("kernel/<", 2, |args| {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            match (a, b) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
+                _ => Err("<: expected numbers".into()),
+            }
+        });
+
+        self.define_native("kernel/>", 2, |args| {
+            let a = args[0].clone();
+            let b = args[1].clone();
+            match (a, b) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
+                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
+                _ => Err(">: expected numbers".into()),
+            }
+        });
+
+        self.define_native("kernel/cons", 2, |args| {
+            let car = args[0].clone();
+            let cdr = args[1].clone();
+            match cdr {
+                Value::List(mut items) => {
+                    let mut new_list = vec![car];
+                    new_list.append(&mut items);
+                    Ok(Value::List(new_list))
+                }
+                Value::Nil => Ok(Value::List(vec![car])),
+                _ => Err("cons: second argument must be a list".into()),
+            }
+        });
+
+        self.define_native("kernel/car", 1, |args| {
+            match &args[0] {
+                Value::List(items) => items.first().cloned().ok_or_else(|| "car: empty list".into()),
+                _ => Err("car: expected list".into()),
+            }
+        });
+
+        self.define_native("kernel/cdr", 1, |args| {
+            match &args[0] {
+                Value::List(items) if items.len() >= 2 => Ok(Value::List(items[1..].to_vec())),
+                Value::List(_) => Ok(Value::Nil),
+                _ => Err("cdr: expected list".into()),
+            }
+        });
+
+        self.define_native("kernel/list", 0, |args| {
+            Ok(Value::List(args.to_vec()))
+        });
+
+        self.define_native("kernel/display", 1, |args| {
+            print!("{}", args[0]);
+            Ok(args[0].clone())
+        });
+
+        self.define_native("kernel/println", 1, |args| {
+            println!("{}", args[0]);
+            Ok(args[0].clone())
+        });
+
+        self.define_native("kernel/read", 0, |_args| {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)
+                .map_err(|e| format!("read error: {}", e))?;
+            Ok(Value::string(input.trim()))
+        });
+
+        // Type predicates
+        self.define_native("kernel/nil?", 1, |args| {
+            Ok(Value::Bool(matches!(args[0], Value::Nil)))
+        });
+        self.define_native("kernel/number?", 1, |args| {
+            Ok(Value::Bool(matches!(args[0], Value::Int(_) | Value::Float(_))))
+        });
+        self.define_native("kernel/symbol?", 1, |args| {
+            Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
+        });
+        self.define_native("kernel/string?", 1, |args| {
+            Ok(Value::Bool(matches!(args[0], Value::String(_))))
+        });
+        self.define_native("kernel/list?", 1, |args| {
+            Ok(Value::Bool(args[0].is_list()))
+        });
+        self.define_native("kernel/function?", 1, |args| {
+            Ok(Value::Bool(matches!(args[0], Value::Function(_))))
+        });
+        self.define_native("kernel/keyword?", 1, |args| {
+            Ok(Value::Bool(matches!(args[0], Value::Keyword(_))))
+        });
+
+        // Control
+        self.define_native("control/Continue", 0, |_args| {
+            Ok(Value::Keyword("Continue".to_string()))
+        });
+        self.define_native("control/CancelCurrent", 1, |args| {
+            Ok(Value::Tagged {
+                family: "control".into(),
+                variant: "CancelCurrent".into(),
+                fields: args.to_vec(),
+            })
+        });
+        self.define_native("control/Error", 1, |args| {
+            let msg = format!("{}", args[0]);
+            Err(msg)
+        });
+
+        // System
+        self.define_native("system/version", 0, |_args| {
+            Ok(Value::string("persistent-lisp-harness/0.1.0"))
+        });
+        self.define_native("system/clock", 0, |_args| {
+            Ok(Value::string(&chrono::Utc::now().to_rfc3339()))
+        });
+        self.define_native("system/interrupt", 0, |_args| {
+            // Set the interrupt flag — Lisp will notice at the next safepoint
+            crate::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(Value::keyword("interrupted"))
+        });
+        self.define_native("system/clear-interrupt", 0, |_args| {
+            crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
+            Ok(Value::keyword("cleared"))
+        });
+        self.define_native("system/snapshot", 0, |_args| {
+            with_kernel(|k| {
+                let snap = k.snapshot(SnapshotKind::Incremental);
+                Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
+            })
+        });
+        self.define_native("system/compact", 0, |_args| {
+            with_kernel(|k| {
+                let summary = k.compact();
+                Ok(Value::string(&format!(
+                    "compacted events {}..{}: {}",
+                    summary.from_id, summary.to_id, summary.summary
+                )))
+            })
+        });
+        self.define_native("system/event-log", 0, |_args| {
+            with_kernel(|k| {
+                Ok(Value::string(&format!(
+                    "{} events recorded (latest id: {})",
+                    k.event_counter, k.event_counter
+                )))
+            })
+        });
+        self.define_native("inspect/namespaces", 0, |_args| {
+            with_kernel(|k| {
+                let names: Vec<Value> = k.env.namespace_names().iter().map(|n| {
+                    let count = k.env.namespaces.get(n)
+                        .map(|ns| ns.list_bindings().len())
+                        .unwrap_or(0);
+                    Value::list(vec![Value::symbol(n), Value::int(count as i64)])
+                }).collect();
+                Ok(Value::List(names))
+            })
+        });
+        self.define_native("inspect/bindings", 1, |args| {
+            let ns_name = match &args[0] {
+                Value::Symbol(s) => s.clone(),
+                _ => return Err("inspect/bindings: expected symbol".into()),
+            };
+            with_kernel(|k| {
+                let bindings = k.inspect_namespace(&ns_name)
+                    .unwrap_or_default();
+                let items: Vec<Value> = bindings.iter().map(|b| Value::symbol(b)).collect();
+                Ok(Value::List(items))
+            })
+        });
+        self.define_native("inspect/history", 1, |args| {
+            let name = match &args[0] {
+                Value::Symbol(s) => s.clone(),
+                _ => return Err("inspect/history: expected symbol".into()),
+            };
+            with_kernel(|k| {
+                let qualified = if name.contains('/') { name.clone() } else { format!("user/{}", name) };
+                let parts: Vec<&str> = qualified.splitn(2, '/').collect();
+                if parts.len() == 2 {
+                    if let Some(ns) = k.env.namespaces.get(parts[0]) {
+                        let records = ns.history(parts[1]);
+                        if records.is_empty() {
+                            return Ok(Value::string("no history"));
+                        }
+                        let entries: Vec<Value> = records.iter().map(|r| {
+                            Value::list(vec![
+                                Value::string(&r.timestamp),
+                                Value::int(r.version as i64),
+                                Value::string(&format!("{}", r.value)),
+                            ])
+                        }).collect();
+                        return Ok(Value::List(entries));
+                    }
+                }
+                Err(format!("no history for {}", name))
+            })
+        });
+    
+
         self.define_native("web/search", 1, |args| {
             let query = match &args[0] {
                 Value::String(s) => s.clone(),

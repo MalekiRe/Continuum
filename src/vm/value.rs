@@ -2,10 +2,6 @@ use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 
-/// Stable ID for a Value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ValueId(pub u64);
-
 /// A Lisp function, either native (Rust) or interpreted.
 #[derive(Debug, Clone)]
 pub enum Function {

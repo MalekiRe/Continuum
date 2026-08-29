@@ -31,8 +31,7 @@ pub struct Namespace {
     pub history: HashMap<String, Vec<BindingRecord>>,
     pub next_version: u64,
     pub protected: bool,
-    pub data_families: HashMap<String, DataFamily>,
-    pub data_constructors: HashMap<String, (String, String, Vec<String>)>,
+    pub data_families: HashMap<String, DataFamily>
 }
 
 impl Namespace {
@@ -44,8 +43,7 @@ impl Namespace {
             history: HashMap::new(),
             next_version: 1,
             protected,
-            data_families: HashMap::new(),
-            data_constructors: HashMap::new(),
+            data_families: HashMap::new()
         }
     }
 
@@ -325,22 +323,9 @@ impl EnvRef {
                 let retain = k != &name && !name.ends_with(k);
                 retain
             });
-            ns.data_constructors.retain(|k, _| {
-                let retain = !to_remove.iter().any(|r| k.ends_with(r));
-                retain
-            });
         }
 
         Ok(())
-    }
-
-    pub fn set_data_constructor(&mut self, qualified_name: &str, family: String, variant: String, fields: Vec<String>) {
-        let parts: Vec<&str> = qualified_name.splitn(2, '/').collect();
-        if parts.len() != 2 { return; }
-        let ns_name = parts[0];
-        let name = parts[1];
-        let ns = self.namespaces.entry(ns_name.to_string()).or_insert_with(|| Namespace::new(ns_name));
-        ns.data_constructors.insert(name.to_string(), (family, variant, fields));
     }
 
     pub fn serialize_env_for_closure(&mut self) {

@@ -423,7 +423,6 @@ fn expand_quasiquote(val: &Value, env: &mut EnvRef) -> Result<Value, EvalError> 
     match val {
         Value::List(items) if !items.is_empty() => {
             let head = &items[0];
-
             if let Value::Symbol(s) = head {
                 if s == "unquote" {
                     if items.len() != 2 {
@@ -432,64 +431,40 @@ fn expand_quasiquote(val: &Value, env: &mut EnvRef) -> Result<Value, EvalError> 
                     return eval_value(items[1].clone(), env);
                 }
             }
-
-            let mut result = Vec::new();
-            for item in items {
-                match item {
-                    Value::List(sub) if !sub.is_empty() => {
-                        if let Value::Symbol(s) = &sub[0] {
-                            if s == "unquote-splicing" {
-                                if sub.len() != 2 {
-                                    return Err(EvalError::InvalidForm("unquote-splicing expects 1 argument".into()));
-                                }
-                                let spliced = eval_value(sub[1].clone(), env)?;
-                                match spliced {
-                                    Value::List(v) => result.extend(v),
-                                    Value::Vector(v) => result.extend(v),
-                                    _ => result.push(spliced),
-                                }
-                                continue;
-                            }
-                        }
-                        result.push(expand_quasiquote(item, env)?);
-                    }
-                    other => {
-                        result.push(expand_quasiquote(other, env)?);
-                    }
-                }
-            }
-            Ok(Value::List(result))
+            expand_quasiquote_seq(items, env, |v| Value::List(v))
         }
-        Value::Vector(items) => {
-            let mut result = Vec::new();
-            for item in items {
-                match item {
-                    Value::List(sub) if !sub.is_empty() => {
-                        if let Value::Symbol(s) = &sub[0] {
-                            if s == "unquote-splicing" {
-                                if sub.len() != 2 {
-                                    return Err(EvalError::InvalidForm("unquote-splicing expects 1 argument".into()));
-                                }
-                                let spliced = eval_value(sub[1].clone(), env)?;
-                                match spliced {
-                                    Value::List(v) => result.extend(v),
-                                    Value::Vector(v) => result.extend(v),
-                                    _ => result.push(spliced),
-                                }
-                                continue;
-                            }
-                        }
-                        result.push(expand_quasiquote(item, env)?);
-                    }
-                    other => {
-                        result.push(expand_quasiquote(other, env)?);
-                    }
-                }
-            }
-            Ok(Value::Vector(result))
-        }
+        Value::Vector(items) => expand_quasiquote_seq(items, env, |v| Value::Vector(v)),
         _ => Ok(val.clone()),
     }
+}
+
+fn expand_quasiquote_seq(items: &[Value], env: &mut EnvRef, wrap: fn(Vec<Value>) -> Value) -> Result<Value, EvalError> {
+    let mut result = Vec::new();
+    for item in items {
+        match item {
+            Value::List(sub) if !sub.is_empty() => {
+                if let Value::Symbol(s) = &sub[0] {
+                    if s == "unquote-splicing" {
+                        if sub.len() != 2 {
+                            return Err(EvalError::InvalidForm("unquote-splicing expects 1 argument".into()));
+                        }
+                        let spliced = eval_value(sub[1].clone(), env)?;
+                        match spliced {
+                            Value::List(v) => result.extend(v),
+                            Value::Vector(v) => result.extend(v),
+                            _ => result.push(spliced),
+                        }
+                        continue;
+                    }
+                }
+                result.push(expand_quasiquote(item, env)?);
+            }
+            other => {
+                result.push(expand_quasiquote(other, env)?);
+            }
+        }
+    }
+    Ok(wrap(result))
 }
 
 // ---- define-syntax (simple) ----
@@ -574,8 +549,7 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
                 // Register constructor as a Lisp function that returns a tagged value
                 let fam = family_name.clone();
                 let var = variant_name.clone();
-                let fnames = field_names.clone();
-                let arity = fnames.len() as u32;
+                let arity = field_names.len() as u32;
                 // Store constructors as user/{family}/{variant}
                 let constructor_name = format!("user/{}/{}", family_name, variant_name);
 

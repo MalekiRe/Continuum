@@ -67,6 +67,15 @@ impl EventLog {
             let _ = writeln!(file, "{}", line);
         }
 
+        // Rotate log if it exceeds 10MB
+        if let Ok(metadata) = fs::metadata(&self.path) {
+            if metadata.len() > 10_000_000 {
+                let rotated_path = format!("{}.{}", self.path, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                let _ = fs::rename(&self.path, &rotated_path);
+                self.next_id = 1;
+            }
+        }
+
         id
     }
 

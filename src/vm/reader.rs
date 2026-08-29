@@ -169,6 +169,29 @@ fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
     match ch {
         't' => Ok((Value::Bool(true), &input[1..])),
         'f' => Ok((Value::Bool(false), &input[1..])),
+        '\\' => {
+            if input.len() >= 2 {
+                let char_lit = input.as_bytes()[1] as char;
+                Ok((Value::string(&char_lit.to_string()), &input[2..]))
+            } else {
+                Err(ReadError::UnexpectedEof("expected character after #\\".into()))
+            }
+        }
+        'x' => {
+            let (raw, rest) = read_raw_symbol(&input[1..])?;
+            i64::from_str_radix(&raw, 16).map(|n| (Value::Int(n), rest))
+                .map_err(|_| ReadError::InvalidSyntax(format!("invalid hex number: #x{}", raw)))
+        }
+        'o' => {
+            let (raw, rest) = read_raw_symbol(&input[1..])?;
+            i64::from_str_radix(&raw, 8).map(|n| (Value::Int(n), rest))
+                .map_err(|_| ReadError::InvalidSyntax(format!("invalid octal number: #o{}", raw)))
+        }
+        'b' => {
+            let (raw, rest) = read_raw_symbol(&input[1..])?;
+            i64::from_str_radix(&raw, 2).map(|n| (Value::Int(n), rest))
+                .map_err(|_| ReadError::InvalidSyntax(format!("invalid binary number: #b{}", raw)))
+        }
         _ => Err(ReadError::UnknownDispatch(format!("#{}", ch))),
     }
 }
