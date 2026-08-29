@@ -36,6 +36,7 @@ pub enum EvalError {
     NotADataFamily(String),
     InvalidPattern(String),
     AuthorityDenied(String),
+    TailCall(Value, EnvRef),
 }
 
 impl std::fmt::Display for EvalError {
@@ -51,6 +52,7 @@ impl std::fmt::Display for EvalError {
             EvalError::NotADataFamily(s) => write!(f, "not a data family: {}", s),
             EvalError::InvalidPattern(s) => write!(f, "invalid pattern: {}", s),
             EvalError::AuthorityDenied(s) => write!(f, "authority denied: {}", s),
+            EvalError::TailCall(_, _) => write!(f, "tail call"),
         }
     }
 }
@@ -61,7 +63,24 @@ pub fn eval(input: &str, env: &mut EnvRef) -> Result<Value, EvalError> {
     let exprs = reader::read_all(input).map_err(|e| EvalError::SyntaxError(e.to_string()))?;
     let mut result = Value::Nil;
     for expr in exprs {
-        result = eval_value(expr, env)?;
+        let mut current = expr;
+        let mut local = env.clone();
+        loop {
+            match eval_value(current, &mut local) {
+                Ok(v) => { result = v; break; }
+                Err(EvalError::TailCall(next_expr, next_env)) => {
+                    // Continue evaluation in the environment that has the
+                    // lexical frame with params already bound. Frames are
+                    // accumulated during the tail chain but popped naturally
+                    // when a non-tail value is reached.
+                    current = next_expr;
+                    local = next_env;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        *env = local;
     }
     Ok(result)
 }
@@ -167,7 +186,16 @@ fn eval_define(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
                 }
             }).collect();
             let body: Vec<Value> = args[1..].to_vec();
+            // Define the name FIRST so closures can see it (self-reference)
+            let placeholder = Value::Nil;
+            if !name.contains('/') {
+                env.define(&format!("user/{}", name), placeholder).map_err(|e| EvalError::SyntaxError(e))?;
+            } else {
+                env.define(&name, placeholder).map_err(|e| EvalError::SyntaxError(e))?;
+            }
+            // Now create the lambda — it captures the env which now includes the name
             let lambda = eval_lambda_simple(param_names, body, env)?;
+            // Overwrite the placeholder with the real function
             if !name.contains('/') {
                 env.define(&format!("user/{}", name), lambda).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
@@ -850,11 +878,13 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             // Deserialize closure env, but restore kernel natives from current env
             let mut local: EnvRef = serde_json::from_str(&env_serialized).unwrap_or_else(|_| env.clone());
 
-            // Restore native function pointers from current env (they can't survive serialization)
+            // Restore function pointers from current env (they can't survive serialization).
+            // Native functions lose their func pointer. Interpreted functions defined
+            // after closure capture are also missing. Copy all functions to be safe.
             for (ns_name, current_ns) in &env.namespaces {
                 if let Some(local_ns) = local.namespaces.get_mut(ns_name) {
                     for (name, val) in &current_ns.bindings {
-                        if matches!(val, Value::Function(Function::Native { .. })) {
+                        if matches!(val, Value::Function(_)) {
                             local_ns.bindings.insert(name.clone(), val.clone());
                         }
                     }
@@ -865,6 +895,16 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             for (p, a) in params.iter().zip(args.into_iter()) {
                 local.set_lexical(p, a);
             }
+
+            // Tail call optimization via trampoline.
+            // Single-expression bodies return TailCall so the eval loop
+            // evaluates them without Rust stack growth. The frame must NOT
+            // be popped — the next evaluation still needs lexical bindings.
+            if body.len() == 1 {
+                let next_expr = body.into_iter().next().unwrap();
+                return Err(EvalError::TailCall(next_expr, local));
+            }
+
             let result = eval_begin(&body, &mut local);
             local.pop_frame();
             result
