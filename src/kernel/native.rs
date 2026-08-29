@@ -1,0 +1,163 @@
+use crate::vm::value::Value;
+use crate::kernel::Kernel;
+use std::collections::HashMap;
+
+impl Kernel {
+    pub fn register_tools(&mut self) {
+        self.define_native("web/search", 1, |args| {
+            let query = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("web/search: expected string, got {}", other)),
+            };
+            Ok(Value::list(vec![
+                Value::string(&format!("result for: {}", query)),
+            ]))
+        });
+
+        self.define_native("fs/read", 1, |args| {
+            let path = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("fs/read: expected string, got {}", other)),
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(content) => Ok(Value::string(&content)),
+                Err(e) => Err(format!("fs/read: {}", e)),
+            }
+        });
+
+        self.define_native("fs/write", 2, |args| {
+            let path = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("fs/write: expected string for path, got {}", other)),
+            };
+            let content = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("fs/write: expected string for content, got {}", other)),
+            };
+            match std::fs::write(&path, &content) {
+                Ok(_) => Ok(Value::Nil),
+                Err(e) => Err(format!("fs/write: {}", e)),
+            }
+        });
+
+        self.define_native("proc/run", 1, |args| {
+            let cmd = match &args[0] {
+                Value::String(s) => s.clone(),
+                Value::List(items) => {
+                    items.iter().map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => format!("{}", other),
+                    }).collect::<Vec<_>>().join(" ")
+                }
+                other => return Err(format!("proc/run: expected string or list, got {}", other)),
+            };
+            match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    Ok(Value::Map(HashMap::from([
+                        (Value::keyword("exit"), Value::Int(output.status.code().unwrap_or(-1) as i64)),
+                        (Value::keyword("stdout"), Value::string(&stdout)),
+                        (Value::keyword("stderr"), Value::string(&stderr)),
+                    ])))
+                }
+                Err(e) => Err(format!("proc/run: {}", e)),
+            }
+        });
+
+        self.define_native("message/reply", 1, |args| {
+            let text = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            println!("[message/reply] {}", text);
+            Ok(Value::keyword("sent"))
+        });
+
+        self.define_native("clock/wake", 2, |args| {
+            let _duration = match &args[0] {
+                Value::Int(ms) => *ms,
+                _ => return Err("clock/wake: expected integer milliseconds".into()),
+            };
+            let _action = args[1].clone();
+            Ok(Value::keyword("scheduled"))
+        });
+
+        self.define_native("agent/call", 2, |args| {
+            let _name = match &args[0] {
+                Value::String(s) => s.clone(),
+                Value::Symbol(s) => s.clone(),
+                other => return Err(format!("agent/call: expected name, got {}", other)),
+            };
+            let _request = args[1].clone();
+            Ok(Value::keyword("called"))
+        });
+
+        self.define_native("string/join", 2, |args| {
+            let sep = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string/join: separator must be string, got {}", other)),
+            };
+            let parts = match &args[1] {
+                Value::List(items) => items.iter().map(|v| format!("{}", v)).collect::<Vec<_>>(),
+                other => vec![format!("{}", other)],
+            };
+            Ok(Value::string(&parts.join(&sep)))
+        });
+
+        self.define_native("string/split", 2, |args| {
+            let text = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string/split: expected string, got {}", other)),
+            };
+            let sep = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string/split: separator must be string, got {}", other)),
+            };
+            let parts: Vec<Value> = text.split(&sep).map(|s| Value::string(s)).collect();
+            Ok(Value::List(parts))
+        });
+
+        self.define_native("string/contains?", 2, |args| {
+            let text = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string/contains?: expected string, got {}", other)),
+            };
+            let substr = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string/contains?: expected string, got {}", other)),
+            };
+            Ok(Value::Bool(text.contains(&substr)))
+        });
+
+        self.define_native("map/get", 2, |args| {
+            let map = match &args[0] {
+                Value::Map(m) => m,
+                other => return Err(format!("map/get: expected map, got {}", other)),
+            };
+            let key = &args[1];
+            Ok(map.get(key).cloned().unwrap_or(Value::Nil))
+        });
+
+        self.define_native("vector/get", 2, |args| {
+            let vec = match &args[0] {
+                Value::Vector(v) => v,
+                other => return Err(format!("vector/get: expected vector, got {}", other)),
+            };
+            let idx = match &args[1] {
+                Value::Int(i) => *i as usize,
+                other => return Err(format!("vector/get: expected integer index, got {}", other)),
+            };
+            vec.get(idx).cloned().ok_or_else(|| format!("vector/get: index {} out of bounds (len {})", idx, vec.len()))
+        });
+
+        self.define_native("kernel/error", 1, |args| {
+            let msg = format!("{}", args[0]);
+            Err(msg)
+        });
+    }
+}
