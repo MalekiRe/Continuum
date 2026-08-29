@@ -51,19 +51,11 @@ fn main() {
           (Indeterminate problem))
 
         (define (agent/cognize context)
-          (let ((result (agent/think context "What should I do next?")))
-            (match result
-              ((result/Ok text)
-               (println "[agent]" text)
-               text)
-              ((result/Err msg)
-               (println "[agent] error:" msg)
-               nil))))
+          (println "[agent] context:" context)
+          context)
 
         (define (agent/loop context)
-          (begin
-            (let ((result (agent/cognize context)))
-              (agent/loop (string/join " " (list "Previous:" context "Result:" result))))))
+          (agent/loop (agent/cognize context)))
     "#;
 
     match kernel.eval(agent_core) {

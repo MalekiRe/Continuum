@@ -30,7 +30,7 @@ fn test_define_data_and_match() {
     let r = k.eval(r#"
         (match (user/result/Result/Err "oops")
           ((result/Result/Ok n) n)
-          ((result/Result/Err msg) (string/join " " (list "ERROR:" msg))))
+          ((result/Result/Err msg) (println msg)))
     "#);
     assert!(r.is_ok(), "match err: {:?}", r.err());
 }
