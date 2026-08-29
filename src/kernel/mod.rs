@@ -184,9 +184,6 @@ impl Kernel {
         // Record event
         self.record_event(EventKind::EvalRequest { source: source.to_string() }, self.current_frame_id());
 
-        // Snapshot before evaluation (REPL boundary — save quiescent state)
-        self.snapshot(SnapshotKind::Incremental);
-
         let result = eval::eval(source, &mut self.env);
 
         match &result {
@@ -591,9 +588,14 @@ impl Kernel {
             name: qualified_name.to_string(),
             arity,
             func,
-            
         });
-        self.env.force_define(qualified_name, val);
+        // Qualify unqualified names with "kernel/" so force_define works.
+        let full_name = if qualified_name.contains('/') {
+            qualified_name.to_string()
+        } else {
+            format!("kernel/{}", qualified_name)
+        };
+        self.env.force_define(&full_name, val);
     }
 
     pub fn inspect_namespace(&self, name: &str) -> Option<Vec<String>> {

@@ -245,22 +245,23 @@ fn eval_lambda(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
         _ => return Err(EvalError::InvalidForm(format!("lambda: expected parameter list, got {}", param_list))),
     };
 
-    env.serialize_env_for_closure();
-    let serialized = env.serialized.clone();
+    // Serialize only lexical frames (namespaces come from fallback at call time)
+    let frames_json = serde_json::to_string(&env.frames).unwrap_or_default();
     Ok(Value::Function(Function::Interpreted {
         params: param_names,
         body,
-        env_serialized: serialized,
+        env_serialized: frames_json,
     }))
 }
 
 fn eval_lambda_simple(params: Vec<String>, body: Vec<Value>, env: &EnvRef) -> Result<Value, EvalError> {
-    // We need serialized env. Clone env and serialize.
-    let serialized = serde_json::to_string(env).unwrap_or_default();
+    // Serialize only the lexical frames — namespaces are provided by the fallback
+    // at call time. This avoids O(n) serialization of every binding in every namespace.
+    let frames_json = serde_json::to_string(&env.frames).unwrap_or_default();
     Ok(Value::Function(Function::Interpreted {
         params,
         body,
-        env_serialized: serialized,
+        env_serialized: frames_json,
     }))
 }
 
@@ -868,23 +869,15 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             })
         }
         Value::Function(Function::Interpreted { params, body, env_serialized }) => {
-            // Deserialize closure env
-            let mut local: EnvRef = serde_json::from_str(&env_serialized).unwrap_or_else(|_| env.clone());
-
-            // Remove native function stubs from the deserialized env.
-            // Native functions lose their function pointers during serialization
-            // and become stubs that can't be called. The fallback provides
-            // the real native functions from the current env.
-            for ns in local.namespaces.values_mut() {
-                ns.bindings.retain(|_, v| {
-                    !matches!(v, Value::Function(Function::Native { .. }))
-                });
+            // Start from the current env (provides namespaces with real function pointers)
+            // and replace the lexical frames with the deserialized ones from closure capture.
+            // This avoids O(n) serialization of namespace bindings on every lambda definition.
+            let mut local = env.clone();
+            if let Ok(frames) = serde_json::from_str::<Vec<HashMap<String, Value>>>(&env_serialized) {
+                local.frames = frames;
             }
-
-            // Set fallback to current env so symbol lookups resolve against
-            // the call-time environment. This eliminates the need to copy
-            // function pointers into every closure on every call.
-            local.fallback = Some(Box::new(env.clone()));
+            // The fallback is already set to the current env (from env.clone())
+            // so symbol lookups resolve against the current environment.
 
             // Tail call optimization: for single-expression bodies, bind params
             // into the CURRENT frame (reusing it) instead of pushing a new one.
