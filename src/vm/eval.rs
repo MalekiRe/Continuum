@@ -186,16 +186,9 @@ fn eval_define(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
                 }
             }).collect();
             let body: Vec<Value> = args[1..].to_vec();
-            // Define the name FIRST so closures can see it (self-reference)
-            let placeholder = Value::Nil;
-            if !name.contains('/') {
-                env.define(&format!("user/{}", name), placeholder).map_err(|e| EvalError::SyntaxError(e))?;
-            } else {
-                env.define(&name, placeholder).map_err(|e| EvalError::SyntaxError(e))?;
-            }
-            // Now create the lambda — it captures the env which now includes the name
+            // Create the lambda FIRST (captures current env without the name)
             let lambda = eval_lambda_simple(param_names, body, env)?;
-            // Overwrite the placeholder with the real function
+            // Then define the name — the lambda can find itself via the fallback
             if !name.contains('/') {
                 env.define(&format!("user/{}", name), lambda).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
@@ -875,21 +868,23 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             })
         }
         Value::Function(Function::Interpreted { params, body, env_serialized }) => {
-            // Deserialize closure env, but restore kernel natives from current env
+            // Deserialize closure env
             let mut local: EnvRef = serde_json::from_str(&env_serialized).unwrap_or_else(|_| env.clone());
 
-            // Restore function pointers from current env (they can't survive serialization).
-            // Native functions lose their func pointer. Interpreted functions defined
-            // after closure capture are also missing. Copy all functions to be safe.
-            for (ns_name, current_ns) in &env.namespaces {
-                if let Some(local_ns) = local.namespaces.get_mut(ns_name) {
-                    for (name, val) in &current_ns.bindings {
-                        if matches!(val, Value::Function(_)) {
-                            local_ns.bindings.insert(name.clone(), val.clone());
-                        }
-                    }
-                }
+            // Remove native function stubs from the deserialized env.
+            // Native functions lose their function pointers during serialization
+            // and become stubs that can't be called. The fallback provides
+            // the real native functions from the current env.
+            for ns in local.namespaces.values_mut() {
+                ns.bindings.retain(|_, v| {
+                    !matches!(v, Value::Function(Function::Native { .. }))
+                });
             }
+
+            // Set fallback to current env so symbol lookups resolve against
+            // the call-time environment. This eliminates the need to copy
+            // function pointers into every closure on every call.
+            local.fallback = Some(Box::new(env.clone()));
 
             // Tail call optimization: for single-expression bodies, bind params
             // into the CURRENT frame (reusing it) instead of pushing a new one.

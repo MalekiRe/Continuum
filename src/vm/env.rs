@@ -97,6 +97,11 @@ pub struct EnvRef {
     pub frames: Vec<HashMap<String, Value>>,
     #[serde(skip)]
     pub serialized: String,
+    /// Fallback environment for closures (current env at call time).
+    /// When a symbol isn't found in this env, the fallback is checked.
+    /// This eliminates the need to copy function pointers into every closure.
+    #[serde(skip)]
+    pub fallback: Option<Box<EnvRef>>,
 }
 
 impl EnvRef {
@@ -105,6 +110,7 @@ impl EnvRef {
             namespaces: HashMap::new(),
             frames: vec![HashMap::new()],
             serialized: String::new(),
+            fallback: None,
         };
         env.namespaces.insert("system".into(), Namespace::new("system"));
         env.namespaces.insert("inspect".into(), Namespace::new("inspect"));
@@ -153,6 +159,11 @@ impl EnvRef {
             if let Some(v) = ns.get(symbol) {
                 return Some(v);
             }
+        }
+
+                // Check fallback
+        if let Some(ref fb) = self.fallback {
+            return fb.lookup(symbol);
         }
 
         None
