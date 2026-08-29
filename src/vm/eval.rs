@@ -1,5 +1,5 @@
 use crate::vm::value::*;
-use crate::vm::env::EnvRef;
+use crate::vm::env::{EnvRef, DataVariant, DataFamily};
 use crate::vm::reader;
 use std::collections::HashMap;
 
@@ -522,8 +522,6 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
         other => return Err(EvalError::InvalidForm(format!("define-data: expected family name, got {}", other))),
     };
 
-    // We create constructors that return tagged values via a factory approach.
-    // Store the data family definition.
     let mut variants = Vec::new();
     for variant_def in &args[1..] {
         match variant_def {
@@ -537,14 +535,26 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
                     other => format!("{}", other),
                 }).collect();
 
-                // Create constructor via inline tagged value
+                // Register constructor as a Lisp function that returns a tagged value
                 let fam = family_name.clone();
                 let var = variant_name.clone();
-                let constructor_name = format!("{}/{}", family_name, variant_name);
+                let fnames = field_names.clone();
+                let arity = fnames.len() as u32;
+                let constructor_name = if family_name.contains('/') {
+                    format!("{}/{}", family_name, variant_name)
+                } else {
+                    format!("user/{}/{}", family_name, variant_name)
+                };
 
-                env.set_data_constructor(&constructor_name, fam.clone(), var.clone(), field_names.clone());
+                let constructor = Value::Function(Function::Constructor {
+                    family: family_name.clone(),
+                    variant: variant_name.clone(),
+                    arity,
+                });
 
-                variants.push(crate::vm::env::DataVariant {
+                env.define(&constructor_name, constructor).map_err(|e| EvalError::SyntaxError(e))?;
+
+                variants.push(DataVariant {
                     name: variant_name,
                     fields: field_names,
                 });
@@ -553,9 +563,9 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
         }
     }
 
-    // Store data family in env
+    // Store data family definition
     let fam_name = family_name.clone();
-    env.set_data_family(&fam_name, crate::vm::env::DataFamily {
+    env.set_data_family(&fam_name, DataFamily {
         name: fam_name.clone(),
         variants,
     });
@@ -739,6 +749,20 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
                 return Err(EvalError::ArityMismatch { name, expected: arity, got: args.len() });
             }
             (func)(args).map_err(|e| EvalError::UserError(e))
+        }
+        Value::Function(Function::Constructor { family, variant, arity }) => {
+            if arity > 0 && args.len() as u32 != arity {
+                return Err(EvalError::ArityMismatch {
+                    name: format!("{}/{}", family, variant),
+                    expected: arity,
+                    got: args.len(),
+                });
+            }
+            Ok(Value::Tagged {
+                family: family.clone(),
+                variant: variant.clone(),
+                fields: args,
+            })
         }
         Value::Function(Function::Interpreted { params, body, env_serialized }) => {
             // Deserialize closure env, but restore kernel natives from current env

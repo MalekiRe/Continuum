@@ -20,6 +20,11 @@ pub enum Function {
         body: Vec<Value>,
         env_serialized: String,
     },
+    Constructor {
+        family: String,
+        variant: String,
+        arity: u32,
+    },
 }
 
 impl Serialize for Function {
@@ -40,6 +45,15 @@ impl Serialize for Function {
                     "params": params,
                     "body": body,
                     "env_serialized": env_serialized,
+                });
+                serde_json::Value::serialize(&m, serializer)
+            }
+            Function::Constructor { family, variant, arity } => {
+                let m = serde_json::json!({
+                    "type": "constructor",
+                    "family": family,
+                    "variant": variant,
+                    "arity": arity,
                 });
                 serde_json::Value::serialize(&m, serializer)
             }
@@ -78,6 +92,12 @@ impl<'de> Deserialize<'de> for Function {
                 let env_serialized = m["env_serialized"].as_str().unwrap_or("{}").to_string();
                 Ok(Function::Interpreted { params, body, env_serialized })
             }
+            "constructor" => {
+                let family = m["family"].as_str().unwrap_or("?").to_string();
+                let variant = m["variant"].as_str().unwrap_or("?").to_string();
+                let arity = m["arity"].as_u64().unwrap_or(0) as u32;
+                Ok(Function::Constructor { family, variant, arity })
+            }
             _ => Err(serde::de::Error::custom("unknown function type")),
         }
     }
@@ -88,6 +108,7 @@ impl fmt::Display for Function {
         match self {
             Function::Native { name, arity, .. } => write!(f, "#<native-fn {} arity {}>", name, arity),
             Function::Interpreted { params, .. } => write!(f, "#<fn ({})>", params.join(" ")),
+            Function::Constructor { family, variant, .. } => write!(f, "#<constructor {}/{}>", family, variant),
         }
     }
 }
