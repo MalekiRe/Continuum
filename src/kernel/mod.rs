@@ -88,6 +88,7 @@ pub struct FrameState {
     pub current_continuation: Option<Continuation>,
     /// Stores the pending agent/call return (subagent result).
     pub pending_subagent_result: Option<Value>,
+    pub cancelled_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +159,7 @@ impl Kernel {
                 local_bindings: Vec::new(),
                 current_continuation: None,
                 pending_subagent_result: None,
+                cancelled_tokens: Vec::new(),
             },
         };
         kernel.frames.push(root_frame);
@@ -208,6 +210,17 @@ impl Kernel {
         self.snapshot(SnapshotKind::Incremental);
 
         result
+    }
+
+    /// Interrupt the currently running Lisp evaluation (safepoint mechanism).
+    pub fn interrupt_eval(&self) {
+        crate::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reset the interrupt flag after handling.
+    pub fn clear_interrupt(&self) {
+        crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Try to intercept and handle kernel-level calls.
@@ -289,9 +302,31 @@ impl Kernel {
     }
 
     /// Evaluate Lisp in a read-eval-print loop, returning the result as a display string.
+    /// Checks that the source hasn't been cancelled before executing.
     pub fn eval_repl(&mut self, source: &str) -> String {
+        // Check if this source matches a cancelled call
+        if let Some(frame) = self.frames.last() {
+            for token in &frame.state.cancelled_tokens {
+                if source.contains(token) {
+                    return format!("cancelled: call was previously cancelled and will not be re-executed");
+                }
+            }
+        }
+
         match self.eval(source) {
-            Ok(val) => format!("{}", val),
+            Ok(val) => {
+                // If the result was CancelCurrent, record the cancelled call token
+                if let Value::Tagged { family, variant, fields } = &val {
+                    if family == "control" && variant == "CancelCurrent" {
+                        if let Some(frame) = self.frames.last_mut() {
+                            if let Some(reason) = fields.first() {
+                                frame.state.cancelled_tokens.push(format!("{}", reason));
+                            }
+                        }
+                    }
+                }
+                format!("{}", val)
+            }
             Err(e) => format!("error: {}", e),
         }
     }
@@ -344,6 +379,7 @@ impl Kernel {
                 local_bindings: Vec::new(),
                 current_continuation: None,
                 pending_subagent_result: None,
+                cancelled_tokens: Vec::new(),
             },
         };
 
@@ -389,9 +425,12 @@ impl Kernel {
 
     /// Deliver a human message as an interrupt to the current frame.
     pub fn human_message(&mut self, text: &str) {
-        if let Some(frame) = self.frames.last_mut() {
+        // Deliver the notice to EVERY active frame (stack notices)
+        for frame in self.frames.iter_mut() {
+            // Queue the notice — every frame sees it before it next thinks
+            let notice = format!("(system/HumanMessage {:?})", text);
+            frame.message_queue.push(notice);
             frame.pending_message = Some(text.to_string());
-            frame.message_queue.push(text.to_string());
             if frame.status == FrameStatus::Waiting {
                 frame.status = FrameStatus::Running;
             }
@@ -727,12 +766,6 @@ impl Kernel {
         self.define_native("control/Continue", 0, |_args| {
             Ok(Value::Keyword("Continue".to_string()))
         });
-        self.define_native("control/Wait", 0, |_args| {
-            Ok(Value::Keyword("Wait".to_string()))
-        });
-        self.define_native("control/Return", 0, |_args| {
-            Ok(Value::Keyword("Return".to_string()))
-        });
         self.define_native("control/CancelCurrent", 1, |args| {
             Ok(Value::Tagged {
                 family: "control".into(),
@@ -751,6 +784,16 @@ impl Kernel {
         });
         self.define_native("system/clock", 0, |_args| {
             Ok(Value::string(&chrono::Utc::now().to_rfc3339()))
+        });
+        self.define_native("system/interrupt", 0, |_args| {
+            // Set the interrupt flag — Lisp will notice at the next safepoint
+            crate::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(Value::keyword("interrupted"))
+        });
+        self.define_native("system/clear-interrupt", 0, |_args| {
+            crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
+            Ok(Value::keyword("cleared"))
         });
         self.define_native("system/snapshot", 0, |_args| {
             with_kernel(|k| {

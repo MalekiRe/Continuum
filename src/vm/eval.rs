@@ -2,6 +2,27 @@ use crate::vm::value::*;
 use crate::vm::env::{EnvRef, DataVariant, DataFamily};
 use crate::vm::reader;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
+
+/// Global interrupt flag — set by kernel to request interruption of Lisp evaluation.
+pub static EVAL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Turn counter — incremented on every evaluated expression for safepoint checks.
+pub static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Max turns before automatic safepoint check.
+pub const SAFEPOINT_INTERVAL: u64 = 1000;
+
+/// Check safepoint — if interrupted, return an error.
+#[inline]
+pub fn check_safepoint() -> Result<(), EvalError> {
+    let count = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if count % SAFEPOINT_INTERVAL == 0 && EVAL_INTERRUPTED.load(Ordering::Relaxed) {
+        EVAL_INTERRUPTED.store(false, Ordering::Relaxed);
+        return Err(EvalError::KernelError("evaluation interrupted by kernel".into()));
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub enum EvalError {
@@ -46,6 +67,8 @@ pub fn eval(input: &str, env: &mut EnvRef) -> Result<Value, EvalError> {
 }
 
 pub fn eval_value(val: Value, env: &mut EnvRef) -> Result<Value, EvalError> {
+    // Safepoint: check if kernel wants to interrupt
+    check_safepoint()?;
     match val {
         Value::Symbol(ref name) => {
             env.lookup(name).cloned().ok_or_else(|| EvalError::UndefinedSymbol(name.clone()))

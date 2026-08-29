@@ -201,10 +201,7 @@ fn main() {
             Ok(val) => {
                 // Unless the agent explicitly returns/wait, schedule next turn immediately
                 match &val {
-                    Value::Keyword(s) if s == "Return" || s == "Wait" => {
-                        // Frame requested pause — respect it
-                        continue;
-                    }
+
                     _ => {
                         // Continue immediately — no backoff
                         continue;

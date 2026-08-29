@@ -42,6 +42,7 @@ impl Scheduler {
                 local_bindings: Vec::new(),
                 current_continuation: None,
                 pending_subagent_result: None,
+                cancelled_tokens: Vec::new(),
             },
         };
 
@@ -58,16 +59,7 @@ impl Scheduler {
             Value::Keyword(s) if s == "Continue" => {
                 TurnOutcome::Continued
             }
-            Value::Keyword(s) if s == "Wait" => {
-                if let Some(frame) = kernel.frames.last_mut() {
-                    frame.status = FrameStatus::Waiting;
-                }
-                TurnOutcome::Waiting
-            }
-            Value::Keyword(s) if s == "Return" => {
-                Self::frame_return(kernel, Value::Nil);
-                TurnOutcome::Completed
-            }
+
             Value::Tagged { family, variant, .. } if family == "control" && variant == "CancelCurrent" => {
                 Self::frame_return(kernel, result);
                 TurnOutcome::Cancelled
@@ -153,7 +145,6 @@ impl Scheduler {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnOutcome {
     Continued,
-    Waiting,
     Completed,
     Cancelled,
     Error(String),
