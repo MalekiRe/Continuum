@@ -605,7 +605,7 @@ impl Kernel {
     pub fn find_bindings(&self, query: &str) -> Vec<String> {
         let q = query.to_lowercase();
         let mut results = Vec::new();
-        for (ns_name, ns) in &self.env.namespaces {
+        for (ns_name, ns) in self.env.namespaces.iter() {
             for binding in ns.list_bindings() {
                 let qualified = format!("{}/{}", ns_name, binding);
                 if qualified.to_lowercase().contains(&q) {

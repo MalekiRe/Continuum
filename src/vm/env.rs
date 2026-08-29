@@ -1,6 +1,7 @@
 use crate::vm::value::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A snapshot of a binding at one point in history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +94,7 @@ impl Namespace {
 /// A reference to the root environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvRef {
-    pub namespaces: HashMap<String, Namespace>,
+    pub namespaces: Arc<HashMap<String, Namespace>>,
     pub frames: Vec<HashMap<String, Value>>,
     #[serde(skip)]
     pub serialized: String,
@@ -106,17 +107,17 @@ pub struct EnvRef {
 
 impl EnvRef {
     pub fn new() -> Self {
-        let mut env = EnvRef {
-            namespaces: HashMap::new(),
+        let mut namespaces = HashMap::new();
+        namespaces.insert("system".into(), Namespace::new("system"));
+        namespaces.insert("inspect".into(), Namespace::new("inspect"));
+        namespaces.insert("control".into(), Namespace::new("control"));
+        namespaces.insert("kernel".into(), Namespace::new("kernel"));
+        EnvRef {
+            namespaces: Arc::new(namespaces),
             frames: vec![HashMap::new()],
             serialized: String::new(),
             fallback: None,
-        };
-        env.namespaces.insert("system".into(), Namespace::new("system"));
-        env.namespaces.insert("inspect".into(), Namespace::new("inspect"));
-        env.namespaces.insert("control".into(), Namespace::new("control"));
-        env.namespaces.insert("kernel".into(), Namespace::new("kernel"));
-        env
+        }
     }
 
     pub fn lookup(&self, symbol: &str) -> Option<&Value> {
@@ -178,7 +179,7 @@ impl EnvRef {
         let ns_name = parts[0].to_string();
         let name = parts[1].to_string();
 
-        let ns = self.namespaces.entry(ns_name.clone()).or_insert_with(|| Namespace::new(&ns_name));
+        let ns = Arc::make_mut(&mut self.namespaces).entry(ns_name.clone()).or_insert_with(|| Namespace::new(&ns_name));
         if ns.protected {
             return Err(format!("namespace '{}' is protected and cannot be modified", ns_name));
         }
@@ -195,7 +196,7 @@ impl EnvRef {
         }
         let ns_name = parts[0].to_string();
         let name = parts[1].to_string();
-        let ns = self.namespaces.entry(ns_name.clone()).or_insert_with(|| Namespace::new(&ns_name));
+        let ns = Arc::make_mut(&mut self.namespaces).entry(ns_name.clone()).or_insert_with(|| Namespace::new(&ns_name));
         let _ = ns.protected;
         ns.define(&name, value);
     }
@@ -206,7 +207,7 @@ impl EnvRef {
             return Err(format!("undefine requires a qualified name (namespace/name), got '{}'", qualified_name));
         }
 
-        if let Some(ns) = self.namespaces.get_mut(parts[0]) {
+        if let Some(ns) = Arc::make_mut(&mut self.namespaces).get_mut(parts[0]) {
             ns.undefine(parts[1]);
             Ok(())
         } else {
@@ -238,7 +239,7 @@ impl EnvRef {
         let parts: Vec<&str> = family_name.splitn(2, '/').collect();
         let name = if parts.len() == 2 { parts[1].to_string() } else { family_name.to_string() };
         let ns_name = if parts.len() == 2 { parts[0].to_string() } else { "kernel".to_string() };
-        let ns = self.namespaces.entry(ns_name).or_insert_with(|| Namespace::new("kernel"));
+        let ns = Arc::make_mut(&mut self.namespaces).entry(ns_name).or_insert_with(|| Namespace::new("kernel"));
         ns.data_families.insert(name, family);
     }
 
@@ -312,7 +313,7 @@ impl EnvRef {
         }
 
         // Remove constructors from the user namespace
-        if let Some(user_ns) = self.namespaces.get_mut("user") {
+        if let Some(user_ns) = Arc::make_mut(&mut self.namespaces).get_mut("user") {
             for ctor_key in &to_remove {
                 // Try exact match first
                 if user_ns.bindings.remove(ctor_key).is_none() {
@@ -329,7 +330,7 @@ impl EnvRef {
         }
 
         // Remove the family metadata from all namespaces
-        for ns in self.namespaces.values_mut() {
+        for ns in Arc::make_mut(&mut self.namespaces).values_mut() {
             ns.data_families.retain(|k, _| {
                 let retain = k != &name && !name.ends_with(k);
                 retain

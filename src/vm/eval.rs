@@ -36,7 +36,7 @@ pub enum EvalError {
     NotADataFamily(String),
     InvalidPattern(String),
     AuthorityDenied(String),
-    TailCall(Value, EnvRef),
+    TailCall(Value),
 }
 
 impl std::fmt::Display for EvalError {
@@ -52,7 +52,7 @@ impl std::fmt::Display for EvalError {
             EvalError::NotADataFamily(s) => write!(f, "not a data family: {}", s),
             EvalError::InvalidPattern(s) => write!(f, "invalid pattern: {}", s),
             EvalError::AuthorityDenied(s) => write!(f, "authority denied: {}", s),
-            EvalError::TailCall(_, _) => write!(f, "tail call"),
+            EvalError::TailCall(_) => write!(f, "tail call"),
         }
     }
 }
@@ -64,23 +64,18 @@ pub fn eval(input: &str, env: &mut EnvRef) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for expr in exprs {
         let mut current = expr;
-        let mut local = env.clone();
+        // Pass env directly — no clone needed. eval_value modifies env in place.
+        // TailCall signals "continue with current env" (frames already swapped in).
         loop {
-            match eval_value(current, &mut local) {
+            match eval_value(current, env) {
                 Ok(v) => { result = v; break; }
-                Err(EvalError::TailCall(next_expr, next_env)) => {
-                    // Continue evaluation in the environment that has the
-                    // lexical frame with params already bound. Frames are
-                    // accumulated during the tail chain but popped naturally
-                    // when a non-tail value is reached.
+                Err(EvalError::TailCall(next_expr)) => {
                     current = next_expr;
-                    local = next_env;
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
-        *env = local;
     }
     Ok(result)
 }
@@ -869,37 +864,39 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             })
         }
         Value::Function(Function::Interpreted { params, body, env_serialized }) => {
-            // Start from the current env (provides namespaces with real function pointers)
-            // and replace the lexical frames with the deserialized ones from closure capture.
-            // This avoids O(n) serialization of namespace bindings on every lambda definition.
-            let mut local = env.clone();
+            // Swap the current frames with the closure's captured frames.
+            // This avoids cloning the entire EnvRef (namespaces + bindings).
+            // The closure's frames are its definition-time lexical scope.
+            // We save the current frames, swap in the closure's, evaluate,
+            // then swap back. For tail calls, we return the env with the
+            // closure's frames (TailCall replaces the current frame).
+            let saved_frames = std::mem::take(&mut env.frames);
             if let Ok(frames) = serde_json::from_str::<Vec<HashMap<String, Value>>>(&env_serialized) {
-                local.frames = frames;
+                env.frames = frames;
             }
-            // The fallback is already set to the current env (from env.clone())
-            // so symbol lookups resolve against the current environment.
 
             // Tail call optimization: for single-expression bodies, bind params
-            // into the CURRENT frame (reusing it) instead of pushing a new one.
-            // This prevents frame accumulation across recursive calls.
-            // Without this, (define (loop) (loop)) would accumulate 1 frame per
-            // iteration and OOM after ~1M iterations.
+            // into the current frame (reusing it) instead of pushing a new one.
             if body.len() == 1 {
-                // Bind params into the current frame (reuse, don't push)
                 for (p, a) in params.iter().zip(args.into_iter()) {
-                    local.set_lexical(p, a);
+                    env.set_lexical(p, a);
                 }
                 let next_expr = body.into_iter().next().unwrap();
-                return Err(EvalError::TailCall(next_expr, local));
+                // Return TailCall without env — the trampoline continues with the
+                // same env (which already has the closure frames swapped in, and
+                // the original namespaces intact). No clone needed.
+                return Err(EvalError::TailCall(next_expr));
             }
 
             // Multi-expression body: push a new frame for lexical scoping
-            local.push_frame();
+            env.push_frame();
             for (p, a) in params.iter().zip(args.into_iter()) {
-                local.set_lexical(p, a);
+                env.set_lexical(p, a);
             }
-            let result = eval_begin(&body, &mut local);
-            local.pop_frame();
+            let result = eval_begin(&body, env);
+            env.pop_frame();
+            // Restore the saved frames (undo the closure frame swap)
+            env.frames = saved_frames;
             result
         }
         Value::Macro(Macro::Native { name: _, func, .. }) => {
