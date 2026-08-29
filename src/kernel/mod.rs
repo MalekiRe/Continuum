@@ -4,6 +4,7 @@ pub mod native;
 pub mod scheduler;
 pub mod event_log;
 pub mod compaction;
+pub mod model;
 
 use crate::vm::env::EnvRef;
 use crate::vm::eval;

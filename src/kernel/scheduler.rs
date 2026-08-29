@@ -1,13 +1,16 @@
+
 use crate::kernel::{Frame, FrameStatus, Kernel, FrameState};
 use crate::vm::eval;
 use crate::vm::value::Value;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scheduler {
     pub max_turns_per_frame: u32,
     pub fifteen_minute_ms: u64,
     pub supervise_efficiency: bool,
+    pub check_interval_ms: u64,
 }
 
 impl Default for Scheduler {
@@ -16,6 +19,7 @@ impl Default for Scheduler {
             max_turns_per_frame: 1000,
             fifteen_minute_ms: 15 * 60 * 1000,
             supervise_efficiency: true,
+            check_interval_ms: 1000,
         }
     }
 }
@@ -45,12 +49,13 @@ impl Scheduler {
         id
     }
 
+    /// Execute one cognition turn.
+    /// Returns the outcome and whether to schedule another turn.
     pub fn execute_turn(kernel: &mut Kernel, source: &str) -> Result<TurnOutcome, eval::EvalError> {
         let result = kernel.eval(source)?;
 
         let outcome = match &result {
             Value::Keyword(s) if s == "Continue" => {
-                let _ = Self::schedule_next(kernel);
                 TurnOutcome::Continued
             }
             Value::Keyword(s) if s == "Wait" => {
@@ -68,7 +73,6 @@ impl Scheduler {
                 TurnOutcome::Cancelled
             }
             _ => {
-                let _ = Self::schedule_next(kernel);
                 TurnOutcome::Continued
             }
         };
@@ -76,21 +80,20 @@ impl Scheduler {
         Ok(outcome)
     }
 
-    fn schedule_next(_kernel: &mut Kernel) -> Result<(), String> {
-        Ok(())
-    }
-
     fn frame_return(kernel: &mut Kernel, result: Value) {
         if let Some(mut frame) = kernel.frames.pop() {
             frame.status = FrameStatus::Completed;
-            if let Some(parent_id) = &frame.parent_id {
-                let msg = format!("(child/returned {:?} {:?})", frame.name, result);
-                let _ = msg;
-                let _ = parent_id;
+            // Deliver to parent frame's pending_subagent_result
+            if let Some(parent) = kernel.frames.last_mut() {
+                parent.state.pending_subagent_result = Some(result);
+                if parent.status == FrameStatus::Waiting {
+                    parent.status = FrameStatus::Running;
+                }
             }
         }
     }
 
+    /// Deliver a human interrupt.
     pub fn human_interrupt(kernel: &mut Kernel, message: &str) {
         if let Some(frame) = kernel.frames.last_mut() {
             frame.pending_message = Some(message.to_string());
@@ -101,35 +104,48 @@ impl Scheduler {
         }
     }
 
-    pub fn check_fifteen_minute_review(
+    /// Efficiency review: check tokens vs time spent waiting in tool calls.
+    pub fn efficiency_review(kernel: &Kernel) -> Option<String> {
+        if !kernel.storage.snapshot_count > 0 {
+            return None;
+        }
+
+        // Simple heuristic: if the event log shows many tool calls with few
+        // eval results between them, suggest batching.
+        let tool_event_count = kernel.event_counter;
+        let eval_count = kernel.compaction.summary_count() as u64;
+
+        if tool_event_count > 10 && eval_count < 2 {
+            Some("Use repo/history-batch instead of calling git once per commit.".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Fifteen-minute review: check if the current top-level call has been
+    /// running too long.
+    pub fn fifteen_minute_review(
+        kernel: &Kernel,
         start_time: chrono::DateTime<chrono::Utc>,
         threshold_ms: u64,
-    ) -> bool {
+    ) -> ReviewDecision {
         let elapsed = (chrono::Utc::now() - start_time).num_milliseconds() as u64;
-        elapsed >= threshold_ms
-    }
 
-    pub fn supervisor_advice(text: &str) -> Value {
-        Value::Tagged {
-            family: "supervisor".into(),
-            variant: "Advice".into(),
-            fields: vec![Value::string(text)],
-        }
-    }
-
-    pub fn supervisor_cancel(reason: &str) -> Value {
-        Value::Tagged {
-            family: "supervisor".into(),
-            variant: "Cancel".into(),
-            fields: vec![Value::string(reason)],
-        }
-    }
-
-    pub fn supervisor_no_action() -> Value {
-        Value::Tagged {
-            family: "supervisor".into(),
-            variant: "NoAction".into(),
-            fields: vec![],
+        if elapsed >= threshold_ms {
+            // Check the call stack for the current frame
+            if let Some(frame) = kernel.frames.last() {
+                // Simple heuristic: cancel if we see repetitive patterns
+                let queue_len = frame.message_queue.len();
+                if queue_len > 5 {
+                    return ReviewDecision::Cancel(
+                        format!("Frame '{}' has been running for {}ms with {} queued messages. Polling without progress?", 
+                            frame.name, elapsed, queue_len)
+                    );
+                }
+            }
+            ReviewDecision::Continue
+        } else {
+            ReviewDecision::NoAction
         }
     }
 }
@@ -143,6 +159,15 @@ pub enum TurnOutcome {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum ReviewDecision {
+    NoAction,
+    Continue,
+    Cancel(String),
+    Advice(String),
+}
+
+/// A review request for the supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewRequest {
     pub frame_id: String,

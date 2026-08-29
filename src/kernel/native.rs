@@ -9,8 +9,44 @@ impl Kernel {
                 Value::String(s) => s.clone(),
                 other => return Err(format!("web/search: expected string, got {}", other)),
             };
+
+            // Try Serper API if key is set
+            if let Ok(api_key) = std::env::var("SERPER_API_KEY") {
+                let client = reqwest::blocking::Client::new();
+                let body = serde_json::json!({"q": query});
+                match client
+                    .post("https://google.serper.dev/search")
+                    .header("X-API-KEY", &api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                {
+                    Ok(resp) => {
+                        match resp.json::<serde_json::Value>() {
+                            Ok(json) => {
+                                // Extract organic results
+                                let results = json["organic"].as_array()
+                                    .map(|arr| {
+                                        arr.iter().map(|item| {
+                                            let title = item["title"].as_str().unwrap_or("");
+                                            let link = item["link"].as_str().unwrap_or("");
+                                            let snippet = item["snippet"].as_str().unwrap_or("");
+                                            Value::string(&format!("{} - {}: {}", title, link, snippet))
+                                        }).collect::<Vec<Value>>()
+                                    })
+                                    .unwrap_or_default();
+                                return Ok(Value::List(results));
+                            }
+                            Err(e) => return Err(format!("web/search: parse error: {}", e)),
+                        }
+                    }
+                    Err(e) => return Err(format!("web/search: request error: {}", e)),
+                }
+            }
+
+            // Fallback: return placeholder
             Ok(Value::list(vec![
-                Value::string(&format!("result for: {}", query)),
+                Value::string(&format!("no results for: {} (set SERPER_API_KEY)", query)),
             ]))
         });
 
@@ -88,13 +124,32 @@ impl Kernel {
         });
 
         self.define_native("agent/call", 2, |args| {
-            let _name = match &args[0] {
+            let name = match &args[0] {
                 Value::String(s) => s.clone(),
                 Value::Symbol(s) => s.clone(),
                 other => return Err(format!("agent/call: expected name, got {}", other)),
             };
-            let _request = args[1].clone();
-            Ok(Value::keyword("called"))
+            let request = format!("{}", args[1]);
+
+            crate::kernel::with_kernel(|k| {
+                let child_id = k.spawn_subagent(&name, &request)?;
+
+                // Evaluate the request in the child frame context
+                // This is done by running eval in the child frame
+                let child_result = k.eval(&request).map_err(|e| e.to_string())?;
+
+                // Return from subagent
+                k.return_from_subagent(child_result.clone());
+
+                // Check if parent has a pending result from the subagent
+                if let Some(parent) = k.frames.last() {
+                    if let Some(result) = &parent.state.pending_subagent_result {
+                        return Ok(result.clone());
+                    }
+                }
+
+                Ok(child_result)
+            })
         });
 
         self.define_native("string/join", 2, |args| {
