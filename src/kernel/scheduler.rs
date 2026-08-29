@@ -37,6 +37,7 @@ impl Scheduler {
             state: FrameState {
                 local_bindings: Vec::new(),
                 current_continuation: None,
+                pending_subagent_result: None,
             },
         };
 

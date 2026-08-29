@@ -1,0 +1,24 @@
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define x 42)"}},"timestamp":"2026-08-29T04:54:31.454156159+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define answer 42)"}},"timestamp":"2026-08-29T04:54:31.454156179+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"'(1 2 3)"}},"timestamp":"2026-08-29T04:54:31.454161700+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(let ((x 10) (y 20)) (+ x y))"}},"timestamp":"2026-08-29T04:54:31.454169404+00:00"}
+
+
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T04:54:31.454234106+00:00"}{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T04:54:31.454236440+00:00"}{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"answer"}},"timestamp":"2026-08-29T04:54:31.454236611+00:00"}
+
+
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T04:54:31.454258782+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(define greeting \"hello\")"}},"timestamp":"2026-08-29T04:54:31.454259163+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(let ((x 42)) `(1 ,x 3))"}},"timestamp":"2026-08-29T04:54:31.454258702+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T04:54:31.454274772+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"30"}},"timestamp":"2026-08-29T04:54:31.454265295+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"greeting"}},"timestamp":"2026-08-29T04:54:31.454278580+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(+ 1 2)"}},"timestamp":"2026-08-29T04:54:31.454288408+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(1 42 3)"}},"timestamp":"2026-08-29T04:54:31.454301262+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"3"}},"timestamp":"2026-08-29T04:54:31.454307634+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"(if #t 1 2)"}},"timestamp":"2026-08-29T04:54:31.454322011+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"1"}},"timestamp":"2026-08-29T04:54:31.454336879+00:00"}
+{"frame_id":"frame-1","id":9,"kind":{"EvalRequest":{"source":"(define (add a b) (+ a b))"}},"timestamp":"2026-08-29T04:54:31.454353831+00:00"}
+{"frame_id":"frame-1","id":10,"kind":{"EvalResult":{"success":true,"value":"add"}},"timestamp":"2026-08-29T04:54:31.454560089+00:00"}
+{"frame_id":"frame-1","id":11,"kind":{"EvalRequest":{"source":"(add 3 4)"}},"timestamp":"2026-08-29T04:54:31.454575909+00:00"}
+{"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":true,"value":"7"}},"timestamp":"2026-08-29T04:54:31.454810740+00:00"}
+{"frame_id":"frame-1","id":13,"kind":{"EvalRequest":{"source":"(list 1 2 3)"}},"timestamp":"2026-08-29T04:54:31.454835757+00:00"}
+{"frame_id":"frame-1","id":14,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T04:54:31.454857969+00:00"}
