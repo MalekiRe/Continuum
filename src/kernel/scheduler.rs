@@ -95,23 +95,7 @@ impl Scheduler {
         }
     }
 
-    /// Efficiency review: check tokens vs time spent waiting in tool calls.
-    pub fn efficiency_review(kernel: &Kernel) -> Option<String> {
-        if !kernel.storage.snapshot_count > 0 {
-            return None;
-        }
 
-        // Simple heuristic: if the event log shows many tool calls with few
-        // eval results between them, suggest batching.
-        let tool_event_count = kernel.event_counter;
-        let eval_count = kernel.compaction.summary_count() as u64;
-
-        if tool_event_count > 10 && eval_count < 2 {
-            Some("Use repo/history-batch instead of calling git once per commit.".to_string())
-        } else {
-            None
-        }
-    }
 
     /// Fifteen-minute review: check if the current top-level call has been
     /// running too long.

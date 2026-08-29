@@ -64,26 +64,12 @@ fn check_supervision(kernel: &mut Kernel, timer: &mut Instant) {
         match &decision {
             kernel::ReviewDecision::Cancel(reason) => {
                 println!("[supervisor] cancelling: {}", reason);
-                kernel.record_event(
-                    kernel::event_log::EventKind::Supervise {
-                        action: "cancel".into(),
-                        reason: reason.clone(),
-                    },
-                    kernel.current_frame_id(),
-                );
                 if let Some(frame) = kernel.frames.last_mut() {
                     frame.status = FrameStatus::Completed;
                 }
             }
             kernel::ReviewDecision::Advice(advice) => {
                 println!("[supervisor] advice: {}", advice);
-                kernel.record_event(
-                    kernel::event_log::EventKind::Supervise {
-                        action: "advice".into(),
-                        reason: advice.clone(),
-                    },
-                    kernel.current_frame_id(),
-                );
             }
             _ => {}
         }
@@ -221,12 +207,6 @@ fn main() {
         check_hourly_snapshot(&mut kernel, &mut hourly_timer);
         check_supervision(&mut kernel, &mut supervision_timer);
 
-        // Efficiency check every 100 turns
-        if kernel.event_counter % 100 == 0 && kernel.event_counter > 0 {
-            if let Some(advice) = kernel::Scheduler::efficiency_review(&kernel) {
-                println!("[supervisor] efficiency: {}", advice);
-            }
-        }
 
         if maybe_restart_agent(&mut kernel) {
             continue;

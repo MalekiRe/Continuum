@@ -193,15 +193,6 @@ impl Kernel {
                 Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
             })
         });
-        self.define_native("system/compact", 0, |_args| {
-            with_kernel(|k| {
-                let summary = k.compact();
-                Ok(Value::string(&format!(
-                    "compacted events {}..{}: {}",
-                    summary.from_id, summary.to_id, summary.summary
-                )))
-            })
-        });
         self.define_native("system/event-log", 0, |_args| {
             with_kernel(|k| {
                 Ok(Value::string(&format!(
@@ -416,91 +407,10 @@ impl Kernel {
         });
 
         // history/read — read a specific event by ID
-        self.define_native("history/read", 1, |args| {
-            let event_id = match &args[0] {
-                Value::Int(id) => *id as u64,
-                other => return Err(format!("history/read: expected integer, got {}", other)),
-            };
-
-            // Read from event log file
-            let log_path = "data/event.log";
-            match std::fs::read_to_string(log_path) {
-                Ok(content) => {
-                    for line in content.lines() {
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-                            if event["id"].as_u64() == Some(event_id) {
-                                return Ok(Value::string(&serde_json::to_string_pretty(&event).unwrap_or_default()));
-                            }
-                        }
-                    }
-                    Ok(Value::string(&format!("no event with id {}", event_id)))
-                }
-                Err(e) => Err(format!("history/read: {}", e)),
-            }
-        });
 
         // history/zoom — zoom into a summary range, returning raw events
-        self.define_native("history/zoom", 2, |args| {
-            let from = match &args[0] {
-                Value::Int(id) => *id as u64,
-                other => return Err(format!("history/zoom: expected integer from, got {}", other)),
-            };
-            let to = match &args[1] {
-                Value::Int(id) => *id as u64,
-                other => return Err(format!("history/zoom: expected integer to, got {}", other)),
-            };
-
-            let log_path = "data/event.log";
-            match std::fs::read_to_string(log_path) {
-                Ok(content) => {
-                    let mut events = Vec::new();
-                    for line in content.lines() {
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-                            if let Some(id) = event["id"].as_u64() {
-                                if id >= from && id <= to {
-                                    let summary = format!("event #{}: {}",
-                                        id,
-                                        serde_json::to_string(&event["kind"]).unwrap_or_default()
-                                    );
-                                    events.push(Value::string(&summary));
-                                }
-                                if id > to {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(Value::List(events))
-                }
-                Err(e) => Err(format!("history/zoom: {}", e)),
-            }
-        });
 
         // history/find — search events by text content
-        self.define_native("history/find", 1, |args| {
-            let query = match &args[0] {
-                Value::String(s) => s.clone(),
-                other => return Err(format!("history/find: expected string, got {}", other)),
-            };
-
-            let q = query.to_lowercase();
-            let log_path = "data/event.log";
-            match std::fs::read_to_string(log_path) {
-                Ok(content) => {
-                    let mut results = Vec::new();
-                    for line in content.lines() {
-                        if line.to_lowercase().contains(&q) {
-                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-                                let id = event["id"].as_u64().unwrap_or(0);
-                                results.push(Value::string(&format!("#{}", id)));
-                            }
-                        }
-                    }
-                    Ok(Value::List(results))
-                }
-                Err(e) => Err(format!("history/find: {}", e)),
-            }
-        });
 
         // Model invocation — calls any OpenAI-compatible API
         

@@ -3,9 +3,6 @@ pub mod snapshot;
 pub mod native;
 pub mod scheduler;
 pub use scheduler::{Scheduler, ReviewDecision};
-pub mod event_log;
-pub use event_log::EventKind;
-pub mod compaction;
 
 use crate::vm::env::EnvRef;
 use crate::vm::eval;
@@ -59,11 +56,7 @@ pub struct Kernel {
     pub event_counter: u64,
     pub next_frame_id: u64,
     pub version: String,
-    #[serde(skip)]
-    pub event_log_path: String,
-    #[serde(skip)]
-    pub compaction: compaction::CompactionManager,
-    pub wake_timers: Vec<WakeEntry>,
+pub wake_timers: Vec<WakeEntry>,
 }
 
 /// An agent frame.
@@ -147,8 +140,7 @@ impl Kernel {
             event_counter: 0,
             next_frame_id: 1,
             version: "0.1.0".into(),
-            event_log_path: "data/event.log".into(),
-            compaction: compaction::CompactionManager::new("data/event.log"),
+
         };
 
         kernel.register_natives();
@@ -182,22 +174,15 @@ impl Kernel {
 
     pub fn eval(&mut self, source: &str) -> Result<Value, eval::EvalError> {
         // Record event
-        self.record_event(EventKind::EvalRequest { source: source.to_string() }, self.current_frame_id());
 
         let result = eval::eval(source, &mut self.env);
 
         match &result {
             Ok(val) => {
-                self.record_event(EventKind::EvalResult {
-                    value: val.to_string(),
-                    success: true,
-                }, self.current_frame_id());
+
             }
             Err(e) => {
-                self.record_event(EventKind::EvalResult {
-                    value: e.to_string(),
-                    success: false,
-                }, self.current_frame_id());
+
             }
         }
 
@@ -214,8 +199,6 @@ impl Kernel {
         crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
         crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
     }
-
-
 
     /// Evaluate Lisp in a read-eval-print loop, returning the result as a display string.
     /// Checks that the source hasn't been cancelled before executing.
@@ -249,39 +232,7 @@ impl Kernel {
         }
     }
 
-    /// Record an event in the append-only log.
-    pub fn record_event(&mut self, kind: EventKind, frame_id: Option<String>) -> u64 {
-        self.event_counter += 1;
-        let id = self.event_counter;
-
-        // Try to write to event log file
-        let event = serde_json::json!({
-            "id": id,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "kind": kind,
-            "frame_id": frame_id,
-        });
-
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.event_log_path)
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
-        }
-
-        // Rotate log if it exceeds 10MB
-        if let Ok(metadata) = std::fs::metadata(&self.event_log_path) {
-            if metadata.len() > 10_000_000 {
-                let rotated = format!("{}.{}", self.event_log_path, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
-                let _ = std::fs::rename(&self.event_log_path, &rotated);
-                self.event_counter = 0;
-            }
-        }
-
-        id
-    }
+    
 
     pub fn current_frame_id(&self) -> Option<String> {
         self.frames.last().map(|f| f.id.clone())
@@ -321,10 +272,6 @@ impl Kernel {
         let _ = self.eval(&child_source);
 
         // Record event
-        self.record_event(EventKind::AgentCall {
-            child_name: name.to_string(),
-            request: request.to_string(),
-        }, self.current_frame_id());
 
         Ok(id)
     }
@@ -343,10 +290,6 @@ impl Kernel {
                 }
             }
 
-            self.record_event(
-                EventKind::AgentReturn { value: value.to_string() },
-                frame.parent_id,
-            );
         }
     }
 
@@ -363,10 +306,6 @@ impl Kernel {
             }
         }
 
-        self.record_event(
-            EventKind::HumanMessage { text: text.to_string(), sender: "human".into() },
-            self.current_frame_id(),
-        );
     }
 
     /// Check and fire scheduled wake timers.
@@ -392,22 +331,7 @@ impl Kernel {
         fired.len()
     }
 
-    /// Compact the event log into summaries.
-    pub fn compact(&mut self) -> compaction::EventSummary {
-        let latest = self.event_counter;
-        let events_text = format!("{} events up to {}", latest, chrono::Utc::now().to_rfc3339());
-        let summary = self.compaction.compact(latest, &events_text);
-
-        self.record_event(
-            EventKind::Compact {
-                summary: summary.summary.clone(),
-                covered_events: (summary.from_id, summary.to_id),
-            },
-            None,
-        );
-
-        summary
-    }
+    
 
     /// Perform a snapshot.
     /// Check if an hourly full snapshot is due, and take one if so.
@@ -450,13 +374,6 @@ impl Kernel {
         let id = format!("snap-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
 
         // Record snapshot event before serializing
-        self.record_event(
-            EventKind::Snapshot {
-                kind: format!("{:?}", kind),
-                id: id.clone(),
-            },
-            None,
-        );
 
         let kernel_bytes = serde_json::to_vec(&self).unwrap_or_default();
         let checksum = {
@@ -616,8 +533,6 @@ impl Kernel {
         results.sort();
         results
     }
-
-
 
     /// Get the current frame's pending human message, if any.
     pub fn take_pending_message(&mut self) -> Option<String> {
