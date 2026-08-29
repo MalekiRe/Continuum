@@ -6,7 +6,6 @@ pub use scheduler::{Scheduler, ReviewDecision};
 pub mod event_log;
 pub use event_log::EventKind;
 pub mod compaction;
-pub mod model;
 
 use crate::vm::env::EnvRef;
 use crate::vm::eval;
@@ -625,34 +624,6 @@ impl Kernel {
     pub fn take_subagent_result(&mut self) -> Option<Value> {
         self.frames.last_mut().and_then(|f| f.state.pending_subagent_result.take())
     }
-}
-
-
-
-/// Macro: define a native function with compile-time arity checking.
-macro_rules! define_native_typed {
-    ($k:expr, $name:expr, 0, $func:expr) => {
-        $k.define_native($name, 0, |args| {
-            if !args.is_empty() { return Err(format!("{}: expected 0 args got {}", $name, args.len())); }
-            ($func)()
-        });
-    };
-    ($k:expr, $name:expr, 1, $func:expr) => {
-        $k.define_native($name, 1, |args| {
-            if args.len() != 1 { return Err(format!("{}: expected 1 arg got {}", $name, args.len())); }
-            ($func)(args.into_iter().next().unwrap())
-        });
-    };
-    ($k:expr, $name:expr, 2, $func:expr) => {
-        $k.define_native($name, 2, |args| {
-            if args.len() != 2 { return Err(format!("{}: expected 2 args got {}", $name, args.len())); }
-            let mut iter = args.into_iter();
-            ($func)(iter.next().unwrap(), iter.next().unwrap())
-        });
-    };
-    ($k:expr, $name:expr, v, $func:expr) => {
-        $k.define_native($name, 0, $func);
-    };
 }
 fn kind_name(kind: &SnapshotKind) -> &str {
     match kind {

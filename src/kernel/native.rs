@@ -3,31 +3,6 @@ use crate::vm::value::Value;
 use crate::kernel::Kernel;
 use std::collections::HashMap;
 
-/// Helper: make an HTTP POST request and return the JSON response.
-fn http_post(url: &str, api_key: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .header("HTTP-Referer", "http://localhost:5173")
-        .header("X-Title", "Persistent-Agent-Lisp-Harness")
-        .json(&body)
-        .send()
-        .map_err(|e| format!("HTTP request error: {}", e))?;
-
-    let status = resp.status();
-    let json: serde_json::Value = resp.json()
-        .map_err(|e| format!("HTTP parse error: {}", e))?;
-
-    if !status.is_success() {
-        let json_str = json.to_string();
-        let msg = json["error"]["message"].as_str().unwrap_or(&json_str);
-        return Err(format!("HTTP error ({}): {}", status, msg));
-    }
-    Ok(json)
-}
-
 impl Kernel {
     pub fn register_tools(&mut self) {
 
