@@ -65,7 +65,7 @@ fn main() {
 
     // Human input channel
     let (tx, rx) = mpsc::channel::<String>();
-    let _input_thread = thread::spawn(move || {
+    let input_thread = thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             match line {

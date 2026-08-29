@@ -266,6 +266,15 @@ impl Kernel {
             let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
         }
 
+        // Rotate log if it exceeds 10MB
+        if let Ok(metadata) = std::fs::metadata(&self.event_log_path) {
+            if metadata.len() > 10_000_000 {
+                let rotated = format!("{}.{}", self.event_log_path, chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                let _ = std::fs::rename(&self.event_log_path, &rotated);
+                self.event_counter = 0;
+            }
+        }
+
         id
     }
 
@@ -385,9 +394,26 @@ impl Kernel {
                 }
             }
         } else {
-            // First full snapshot
             self.snapshot(SnapshotKind::Full);
             self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
+        }
+
+        // Prune snapshots older than 7 days
+        if let Ok(entries) = std::fs::read_dir(&self.storage.snapshot_dir) {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+            for entry in entries.filter_map(|e| e.ok()) {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.created() {
+                        let modified_utc: chrono::DateTime<chrono::Utc> = modified.into();
+                        if modified_utc < cutoff {
+                            let path = entry.path();
+                            if path.extension().map_or(false, |ext| ext == "json" || ext == "meta") {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

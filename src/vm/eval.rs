@@ -891,20 +891,25 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
                 }
             }
 
-            local.push_frame();
-            for (p, a) in params.iter().zip(args.into_iter()) {
-                local.set_lexical(p, a);
-            }
-
-            // Tail call optimization via trampoline.
-            // Single-expression bodies return TailCall so the eval loop
-            // evaluates them without Rust stack growth. The frame must NOT
-            // be popped — the next evaluation still needs lexical bindings.
+            // Tail call optimization: for single-expression bodies, bind params
+            // into the CURRENT frame (reusing it) instead of pushing a new one.
+            // This prevents frame accumulation across recursive calls.
+            // Without this, (define (loop) (loop)) would accumulate 1 frame per
+            // iteration and OOM after ~1M iterations.
             if body.len() == 1 {
+                // Bind params into the current frame (reuse, don't push)
+                for (p, a) in params.iter().zip(args.into_iter()) {
+                    local.set_lexical(p, a);
+                }
                 let next_expr = body.into_iter().next().unwrap();
                 return Err(EvalError::TailCall(next_expr, local));
             }
 
+            // Multi-expression body: push a new frame for lexical scoping
+            local.push_frame();
+            for (p, a) in params.iter().zip(args.into_iter()) {
+                local.set_lexical(p, a);
+            }
             let result = eval_begin(&body, &mut local);
             local.pop_frame();
             result
