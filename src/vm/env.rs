@@ -117,9 +117,24 @@ impl EnvRef {
 
     pub fn lookup(&self, symbol: &str) -> Option<&Value> {
         if symbol.contains('/') {
-            let parts: Vec<&str> = symbol.splitn(2, '/').collect();
+            // Try all possible namespace/name splits (handles nested names)
+            let parts: Vec<&str> = symbol.split('/').collect();
+            // Try from the first split (most specific namespace)
+            for split_pos in (1..parts.len()).rev() {
+                let ns_name = parts[..split_pos].join("/");
+                let name = parts[split_pos..].join("/");
+                if let Some(ns) = self.namespaces.get(&ns_name) {
+                    if let Some(val) = ns.get(&name) {
+                        return Some(val);
+                    }
+                }
+            }
+            // Also try with the first component as the namespace
             if let Some(ns) = self.namespaces.get(parts[0]) {
-                return ns.get(parts[1]);
+                let name = parts[1..].join("/");
+                if let Some(val) = ns.get(&name) {
+                    return Some(val);
+                }
             }
             return None;
         }

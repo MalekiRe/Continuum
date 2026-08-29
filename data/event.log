@@ -22,3 +22,155 @@
 {"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":true,"value":"7"}},"timestamp":"2026-08-29T04:54:31.454810740+00:00"}
 {"frame_id":"frame-1","id":13,"kind":{"EvalRequest":{"source":"(list 1 2 3)"}},"timestamp":"2026-08-29T04:54:31.454835757+00:00"}
 {"frame_id":"frame-1","id":14,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T04:54:31.454857969+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define answer 42)"}},"timestamp":"2026-08-29T04:57:26.093691129+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"'(1 2 3)"}},"timestamp":"2026-08-29T04:57:26.093702821+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define x 42)"}},"timestamp":"2026-08-29T04:57:26.093691149+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(let ((x 10) (y 20)) (+ x y))"}},"timestamp":"2026-08-29T04:57:26.093691169+00:00"}
+
+
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"answer"}},"timestamp":"2026-08-29T04:57:26.093781829+00:00"}{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T04:57:26.093780837+00:00"}{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T04:57:26.093781979+00:00"}
+
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"30"}},"timestamp":"2026-08-29T04:57:26.093804732+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(define greeting \"hello\")"}},"timestamp":"2026-08-29T04:57:26.093813589+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T04:57:26.093815142+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(let ((x 42)) `(1 ,x 3))"}},"timestamp":"2026-08-29T04:57:26.093816043+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"greeting"}},"timestamp":"2026-08-29T04:57:26.093833656+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T04:57:26.093836612+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(+ 1 2)"}},"timestamp":"2026-08-29T04:57:26.093853714+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(1 42 3)"}},"timestamp":"2026-08-29T04:57:26.093862190+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"3"}},"timestamp":"2026-08-29T04:57:26.093880204+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"(if #t 1 2)"}},"timestamp":"2026-08-29T04:57:26.093898048+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"1"}},"timestamp":"2026-08-29T04:57:26.093918586+00:00"}
+{"frame_id":"frame-1","id":9,"kind":{"EvalRequest":{"source":"(define (add a b) (+ a b))"}},"timestamp":"2026-08-29T04:57:26.093935187+00:00"}
+{"frame_id":"frame-1","id":10,"kind":{"EvalResult":{"success":true,"value":"add"}},"timestamp":"2026-08-29T04:57:26.094177964+00:00"}
+{"frame_id":"frame-1","id":11,"kind":{"EvalRequest":{"source":"(add 3 4)"}},"timestamp":"2026-08-29T04:57:26.094196348+00:00"}
+{"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":true,"value":"7"}},"timestamp":"2026-08-29T04:57:26.094418656+00:00"}
+{"frame_id":"frame-1","id":13,"kind":{"EvalRequest":{"source":"(list 1 2 3)"}},"timestamp":"2026-08-29T04:57:26.094440878+00:00"}
+{"frame_id":"frame-1","id":14,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T04:57:26.094463380+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define-data result/Result (Ok value) (Err problem))"}},"timestamp":"2026-08-29T04:57:46.685433070+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"\n        (define-syntax my-when\n          (syntax-rules ()\n            ((my-when test body ...)\n             (if test (begin body ...) nil))))\n    "}},"timestamp":"2026-08-29T04:57:46.685433050+00:00"}
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"result/Result"}},"timestamp":"2026-08-29T04:57:46.685515605+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(user/result/Ok 42)"}},"timestamp":"2026-08-29T04:57:46.685533709+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":false,"value":"undefined symbol: user/result/Ok"}},"timestamp":"2026-08-29T04:57:46.685552765+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"my-when"}},"timestamp":"2026-08-29T04:57:46.685713066+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(my-when #t 42)"}},"timestamp":"2026-08-29T04:57:46.685734416+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":false,"value":"syntax error: no matching syntax-rules clause for my-when"}},"timestamp":"2026-08-29T04:57:46.685756998+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define-data result/Result (Ok value) (Err problem))"}},"timestamp":"2026-08-29T05:00:33.111482587+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"\n        (define-syntax my-when\n          (syntax-rules ()\n            ((my-when test body ...)\n             (if test (begin body ...) nil))))\n    "}},"timestamp":"2026-08-29T05:00:33.111482577+00:00"}
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"result/Result"}},"timestamp":"2026-08-29T05:00:33.111591061+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(user/result/Ok 42)"}},"timestamp":"2026-08-29T05:00:33.111619795+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":false,"value":"undefined symbol: user/result/Ok"}},"timestamp":"2026-08-29T05:00:33.111691459+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"my-when"}},"timestamp":"2026-08-29T05:00:33.111903869+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(my-when #t 42)"}},"timestamp":"2026-08-29T05:00:33.111927944+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:00:33.111960986+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(my-when #f 99)"}},"timestamp":"2026-08-29T05:00:33.111976285+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:00:33.111997114+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define x 10)"}},"timestamp":"2026-08-29T05:02:13.167110673+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define-data result/Result (Ok value) (Err problem))"}},"timestamp":"2026-08-29T05:02:13.167112236+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"\n        (define-syntax my-when\n          (syntax-rules ()\n            ((my-when test body ...)\n             (if test (begin body ...) nil))))\n    "}},"timestamp":"2026-08-29T05:02:13.167112216+00:00"}
+
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:02:13.167203427+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(define x 20)"}},"timestamp":"2026-08-29T05:02:13.167229687+00:00"}{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"result/Result"}},"timestamp":"2026-08-29T05:02:13.167225659+00:00"}
+
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(user/result/Result/Ok 42)"}},"timestamp":"2026-08-29T05:02:13.167254644+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:02:13.167262038+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(define x 30)"}},"timestamp":"2026-08-29T05:02:13.167282266+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(result/Result/Ok ...)"}},"timestamp":"2026-08-29T05:02:13.167294078+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:02:13.167307142+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"\n        (match (user/result/Result/Ok 42)\n          ((result/Ok n) (+ n 1))\n          ((result/Err msg) -1))\n    "}},"timestamp":"2026-08-29T05:02:13.167320507+00:00"}{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:02:13.167326449+00:00"}
+
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"30"}},"timestamp":"2026-08-29T05:02:13.167350784+00:00"}
+{"frame_id":"frame-1","id":9,"kind":{"EvalRequest":{"source":"(undefine x)"}},"timestamp":"2026-08-29T05:02:13.167369480+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":false,"value":"invalid form: match: no clause matched the value"}},"timestamp":"2026-08-29T05:02:13.167381582+00:00"}
+{"frame_id":"frame-1","id":10,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:02:13.167394266+00:00"}
+{"frame_id":"frame-1","id":11,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:02:13.167414013+00:00"}
+{"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":false,"value":"undefined symbol: x"}},"timestamp":"2026-08-29T05:02:13.167434692+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"my-when"}},"timestamp":"2026-08-29T05:02:13.167497390+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(my-when #t 42)"}},"timestamp":"2026-08-29T05:02:13.167521075+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:02:13.167557433+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(my-when #f 99)"}},"timestamp":"2026-08-29T05:02:13.167573904+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:02:13.167595234+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"(my-when #t (println 1) (println 2) 42)"}},"timestamp":"2026-08-29T05:02:13.167610132+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:02:13.167666919+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define x 10)"}},"timestamp":"2026-08-29T05:03:14.346045716+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define-data result/Result (Ok value) (Err problem))"}},"timestamp":"2026-08-29T05:03:14.346040416+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"\n        (define-syntax my-when\n          (syntax-rules ()\n            ((my-when test body ...)\n             (if test (begin body ...) nil))))\n    "}},"timestamp":"2026-08-29T05:03:14.346041157+00:00"}
+
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:03:14.346133040+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"result/Result"}},"timestamp":"2026-08-29T05:03:14.346154070+00:00"}{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(define x 20)"}},"timestamp":"2026-08-29T05:03:14.346158468+00:00"}
+
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:03:14.346192211+00:00"}{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(user/result/Result/Ok 42)"}},"timestamp":"2026-08-29T05:03:14.346192091+00:00"}
+
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(define x 30)"}},"timestamp":"2026-08-29T05:03:14.346214774+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(result/Result/Ok ...)"}},"timestamp":"2026-08-29T05:03:14.346237757+00:00"}{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:03:14.346240041+00:00"}
+
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:03:14.346263285+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"\n        (match (user/result/Result/Ok 42)\n          ((result/Result/Ok n) (+ n 1))\n          ((result/Result/Err msg) -1))\n    "}},"timestamp":"2026-08-29T05:03:14.346264247+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"30"}},"timestamp":"2026-08-29T05:03:14.346284254+00:00"}
+{"frame_id":"frame-1","id":9,"kind":{"EvalRequest":{"source":"(undefine x)"}},"timestamp":"2026-08-29T05:03:14.346303541+00:00"}
+{"frame_id":"frame-1","id":10,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:03:14.346328618+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"43"}},"timestamp":"2026-08-29T05:03:14.346333978+00:00"}
+{"frame_id":"frame-1","id":11,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:03:14.346347954+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"\n        (match (user/result/Result/Err \"oops\")\n          ((result/Result/Ok n) n)\n          ((result/Result/Err msg) (string/join \" \" (list \"ERROR:\" msg))))\n    "}},"timestamp":"2026-08-29T05:03:14.346359466+00:00"}
+{"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":false,"value":"undefined symbol: x"}},"timestamp":"2026-08-29T05:03:14.346369334+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"my-when"}},"timestamp":"2026-08-29T05:03:14.346409941+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":false,"value":"undefined symbol: string/join"}},"timestamp":"2026-08-29T05:03:14.346424638+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(my-when #t 42)"}},"timestamp":"2026-08-29T05:03:14.346439035+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:03:14.346475814+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(my-when #f 99)"}},"timestamp":"2026-08-29T05:03:14.346494700+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:03:14.346520749+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"(my-when #t (println 1) (println 2) 42)"}},"timestamp":"2026-08-29T05:03:14.346540777+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:03:14.346597744+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(let ((x 42)) `(1 ,x 3))"}},"timestamp":"2026-08-29T05:03:55.088983624+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define x 10)"}},"timestamp":"2026-08-29T05:03:55.088991949+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"\n        (define-syntax my-when\n          (syntax-rules ()\n            ((my-when test body ...)\n             (if test (begin body ...) nil))))\n    "}},"timestamp":"2026-08-29T05:03:55.088978254+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define-data result/Result (Ok value) (Err problem))"}},"timestamp":"2026-08-29T05:03:55.088986489+00:00"}
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:03:55.089094883+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"(1 42 3)"}},"timestamp":"2026-08-29T05:03:55.089103519+00:00"}{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(define x 20)"}},"timestamp":"2026-08-29T05:03:55.089114149+00:00"}
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"result/Result"}},"timestamp":"2026-08-29T05:03:55.089114069+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(user/result/Result/Ok 42)"}},"timestamp":"2026-08-29T05:03:55.089135139+00:00"}{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(let ((lst '(a b c))) `(x ,@lst y))"}},"timestamp":"2026-08-29T05:03:55.089130760+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:03:55.089137112+00:00"}
+
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(define x 30)"}},"timestamp":"2026-08-29T05:03:55.089155076+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:03:55.089174452+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(result/Result/Ok ...)"}},"timestamp":"2026-08-29T05:03:55.089176697+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(x a b c y)"}},"timestamp":"2026-08-29T05:03:55.089179552+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:03:55.089189140+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"\n        (match (user/result/Result/Ok 42)\n          ((result/Result/Ok n) (+ n 1))\n          ((result/Result/Err msg) -1))\n    "}},"timestamp":"2026-08-29T05:03:55.089194190+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"30"}},"timestamp":"2026-08-29T05:03:55.089205801+00:00"}
+{"frame_id":"frame-1","id":9,"kind":{"EvalRequest":{"source":"(undefine x)"}},"timestamp":"2026-08-29T05:03:55.089220319+00:00"}
+{"frame_id":"frame-1","id":10,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:03:55.089243653+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"43"}},"timestamp":"2026-08-29T05:03:55.089247860+00:00"}
+{"frame_id":"frame-1","id":11,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:03:55.089259062+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"\n        (match (user/result/Result/Err \"oops\")\n          ((result/Result/Ok n) n)\n          ((result/Result/Err msg) (string/join \" \" (list \"ERROR:\" msg))))\n    "}},"timestamp":"2026-08-29T05:03:55.089268609+00:00"}
+{"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":false,"value":"undefined symbol: x"}},"timestamp":"2026-08-29T05:03:55.089281514+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"\"\"ERROR:\" \"oops\"\""}},"timestamp":"2026-08-29T05:03:55.089334563+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"my-when"}},"timestamp":"2026-08-29T05:03:55.089419754+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(my-when #t 42)"}},"timestamp":"2026-08-29T05:03:55.089440192+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:03:55.089467543+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(my-when #f 99)"}},"timestamp":"2026-08-29T05:03:55.089482281+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"nil"}},"timestamp":"2026-08-29T05:03:55.089502639+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"(my-when #t (println 1) (println 2) 42)"}},"timestamp":"2026-08-29T05:03:55.089516445+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:03:55.089554747+00:00"}
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define x 42)"}},"timestamp":"2026-08-29T05:04:00.963466283+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(let ((x 10) (y 20)) (+ x y))"}},"timestamp":"2026-08-29T05:04:00.963477414+00:00"}
+
+{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"(define answer 42)"}},"timestamp":"2026-08-29T05:04:00.963495088+00:00"}{"frame_id":"frame-1","id":1,"kind":{"EvalRequest":{"source":"'(1 2 3)"}},"timestamp":"2026-08-29T05:04:00.963492423+00:00"}
+
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"x"}},"timestamp":"2026-08-29T05:04:00.963541635+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"answer"}},"timestamp":"2026-08-29T05:04:00.963547937+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T05:04:00.963552285+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"x"}},"timestamp":"2026-08-29T05:04:00.963561072+00:00"}
+{"frame_id":"frame-1","id":2,"kind":{"EvalResult":{"success":true,"value":"30"}},"timestamp":"2026-08-29T05:04:00.963564057+00:00"}
+{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(let ((x 42)) `(1 ,x 3))"}},"timestamp":"2026-08-29T05:04:00.963572413+00:00"}{"frame_id":"frame-1","id":3,"kind":{"EvalRequest":{"source":"(define greeting \"hello\")"}},"timestamp":"2026-08-29T05:04:00.963570930+00:00"}
+
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"42"}},"timestamp":"2026-08-29T05:04:00.963577462+00:00"}
+{"frame_id":"frame-1","id":5,"kind":{"EvalRequest":{"source":"(+ 1 2)"}},"timestamp":"2026-08-29T05:04:00.963591689+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"greeting"}},"timestamp":"2026-08-29T05:04:00.963595627+00:00"}
+{"frame_id":"frame-1","id":6,"kind":{"EvalResult":{"success":true,"value":"3"}},"timestamp":"2026-08-29T05:04:00.963611547+00:00"}
+{"frame_id":"frame-1","id":4,"kind":{"EvalResult":{"success":true,"value":"(1 42 3)"}},"timestamp":"2026-08-29T05:04:00.963611787+00:00"}
+{"frame_id":"frame-1","id":7,"kind":{"EvalRequest":{"source":"(if #t 1 2)"}},"timestamp":"2026-08-29T05:04:00.963635892+00:00"}
+{"frame_id":"frame-1","id":8,"kind":{"EvalResult":{"success":true,"value":"1"}},"timestamp":"2026-08-29T05:04:00.963655419+00:00"}
+{"frame_id":"frame-1","id":9,"kind":{"EvalRequest":{"source":"(define (add a b) (+ a b))"}},"timestamp":"2026-08-29T05:04:00.963668944+00:00"}
+{"frame_id":"frame-1","id":10,"kind":{"EvalResult":{"success":true,"value":"add"}},"timestamp":"2026-08-29T05:04:00.963893046+00:00"}
+{"frame_id":"frame-1","id":11,"kind":{"EvalRequest":{"source":"(add 3 4)"}},"timestamp":"2026-08-29T05:04:00.963911881+00:00"}
+{"frame_id":"frame-1","id":12,"kind":{"EvalResult":{"success":true,"value":"7"}},"timestamp":"2026-08-29T05:04:00.964135481+00:00"}
+{"frame_id":"frame-1","id":13,"kind":{"EvalRequest":{"source":"(list 1 2 3)"}},"timestamp":"2026-08-29T05:04:00.964158064+00:00"}
+{"frame_id":"frame-1","id":14,"kind":{"EvalResult":{"success":true,"value":"(1 2 3)"}},"timestamp":"2026-08-29T05:04:00.964181287+00:00"}

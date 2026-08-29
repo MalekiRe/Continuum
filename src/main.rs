@@ -1,10 +1,17 @@
 
-//! Persistent Agent Lisp Harness - REPL
-use persistent_lisp_harness::{Kernel, kernel::{self, SnapshotKind}};
+//! Persistent Agent Lisp Harness — Continuous Agent REPL
+//!
+//! The agent runs continuously. Unless it explicitly returns or waits,
+//! the kernel immediately schedules its next turn. Human messages
+//! interrupt and take priority.
+
+use persistent_lisp_harness::{Kernel, Value, kernel::{self, SnapshotKind, FrameStatus}};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-/// Load or create kernel with recovery.
 fn load_or_create_kernel() -> Kernel {
     if Path::new("snapshots").exists() {
         match Kernel::recover_from_latest() {
@@ -17,7 +24,6 @@ fn load_or_create_kernel() -> Kernel {
             }
         }
     }
-
     let mut k = Kernel::new();
     k.register_tools();
     let _ = std::fs::create_dir_all("data");
@@ -26,97 +32,139 @@ fn load_or_create_kernel() -> Kernel {
 }
 
 fn main() {
-    println!("╔══════════════════════════════════════════╗");
-    println!("║  Persistent Agent Lisp Harness v0.1.0   ║");
-    println!("║  Type (help) for info, (exit) to quit.  ║");
-    println!("╚══════════════════════════════════════════╝");
-    println!();
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  Persistent Agent Lisp Harness v0.1.0       ║");
+    println!("║  Continuous autonomous agent environment.    ║");
+    println!("║  Type a message to the agent at any time.    ║");
+    println!("║  Type '!!exit' to quit.                     ║");
+    println!("╚══════════════════════════════════════════════╝");
 
     let mut kernel = load_or_create_kernel();
-
-    // Set up kernel hook so system/natives can access the kernel
     kernel::set_kernel_hook(&mut kernel);
 
-    // Startup definitions
-    let startup = r#"
-        (define (help)
-          (println "=== Persistent Agent Lisp Harness ===")
-          (println "Special forms: define, undefine, lambda, if, begin, let, let*, letrec, set!")
-          (println "              quote, quasiquote, define-syntax, define-data, match")
-          (println "Natives:       +, -, *, /, =, <, >, cons, car, cdr, list")
-          (println "              display, println, read, nil?, number?, symbol?, string?")
-          (println "              list?, function?, keyword?")
-          (println "System:        system/version, system/clock, system/snapshot")
-          (println "              system/compact, system/event-log")
-          (println "Control:       control/Continue, control/Wait, control/Return")
-          (println "Tools:         web/search, fs/read, fs/write, proc/run, message/reply")
-          (println "              clock/wake, agent/call, string/join, string/split")
-          (println "              map/get, vector/get")
-          (println "")
-          (println "Meta:          (system/snapshot) — save state")
-          (println "               (system/event-log) — show event log")
-          (println "               (inspect/namespaces) — list namespaces")
-          (println "               (inspect/history 'name) — show version history")
-          (println "               (exit) — quit"))
+    // Load the agent core library
+    let agent_core = r#"
+        ;; Agent core library — continuous cognition loop
 
-        (define-data result/Result
-          (Ok value)
-          (Err problem)
-          (Cancelled reason)
-          (Indeterminate problem))
+        ;; The agent's main cognition function.
+        ;; Override this to customize behavior.
+        (define (agent/cognize context)
+          (let ((result (agent/think context "What should I do next?")))
+            (match result
+              ((result/Ok text)
+               (println "[agent] ~" text)
+               text)
+              ((result/Err msg)
+               (println "[agent] error: ~" msg)
+               nil))))
+
+        ;; The main agent loop.
+        ;; Calls (agent/cognize) until explicitly stopped.
+        (define (agent/start)
+          (begin
+            (println "[agent] started continuous cognition")
+            (agent/loop "Initial context")))
+
+        (define (agent/loop context)
+          (let ((result (agent/cognize context)))
+            (begin
+              (system/snapshot)
+              (agent/loop (string/join " " (list "Previous context:" context "Result:" result))))))
+
+        ;; Entry point
+        (agent/start)
     "#;
 
-    match kernel.eval(startup) {
-        Ok(_) => println!("[lisp] startup loaded"),
-        Err(e) => println!("[lisp] startup warning: {}", e),
+    match kernel.eval(agent_core) {
+        Ok(val) => println!("[agent] core loaded: {}", val),
+        Err(e) => println!("[agent] core load warning: {}", e),
     }
 
-    // Main REPL loop
+    // Set up human input channel
+    let (tx, rx) = mpsc::channel::<String>();
+    let _input_thread = thread::spawn(move || {
+        loop {
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let input = input.trim().to_string();
+            if !input.is_empty() {
+                tx.send(input).unwrap_or(());
+            }
+        }
+    });
+
+    // Agent loop — runs cognition turns, checks for human messages
+    let mut last_snapshot = std::time::Instant::now();
+
     loop {
-        let depth = kernel.frames.len();
-        let prompt = if depth > 1 {
-            format!("lisp[{}]> ", depth - 1)
-        } else {
-            "lisp> ".to_string()
-        };
+        // Check for human messages (non-blocking)
+        let human_msg = rx.try_recv().ok();
 
-        print!("{}", prompt);
-        io::stdout().flush().unwrap();
+        if let Some(msg) = human_msg {
+            if msg == "!!exit" || msg == "!!quit" {
+                kernel.snapshot(SnapshotKind::Full);
+                println!("[kernel] goodbye!");
+                break;
+            }
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let input = input.trim().to_string();
+            // Deliver human message as interrupt
+            kernel.human_message(&msg);
+            println!("[human] message delivered to agent frame");
+        }
 
-        if input.is_empty() {
+        // Check if current frame is waiting — if so, wait for human input
+        if kernel.frames.last().map(|f| f.status == kernel::FrameStatus::Waiting).unwrap_or(false) {
+            // Frame is waiting — pause briefly and check again
+            thread::sleep(Duration::from_millis(100));
+
+            // Take a snapshot periodically
+            if last_snapshot.elapsed() > Duration::from_secs(300) {
+                kernel.snapshot(SnapshotKind::Incremental);
+                last_snapshot = std::time::Instant::now();
+            }
             continue;
         }
 
-        if input == "(exit)" || input == "exit" || input == "quit" {
-            kernel.snapshot(SnapshotKind::Full);
-            println!("Goodbye!");
-            break;
+        // Check if the root frame is gone (agent returned)
+        if kernel.frames.is_empty() || 
+           kernel.frames.iter().all(|f| f.status == kernel::FrameStatus::Completed) {
+            println!("[agent] all frames completed. Restarting...");
+            kernel.eval("(agent/start)").ok();
+            continue;
         }
 
-        // Multi-line input support
-        let mut full_input = input.clone();
-        let mut open_parens = input.matches('(').count() as i64
-            - input.matches(')').count() as i64;
-        while open_parens > 0 {
-            print!("  ... ");
-            io::stdout().flush().unwrap();
-            let mut line = String::new();
-            io::stdin().read_line(&mut line).unwrap();
-            let line = line.trim().to_string();
-            open_parens += line.matches('(').count() as i64
-                - line.matches(')').count() as i64;
-            full_input.push_str(" ");
-            full_input.push_str(&line);
+        // Check for pending subagent results
+        if let Some(result) = kernel.take_subagent_result() {
+            println!("[agent] subagent returned: {}", result);
         }
 
-        let result = kernel.eval_repl(&full_input);
-        println!("{}", result);
+        // Run a Lisp cognition turn
+        match kernel.eval("(agent/loop nil)") {
+            Ok(val) => {
+                // Unless the agent explicitly returns/wait, schedule next turn
+                let should_continue = !matches!(&val, 
+                    Value::Keyword(s) if s == "Return" || s == "Wait");
+
+                if !should_continue {
+                    println!("[agent] pause requested");
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+            Err(e) => {
+                println!("[agent] cognition error: {}", e);
+                // Take snapshot on error to preserve state
+                kernel.snapshot(SnapshotKind::Incremental);
+                thread::sleep(Duration::from_millis(1000));
+            }
+        }
+
+        // Periodic snapshot
+        if last_snapshot.elapsed() > Duration::from_secs(300) {
+            kernel.snapshot(SnapshotKind::Incremental);
+            last_snapshot = std::time::Instant::now();
+        }
+
+        // Brief yield to avoid busy-waiting
+        thread::sleep(Duration::from_millis(50));
     }
-
-    kernel.snapshot(SnapshotKind::Full);
-    println!("[kernel] final snapshot saved");
 }

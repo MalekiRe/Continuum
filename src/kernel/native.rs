@@ -214,5 +214,60 @@ impl Kernel {
             let msg = format!("{}", args[0]);
             Err(msg)
         });
+
+        // Model invocation
+        self.define_native("model/invoke", 1, |args| {
+            let prompt = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+
+            let config = crate::kernel::model::ModelConfig::default();
+            let request = crate::kernel::model::ModelRequest::from_prompt(&prompt);
+
+            match crate::kernel::model::invoke_model(&config, &request) {
+                Ok(resp) => Ok(Value::string(&resp.text)),
+                Err(e) => Err(format!("model/invoke: {}", e)),
+            }
+        });
+
+        // Agent thinking: combine context and model call
+        self.define_native("agent/think", 2, |args| {
+            let context = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            let instruction = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+
+            let prompt = format!(
+                "Context:
+{}
+
+Instruction:
+{}
+
+Response:",
+                context, instruction
+            );
+
+            let config = crate::kernel::model::ModelConfig::default();
+            let request = crate::kernel::model::ModelRequest::from_prompt(&prompt);
+
+            match crate::kernel::model::invoke_model(&config, &request) {
+                Ok(resp) => Ok(Value::Tagged {
+                    family: "result".into(),
+                    variant: "Ok".into(),
+                    fields: vec![Value::string(&resp.text)],
+                }),
+                Err(e) => Ok(Value::Tagged {
+                    family: "result".into(),
+                    variant: "Err".into(),
+                    fields: vec![Value::string(&e)],
+                }),
+            }
+        });
     }
 }

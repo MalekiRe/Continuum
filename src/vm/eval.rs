@@ -483,7 +483,10 @@ fn eval_define_syntax(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalErr
             for rule in items[2..].iter() {
                 match rule {
                     Value::List(rule_items) if rule_items.len() >= 2 => {
-                        let pattern = rule_items[0..rule_items.len()-1].to_vec();
+                        let pattern = match &rule_items[0] {
+                            Value::List(items) => items.clone(),
+                            _ => return Err(EvalError::InvalidForm("syntax-rules: pattern must be a list".into())),
+                        };
                         let template = rule_items[rule_items.len()-1].clone();
                         rules.push((pattern, template));
                     }
@@ -540,11 +543,8 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
                 let var = variant_name.clone();
                 let fnames = field_names.clone();
                 let arity = fnames.len() as u32;
-                let constructor_name = if family_name.contains('/') {
-                    format!("{}/{}", family_name, variant_name)
-                } else {
-                    format!("user/{}/{}", family_name, variant_name)
-                };
+                // Store constructors as user/{family}/{variant}
+                let constructor_name = format!("user/{}/{}", family_name, variant_name);
 
                 let constructor = Value::Function(Function::Constructor {
                     family: family_name.clone(),
@@ -617,6 +617,30 @@ fn match_pattern(value: &Value, pattern: &Value, bindings: &mut HashMap<String, 
         Value::Int(n) => matches!(value, Value::Int(v) if v == n),
         Value::String(s) => matches!(value, Value::String(v) if v == s),
         Value::Keyword(k) => matches!(value, Value::Keyword(v) if v == k),
+        // Constructor pattern: (ctor-name field-pattern ...) matching tagged values
+        Value::List(items) if items.len() >= 1 && matches!(&items[0], Value::Symbol(_)) => {
+            if let Value::Tagged { family: f, variant: v, fields: vals } = value {
+                // Check if the pattern head matches the constructor
+                let ctor_name = format!("{}/{}", f, v);
+                if let Value::Symbol(ref s) = items[0] {
+                    if s == &ctor_name || s == v || s == &format!("{}/{}", f.split('/').last().unwrap_or(f), v) {
+                        // Match fields against pattern elements
+                        let pat_fields = &items[1..];
+                        if pat_fields.len() == vals.len() {
+                            return pat_fields.iter().zip(vals.iter()).all(|(p, v)| match_pattern(v, p, bindings));
+                        }
+                    }
+                }
+                false
+            } else {
+                // Regular list matching
+                if let Value::List(vals) = value {
+                    vals.len() == items.len() && items.iter().zip(vals.iter()).all(|(p, v)| match_pattern(v, p, bindings))
+                } else {
+                    false
+                }
+            }
+        }
         Value::List(items) => {
             if let Value::List(vals) = value {
                 vals.len() == items.len() && items.iter().zip(vals.iter()).all(|(p, v)| match_pattern(v, p, bindings))
@@ -661,47 +685,82 @@ fn try_expand_macro(name: &str, args: &[Value], env: &EnvRef) -> Result<Option<V
 }
 
 fn match_pattern_syntax(value: &Value, pattern: &[Value], bindings: &mut HashMap<String, Value>, literals: &[String]) -> bool {
+    // The whole form must be a list
+    let form_items = match value {
+        Value::List(items) => items,
+        _ => return false,
+    };
+
     if pattern.is_empty() {
-        return matches!(value, Value::Nil);
+        return form_items.is_empty();
     }
 
+    // Pattern element 0 is the macro name — must match literally as a symbol
+    // Pattern elements 1..N are the arguments
     let pat_head = &pattern[0];
-    let pat_tail = &pattern[1..];
+    let pat_args = &pattern[1..];
 
-    match pat_head {
-        Value::Symbol(s) if s == "_" => {
-            match value {
-                Value::List(items) if items.len() == pat_tail.len() + 1 => {
-                    pat_tail.iter().zip(items[1..].iter()).all(|(p, v)| match_syntax_pattern(p, v, bindings, literals))
-                }
-                _ => false,
-            }
-        }
-        Value::Symbol(s) if literals.contains(s) => {
-            match value {
-                Value::List(items) if !items.is_empty() => {
-                    if let Value::Symbol(name) = &items[0] {
-                        name == s && pat_tail.iter().zip(items[1..].iter()).all(|(p, v)| match_syntax_pattern(p, v, bindings, literals))
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        }
+    // Match the macro name
+    let name_match = match pat_head {
         Value::Symbol(s) => {
-            bindings.insert(s.clone(), value.clone());
-            true
+            // In syntax-rules, the first symbol of the pattern is the macro name
+            // It must match as a literal (not a binding variable)
+            form_items.first().map_or(false, |first| {
+                first == &Value::Symbol(s.clone())
+            })
         }
-        _ => {
-            match value {
-                Value::List(items) if !items.is_empty() => {
-                    match_syntax_pattern(pat_head, &items[0], bindings, literals)
-                        && pat_tail.iter().zip(items[1..].iter()).all(|(p, v)| match_syntax_pattern(p, v, bindings, literals))
-                }
-                _ => false,
+        _ => false,
+    };
+
+    if !name_match {
+        return false;
+    }
+
+    // Now match the remaining arguments
+    if pat_args.is_empty() {
+        return form_items.len() == 1; // just the name
+    }
+
+    // Handle ellipsis in the last pattern element
+    let has_ellipsis = pat_args.len() >= 2 && pat_args[pat_args.len()-1] == Value::Symbol("...".to_string());
+
+    if has_ellipsis {
+        // The pattern element before ... captures all remaining form items as a list
+        let repeated_var = &pat_args[pat_args.len() - 2];
+        let fixed_args = &pat_args[..pat_args.len() - 2];
+
+        // Match fixed arguments
+        let fixed_count = fixed_args.len();
+        let form_args = &form_items[1..]; // skip the name
+
+        if form_args.len() < fixed_count {
+            return false;
+        }
+
+        // Match fixed args
+        for (p, v) in fixed_args.iter().zip(form_args.iter()) {
+            if !match_syntax_pattern(p, v, bindings, literals) {
+                return false;
             }
         }
+
+        // Bind the repeated variable to the remaining form items as a list
+        let rest: Vec<Value> = form_args[fixed_count..].to_vec();
+        match repeated_var {
+            Value::Symbol(s) => {
+                bindings.insert(s.clone(), Value::List(rest));
+            }
+            _ => return false,
+        }
+
+        true
+    } else {
+        // No ellipsis: exact match
+        let form_args = &form_items[1..]; // skip the name
+        if form_args.len() != pat_args.len() {
+            return false;
+        }
+        pat_args.iter().zip(form_args.iter()).all(|(p, v)| match_syntax_pattern(p, v, bindings, literals))
     }
 }
 
@@ -733,8 +792,24 @@ fn apply_template(template: &Value, bindings: &HashMap<String, Value>) -> Result
             Ok(bindings.get(s).cloned().unwrap_or_else(|| Value::Symbol(s.clone())))
         }
         Value::List(items) => {
-            let evaled: Result<Vec<Value>, _> = items.iter().map(|item| apply_template(item, bindings)).collect();
-            Ok(Value::List(evaled?))
+            let mut result = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                // Check for ellipsis: pattern_var followed by ...
+                if i + 1 < items.len() && items[i + 1] == Value::Symbol("...".to_string()) {
+                    if let Value::Symbol(var_name) = &items[i] {
+                        if let Some(Value::List(vals)) = bindings.get(var_name) {
+                            // Splice the list
+                            result.extend(vals.clone());
+                        }
+                        i += 2; // skip both the variable and ...
+                        continue;
+                    }
+                }
+                result.push(apply_template(&items[i], bindings)?);
+                i += 1;
+            }
+            Ok(Value::List(result))
         }
         other => Ok(other.clone()),
     }
