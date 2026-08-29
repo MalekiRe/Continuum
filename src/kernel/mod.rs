@@ -175,8 +175,13 @@ impl Kernel {
         // Record event
         self.record_event(EventKind::EvalRequest { source: source.to_string() }, self.current_frame_id());
 
+        // Snapshot before evaluation (REPL boundary — save quiescent state)
+        self.snapshot(SnapshotKind::Incremental);
+
         // Intercept kernel-native calls before regular evaluation
         if let Some(result) = self.try_kernel_intercept(source) {
+            // Snapshot after kernel intercept
+            self.snapshot(SnapshotKind::Incremental);
             return result;
         }
 
@@ -196,6 +201,9 @@ impl Kernel {
                 }, self.current_frame_id());
             }
         }
+
+        // Snapshot after evaluation (another REPL boundary)
+        self.snapshot(SnapshotKind::Incremental);
 
         result
     }
@@ -413,7 +421,7 @@ impl Kernel {
     /// Perform a snapshot.
     pub fn snapshot(&mut self, kind: SnapshotKind) -> Snapshot {
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let id = format!("snap-{:06}", self.storage.snapshot_count + 1);
+        let id = format!("snap-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
 
         // Record snapshot event before serializing
         self.record_event(
@@ -467,40 +475,69 @@ impl Kernel {
         let snapshot_dir = "snapshots";
         let _ = std::fs::create_dir_all(snapshot_dir);
 
-        let mut snap_files: Vec<_> = std::fs::read_dir(snapshot_dir)
+        // Try to find the latest full snapshot first
+        let mut full_files: Vec<_> = std::fs::read_dir(snapshot_dir)
             .map_err(|e| format!("cannot read snapshot dir: {}", e))?
             .filter_map(|entry| entry.ok())
             .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
             .filter(|e| {
                 e.path().file_name()
                     .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with("full-") || n.starts_with("inc-"))
+                    .map_or(false, |n| n.starts_with("full-"))
             })
             .collect();
 
-        snap_files.sort_by_key(|e| {
+        full_files.sort_by_key(|e| {
             e.path().file_name()
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         });
 
-        let latest = snap_files.last()
-            .ok_or_else(|| "no snapshots found".to_string())?;
+        // Fall back to incremental snapshots if no full snapshot exists
+        let latest_path = if let Some(full) = full_files.last() {
+            full.path().clone()
+        } else {
+            let mut inc_files: Vec<_> = std::fs::read_dir(snapshot_dir)
+                .map_err(|e| format!("cannot read snapshot dir: {}", e))?
+                .filter_map(|entry| entry.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+                .filter(|e| {
+                    e.path().file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| n.starts_with("inc-"))
+                })
+                .collect();
 
-        let bytes = std::fs::read(latest.path())
+            inc_files.sort_by_key(|e| {
+                e.path().file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            });
+
+            inc_files.last()
+                .ok_or_else(|| "no snapshots found".to_string())?
+                .path()
+                .clone()
+        };
+
+        let bytes = std::fs::read(&latest_path)
             .map_err(|e| format!("cannot read snapshot: {}", e))?;
 
-        let kernel: Kernel = serde_json::from_slice(&bytes)
+        let mut kernel: Kernel = serde_json::from_slice(&bytes)
             .map_err(|e| format!("cannot deserialize kernel: {}", e))?;
 
-        println!("[kernel] recovered from {}", latest.path().display());
+        // Re-register native function pointers (they can't survive serialization)
+        kernel.register_natives();
+
+        println!("[kernel] recovered from {} (natives re-registered)", latest_path.display());
         Ok(kernel)
     }
 
     // ---- Registration ----
 
-    fn register_natives(&mut self) {
+    pub fn register_natives(&mut self) {
         use crate::lisp_fn;
         // Arithmetic
         self.define_native("kernel/+", 2, |args| {

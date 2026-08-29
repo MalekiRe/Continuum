@@ -123,7 +123,7 @@ impl Kernel {
             Ok(Value::keyword("scheduled"))
         });
 
-        self.define_native("agent/call", 2, |args| {
+                self.define_native("agent/call", 2, |args| {
             let name = match &args[0] {
                 Value::String(s) => s.clone(),
                 Value::Symbol(s) => s.clone(),
@@ -132,19 +132,30 @@ impl Kernel {
             let request = format!("{}", args[1]);
 
             crate::kernel::with_kernel(|k| {
-                let child_id = k.spawn_subagent(&name, &request)?;
+                let child_name = name.clone();
+                let request_text = request.clone();
 
-                // Evaluate the request in the child frame context
-                // This is done by running eval in the child frame
-                let child_result = k.eval(&request).map_err(|e| e.to_string())?;
+                // Spawn the child frame
+                let _child_id = k.spawn_subagent(&child_name, &request_text)?;
 
-                // Return from subagent
+                // Mark parent as waiting (paused)
+                if let Some(frame) = k.frames.last_mut() {
+                    frame.status = crate::kernel::FrameStatus::Waiting;
+                }
+
+                // Evaluate in the child frame context
+                let child_result = k.eval(&request_text).map_err(|e| {
+                    format!("agent/call: child error: {}", e)
+                })?;
+
+                // Return from subagent — pops child, delivers to parent
                 k.return_from_subagent(child_result.clone());
 
-                // Check if parent has a pending result from the subagent
-                if let Some(parent) = k.frames.last() {
-                    if let Some(result) = &parent.state.pending_subagent_result {
-                        return Ok(result.clone());
+                // Check for delivered result in parent
+                if let Some(parent) = k.frames.last_mut() {
+                    parent.status = crate::kernel::FrameStatus::Running;
+                    if let Some(result) = parent.state.pending_subagent_result.take() {
+                        return Ok(result);
                     }
                 }
 
@@ -215,7 +226,37 @@ impl Kernel {
             Err(msg)
         });
 
-        // Model invocation
+        // inspect/find — semantic search across all bindings
+        self.define_native("inspect/find", 1, |args| {
+            let query = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("inspect/find: expected string, got {}", other)),
+            };
+
+            crate::kernel::with_kernel(|k| {
+                let results = k.find_bindings(&query);
+                let items: Vec<Value> = results.iter().map(|r| Value::string(r)).collect();
+                Ok(Value::List(items))
+            })
+        });
+
+        // inspect/source — show source code of a definition
+        self.define_native("inspect/source", 1, |args| {
+            let name = match &args[0] {
+                Value::Symbol(s) => s.clone(),
+                other => return Err(format!("inspect/source: expected symbol, got {}", other)),
+            };
+
+            crate::kernel::with_kernel(|k| {
+                let qualified = if name.contains('/') { name.clone() } else { format!("user/{}", name) };
+                match k.env.lookup(&qualified) {
+                    Some(val) => Ok(Value::string(&format!("{}", val))),
+                    None => Err(format!("no binding for {}", name)),
+                }
+            })
+        });
+
+        // Model invocation — calls any OpenAI-compatible API
         self.define_native("model/invoke", 1, |args| {
             let prompt = match &args[0] {
                 Value::String(s) => s.clone(),
@@ -226,12 +267,43 @@ impl Kernel {
             let request = crate::kernel::model::ModelRequest::from_prompt(&prompt);
 
             match crate::kernel::model::invoke_model(&config, &request) {
-                Ok(resp) => Ok(Value::string(&resp.text)),
-                Err(e) => Err(format!("model/invoke: {}", e)),
+                Ok(resp) => {
+                    // Record cost for logging
+                    if resp.cost > 0.0 {
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("data/model-costs.log")
+                            .map(|mut f| {
+                                use std::io::Write;
+                                let _ = writeln!(f, "{} | model={} tokens={}+{} cost=${:.6}",
+                                    chrono::Utc::now().to_rfc3339(),
+                                    resp.model_used,
+                                    resp.tokens_prompt,
+                                    resp.tokens_generated,
+                                    resp.cost);
+                            });
+                    }
+                    Ok(Value::Tagged {
+                        family: "result".into(),
+                        variant: "Ok".into(),
+                        fields: vec![
+                            Value::string(&resp.text),
+                            Value::string(&resp.model_used),
+                            Value::int(resp.tokens_generated as i64),
+                            Value::Float(resp.cost),
+                        ],
+                    })
+                }
+                Err(e) => Ok(Value::Tagged {
+                    family: "result".into(),
+                    variant: "Err".into(),
+                    fields: vec![Value::string(&e)],
+                }),
             }
         });
 
-        // Agent thinking: combine context and model call
+        // Agent think: structured cognition call
         self.define_native("agent/think", 2, |args| {
             let context = match &args[0] {
                 Value::String(s) => s.clone(),
@@ -267,6 +339,52 @@ Response:",
                     variant: "Err".into(),
                     fields: vec![Value::string(&e)],
                 }),
+            }
+        });
+
+        // Model chat: multi-turn conversation
+        self.define_native("model/chat", 2, |args| {
+            let messages_val = &args[0];
+            let config_override = &args[1];
+
+            let messages = match messages_val {
+                Value::List(items) => {
+                    items.iter().filter_map(|item| {
+                        match item {
+                            Value::List(parts) if parts.len() == 2 => {
+                                match (&parts[0], &parts[1]) {
+                                    (Value::String(role), Value::String(content)) => {
+                                        Some(crate::kernel::model::Message {
+                                            role: role.clone(),
+                                            content: content.clone(),
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }).collect::<Vec<_>>()
+                }
+                _ => return Err("model/chat: expected list of (role content) pairs".into()),
+            };
+
+            if messages.is_empty() {
+                return Err("model/chat: at least one message required".into());
+            }
+
+            let mut config = crate::kernel::model::ModelConfig::default();
+
+            // Check for model override
+            if let Value::Keyword(model_name) = config_override {
+                config.model = model_name.to_string();
+            }
+
+            let request = crate::kernel::model::ModelRequest::from_chat(messages);
+
+            match crate::kernel::model::invoke_model(&config, &request) {
+                Ok(resp) => Ok(Value::string(&resp.text)),
+                Err(e) => Err(format!("model/chat: {}", e)),
             }
         });
     }
