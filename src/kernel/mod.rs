@@ -234,13 +234,15 @@ impl Kernel {
 
         match self.eval(source) {
             Ok(val) => {
-                // If the result was CancelCurrent, record the cancelled call token
+                // If the result was CancelCurrent, record the cancelled SOURCE
+                // so the exact same call can't be re-executed.
                 if let Value::Tagged { family, variant, fields } = &val {
                     if family == "control" && variant == "CancelCurrent" {
                         if let Some(frame) = self.frames.last_mut() {
-                            if let Some(reason) = fields.first() {
-                                frame.state.cancelled_tokens.push(format!("{}", reason));
-                            }
+                            // Store the original source expression, not the reason.
+                            // The reason is a human message; the source is the expression
+                            // that was cancelled. Comparing source against source is correct.
+                            frame.state.cancelled_tokens.push(source.to_string());
                         }
                     }
                 }
