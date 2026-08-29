@@ -83,7 +83,6 @@ fn main() {
     // Continuous cognition loop
     let mut hourly_timer = Instant::now();
     let mut supervision_timer = Instant::now();
-    let mut call_start_time = Instant::now();
 
     loop {
         // === Check for human messages ===
@@ -188,7 +187,6 @@ fn main() {
             "(agent/loop nil)".to_string()
         };
 
-        call_start_time = Instant::now();
         match kernel.eval(&source) {
             Ok(val) => {
                 // Unless the agent explicitly returns/wait, schedule next turn immediately

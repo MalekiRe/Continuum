@@ -44,6 +44,14 @@ where
 }
 
 /// The Persistent Agent Lisp Harness Kernel.
+/// A scheduled wake-up call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeEntry {
+    pub wake_at: String,
+    pub action: String,
+    pub frame_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Kernel {
     pub env: EnvRef,
@@ -52,12 +60,11 @@ pub struct Kernel {
     pub event_counter: u64,
     pub next_frame_id: u64,
     pub version: String,
-    /// Path for the event log (not serialized; restored from config).
     #[serde(skip)]
     pub event_log_path: String,
-    /// In-memory compaction manager (rebuilt from event log).
     #[serde(skip)]
     pub compaction: compaction::CompactionManager,
+    pub wake_timers: Vec<WakeEntry>,
 }
 
 /// An agent frame.
@@ -75,7 +82,6 @@ pub struct Frame {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FrameStatus {
     Running,
-    Suspended,
     Waiting,
     Cancelled,
     Completed,
@@ -137,6 +143,7 @@ impl Kernel {
         let mut kernel = Kernel {
             env: EnvRef::new(),
             frames: Vec::new(),
+            wake_timers: Vec::new(),
             storage: SnapshotConfig::default(),
             event_counter: 0,
             next_frame_id: 1,
@@ -220,7 +227,7 @@ impl Kernel {
         // Check if this source matches a cancelled call
         if let Some(frame) = self.frames.last() {
             for token in &frame.state.cancelled_tokens {
-                if source.contains(token) {
+                if source.trim() == token.as_str() {
                     return format!("cancelled: call was previously cancelled and will not be re-executed");
                 }
             }
@@ -364,6 +371,29 @@ impl Kernel {
         );
     }
 
+    /// Check and fire scheduled wake timers.
+    pub fn check_wake_timers(&mut self) -> usize {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut fired = Vec::new();
+        self.wake_timers.retain(|entry| {
+            if entry.wake_at.as_str() <= now.as_str() {
+                fired.push(entry.action.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for action in &fired {
+            if let Some(frame) = self.frames.last_mut() {
+                frame.message_queue.push(action.clone());
+                if frame.status == FrameStatus::Waiting {
+                    frame.status = FrameStatus::Running;
+                }
+            }
+        }
+        fired.len()
+    }
+
     /// Compact the event log into summaries.
     pub fn compact(&mut self) -> compaction::EventSummary {
         let latest = self.event_counter;
@@ -468,7 +498,6 @@ impl Kernel {
     }
 
     pub fn recover_from_latest() -> Result<Self, String> {
-        use std::path::Path;
 
         let snapshot_dir = "snapshots";
         let _ = std::fs::create_dir_all(snapshot_dir);
@@ -585,68 +614,7 @@ impl Kernel {
         results
     }
 
-    /// Build context for the model: agent stack + messages + recent events + summaries.
-    pub fn build_context(&self, frame_idx: usize) -> String {
-        let mut parts = Vec::new();
 
-        // Agent stack
-        parts.push("=== Agent Stack ===".to_string());
-        for (i, frame) in self.frames.iter().enumerate() {
-            let depth = "  ".repeat(i);
-            let status = match frame.status {
-                FrameStatus::Running => "running",
-                FrameStatus::Waiting => "waiting",
-                FrameStatus::Suspended => "suspended",
-                FrameStatus::Cancelled => "cancelled",
-                FrameStatus::Completed => "completed",
-            };
-            parts.push(format!("{}frame {}: {} ({})", depth, frame.name, frame.id, status));
-        }
-
-        // Human messages
-        if let Some(frame) = self.frames.get(frame_idx) {
-            if !frame.message_queue.is_empty() {
-                parts.push("
-=== Messages ===".to_string());
-                for msg in &frame.message_queue {
-                    parts.push(format!("  {}", msg));
-                }
-            }
-        }
-
-        // Recent events from event log
-        parts.push("
-=== Recent Events ===".to_string());
-        if let Ok(events) = std::fs::read_to_string(&self.event_log_path) {
-            let lines: Vec<&str> = events.lines().rev().take(10).collect();
-            for line in lines.iter().rev() {
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-                    let kind = &event["kind"];
-                    let id = event["id"].as_u64().unwrap_or(0);
-                    let summary = match kind {
-                        serde_json::Value::Object(m) => {
-                            m.keys().next().cloned().unwrap_or("unknown".to_string())
-                        }
-                        _ => "unknown".to_string(),
-                    };
-                    parts.push(format!("  event {}: {}", id, summary));
-                }
-            }
-        } else {
-            parts.push("  (no event log)".to_string());
-        }
-
-        // Compaction summaries
-        if self.compaction.summary_count() > 0 {
-            parts.push("
-=== Compaction Summaries ===".to_string());
-            // Summaries are not easily accessible from Kernel (they're in CompactionManager)
-            parts.push(format!("  {} summaries available", self.compaction.summary_count()));
-        }
-
-        parts.join("
-")
-    }
 
     /// Get the current frame's pending human message, if any.
     pub fn take_pending_message(&mut self) -> Option<String> {

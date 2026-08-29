@@ -3,7 +3,6 @@ use crate::kernel::{Frame, FrameStatus, Kernel, FrameState};
 use crate::vm::eval;
 use crate::vm::value::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scheduler {

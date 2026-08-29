@@ -40,7 +40,7 @@ impl CompactionManager {
     }
 
     /// Build or update summaries for recent events.
-    pub fn compact(&mut self, latest_id: u64, events_text: &str) -> EventSummary {
+    pub fn compact(&mut self, latest_id: u64, _events_text: &str) -> EventSummary {
         let from_id = self.summaries.last()
             .map(|s| s.to_id + 1)
             .unwrap_or(1);

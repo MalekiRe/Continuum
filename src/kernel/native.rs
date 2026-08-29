@@ -320,12 +320,22 @@ impl Kernel {
 
         
         self.define_native("wake", 2, |args| {
-            let _duration = match &args[0] {
+            let duration_ms = match &args[0] {
                 Value::Int(ms) => *ms,
-                _ => return Err("clock/wake: expected integer milliseconds".into()),
+                other => return Err(format!("wake: expected integer milliseconds, got {}", other)),
             };
-            let _action = args[1].clone();
-            Ok(Value::keyword("scheduled"))
+            let action = format!("{}", args[1]);
+
+            crate::kernel::with_kernel(|k| {
+                let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(duration_ms);
+                let frame_id = k.frames.last().map(|f| f.id.clone()).unwrap_or_default();
+                k.wake_timers.push(crate::kernel::WakeEntry {
+                    wake_at: wake_at.to_rfc3339(),
+                    action,
+                    frame_id,
+                });
+                Ok(Value::keyword("scheduled"))
+            })
         });
 
                 self.define_native("agent/call", 2, |args| {

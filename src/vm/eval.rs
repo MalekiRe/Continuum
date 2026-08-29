@@ -568,8 +568,8 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
                 }).collect();
 
                 // Register constructor as a Lisp function that returns a tagged value
-                let fam = family_name.clone();
-                let var = variant_name.clone();
+                let _fam = family_name.clone();
+                let _var = variant_name.clone();
                 let arity = field_names.len() as u32;
                 // Store constructors as user/{family}/{variant}
                 let constructor_name = format!("user/{}/{}", family_name, variant_name);
