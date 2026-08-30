@@ -7,7 +7,7 @@ Model/AI
   ↕
 Lisp VM (continuum)
   ↕
-Rust kernel (3,145 lines, 0 unsafe)
+Rust kernel
   ↕
 Tools, APIs, processes, storage
 ```
@@ -16,7 +16,7 @@ The kernel is small. Lisp owns everything else. The kernel provides only what th
 
 ## Architecture
 
-**Kernel** (Rust, 3,145 lines, 0 `unsafe`, 0 warnings) owns the Lisp VM, persistent namespaces with versioned history, subagent scheduling, snapshots & crash recovery, native functions, human interrupts, and execution supervision.
+**Kernel** (Rust, 3,145 lines) owns the Lisp VM, persistent namespaces with versioned history, subagent scheduling, snapshots & crash recovery, native functions, human interrupts, and execution supervision.
 
 **EnvRef** lives on the `Kernel` struct itself — `kernel.env` is the single source of truth for all bindings. Every eval function receives `&mut Kernel` and accesses `kernel.env` at use sites. No globals, no thread-local storage, no raw pointer dereferencing anywhere.
 
@@ -97,11 +97,8 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 3. **Definitions persist.** Every `define` creates a new version. `undefine` removes the current binding without erasing history. `inspect/history` shows the full version trail.
 4. **Snapshots are atomic.** You can never save mid-call. Recovery restores the exact pre-call state.
 5. **The kernel can always interrupt Lisp.** A safepoint mechanism checks every 1,000 expressions.
-6. **Zero unsafe.** The entire kernel is safe Rust. No thread-local storage, no global hooks, no raw pointer dereferencing.
 
 ## Stats
 
 - 3,145 lines of Rust
-- 0 `unsafe` blocks
-- 0 compiler warnings
 - 21 tests across 3 test suites
