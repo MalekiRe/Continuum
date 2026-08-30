@@ -25,23 +25,21 @@ A Scheme-like Lisp with:
 | Pattern matching | `match` with constructor pattern destructuring |
 | Tagged values | `(Ok value)`, `(Err problem)`, `(Cancelled reason)`, `(Indeterminate problem)` |
 
-
-
 ## Design
 
 **Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
 
 **Supervision.** Every cognition loop iteration checks two timeouts:
-- **Absolute timeout** (default 900s): if a top-level eval has been running too long, it's unconditionally interrupted.
-- **Rolling-window token-aware timeout**: token reports from Lisp (`(system/report-tokens N)`) are tracked in a sliding window (default 60s). If the effective token rate drops below the minimum (default 2 tok/s) and the eval has been running long enough (30s), the supervisor interrupts. This catches agents stuck in blocking `bash` calls — even if they reported tokens minutes ago. All thresholds are configurable via `SupervisionConfig` on the kernel.
-
-**Human interaction.** Human messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and the agent returns `control/Continue` or `(control/CancelCurrent ...)`.
+- **Absolute timeout** (default 900s): if a top-level eval runs too long, it's interrupted unconditionally.
+- **Rolling-window token check**: Lisp reports token usage via `(system/report-tokens N)` after model calls. Reports are tracked in a 60-second sliding window. If the effective token rate drops below 2 tok/s and the eval has been running for at least 30s, the supervisor interrupts. This catches agents stuck in blocking `bash` calls — even if they reported tokens minutes ago. All thresholds are configurable via `SupervisionConfig` on the kernel.
 
 **Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
 
 **Closures only capture frames, not namespaces.** Only lexical frames are serialized into closures. Namespaces are shared by reference at call time, avoiding O(n) serialization cost per closure.
 
 **Subagents.** `(agent/call 'name request)` pushes a child frame, evaluates the request, pops the frame, and delivers the result to the parent. Only one evaluation runs at a time.
+
+**Human interaction.** Messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and the agent returns `control/Continue` or `(control/CancelCurrent ...)`.
 
 **Snapshots.** Every snapshot serializes the full kernel state to JSON. Recovery loads the saved image directly — it never replays execution. Snapshots are checksummed (SHA256) and rotated. After recovery, every active frame receives a `(system/Restarted :kind :unclean :downtime ...)` notice.
 
