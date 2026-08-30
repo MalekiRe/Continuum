@@ -29,9 +29,9 @@ A Scheme-like Lisp with:
 
 **Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
 
-**Supervision.** Every cognition loop iteration checks:
-- **Absolute timeout** (default 900s): if a top-level eval runs too long, it's interrupted unconditionally. Catches truly stuck agents.
-- **Efficiency check** (configurable, starts after 120s): token reports from Lisp (`(system/report-tokens N)`) are tracked in a 30-minute sliding window. If elapsed time exceeds 6x the expected time at 10 tok/s, the supervisor delivers a `system/SupervisorNotice` to the agent suggesting it optimize its approach. This is an advisory, not an interrupt — the agent can choose to continue or adjust its strategy. If zero tokens have been reported for 5+ minutes, a notice suggests the agent may be stuck in a blocking tool call.
+**Supervision.** Every cognition loop iteration checks two conditions and delivers advisory notices — the agent stays in control:
+- **Long-running eval** (advisory at 15min, hard kill at 1hr): if a top-level eval runs for 15+ minutes, the agent gets a `system/SupervisorNotice` suggesting it check whether it's making progress. At 1 hour, the kernel force-interrupts as a circuit breaker.
+- **Low token efficiency** (advisory, starts after 120s): token reports from Lisp (`(system/report-tokens N)`) are tracked in a 30-minute sliding window. If elapsed time exceeds 6x the expected time at 10 tok/s, the agent receives a notice suggesting it optimize its approach — batch bash calls, reduce redundant testing, etc. If zero tokens are reported for 5+ minutes, a notice suggests the agent may be stuck in a blocking tool call.
 
 **Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
 

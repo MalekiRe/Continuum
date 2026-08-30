@@ -124,7 +124,7 @@ impl Default for SupervisionConfig {
             window_seconds: 1800,
             min_tokens_per_sec: 2,
             min_elapsed_seconds: 120,
-            max_eval_seconds: 900,
+            max_eval_seconds: 3600,
             expected_tokens_per_sec: 10,
             timeout_multiplier: 6,
         }

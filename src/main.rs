@@ -97,7 +97,7 @@ fn handle_waiting_frame(kernel: &mut Kernel) -> bool {
     }
 }
 
-/// Interrupt if eval runs too long or is stuck waiting for tool calls.
+/// The agent stays in control — only a 1-hour circuit breaker force-interrupts.
 fn check_supervision(kernel: &mut Kernel) {
     let Some(started_at) = kernel.eval_started_at else {
         return;
@@ -106,20 +106,20 @@ fn check_supervision(kernel: &mut Kernel) {
     let elapsed = (now - started_at).num_seconds() as u64;
     let cfg = &kernel.supervision;
 
-    // 1. Absolute timeout — hard interrupt, agent is stuck
+    // Hard circuit breaker — only triggers if something is truly broken (1 hour)
     if elapsed >= cfg.max_eval_seconds {
-        println!("[supervisor] eval ran for {}s — interrupting (max {})", 
+        println!("[supervisor] eval ran for {}s — force interrupting (max {})", 
             elapsed, cfg.max_eval_seconds);
         persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
         return;
     }
 
-    // 2. Efficiency check — only after min_elapsed_seconds
+    // Skip checks if not enough time has passed
     if elapsed < cfg.min_elapsed_seconds {
         return;
     }
 
-    // Drain entries older than the window
+    // Drain old entries
     let cutoff = now - chrono::Duration::seconds(cfg.window_seconds as i64);
     while let Some(front) = kernel.token_reports.front() {
         if front.0 < cutoff {
@@ -129,10 +129,7 @@ fn check_supervision(kernel: &mut Kernel) {
         }
     }
 
-    // Sum tokens in the window
     let window_tokens: u64 = kernel.token_reports.iter().map(|(_, n)| n).sum();
-
-    // Expected seconds based on tokens at expected_tokens_per_sec
     let expected_secs = if cfg.expected_tokens_per_sec > 0 {
         window_tokens / cfg.expected_tokens_per_sec
     } else {
@@ -140,30 +137,28 @@ fn check_supervision(kernel: &mut Kernel) {
     };
     let actual_elapsed = elapsed - cfg.min_elapsed_seconds;
 
-    // If elapsed >> expected, agent is spending disproportionate time on tool calls
-    // vs. thinking. This doesn't mean stuck — it means inefficient.
-    // We deliver an advisory message suggesting optimization.
+    // Advisory 1: low token rate — agent may want to optimize
     if expected_secs > 0 && actual_elapsed > expected_secs * cfg.timeout_multiplier {
         println!("[supervisor] {}s elapsed, {} tokens in window (expected ~{}s at {} tok/s)",
             elapsed, window_tokens, expected_secs, cfg.expected_tokens_per_sec);
-        println!("[supervisor] token rate is low — agent may benefit from optimizing tool usage");
         if let Some(frame) = kernel.frames.last_mut() {
             frame.message_queue.push(
-                r#"(system/SupervisorNotice "Token rate is low. Consider optimizing your approach — batch bash calls, reduce unnecessary testing, or iterate more efficiently.")"#.into()
+                r#"(system/SupervisorNotice "Token rate is low — consider optimizing your approach. Batch operations, reduce redundant testing, or streamline your workflow.")"#.into()
             );
         }
     }
 
-    // No tokens at all for a long time — probably stuck in a blocking call
+    // Advisory 2: no tokens for a long time — might be stuck in a blocking call
     if window_tokens == 0 && actual_elapsed >= 300 {
-        println!("[supervisor] {}s elapsed with zero tokens reported — may be stuck", elapsed);
+        println!("[supervisor] {}s with no tokens reported — may be waiting on a blocking call", elapsed);
         if let Some(frame) = kernel.frames.last_mut() {
             frame.message_queue.push(
-                r#"(system/SupervisorNotice "No tokens have been reported for a long time. If you are waiting on a tool call, consider whether it has hung.")"#.into()
+                r#"(system/SupervisorNotice "No tokens reported in 5+ minutes. If waiting on a tool call, consider whether it has hung or if you should try a different approach.")"#.into()
             );
         }
     }
 }
+
 /// Run one cognition turn for the agent.
 fn run_cognition_turn(kernel: &mut Kernel) {
     let has_pending = kernel
@@ -248,6 +243,7 @@ fn main() {
         if handle_human_input(kernel, &rx) {
             break;
         }
+        check_supervision(kernel);
         check_supervision(kernel);
         check_hourly_snapshot(kernel, &mut hourly_timer);
         kernel.check_wake_timers();
