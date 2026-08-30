@@ -83,8 +83,8 @@ fn check_hourly_snapshot(kernel: &mut Kernel, timer: &mut Instant) {
 
 /// Check if the agent's root frame has completed and needs restarting.
 fn maybe_restart_agent(kernel: &mut Kernel) -> bool {
-    if kernel.frames.is_empty()
-        || kernel.frames.iter().all(|f| f.status == FrameStatus::Completed)
+    if !kernel.frames.is_empty()
+        && kernel.frames.iter().all(|f| f.status == FrameStatus::Completed)
     {
         slog("[agent] all frames completed. Starting fresh...");
         kernel.eval("(println \"Agent ready\")").ok();
@@ -183,18 +183,11 @@ fn check_supervision(kernel: &mut Kernel) {
 }
 /// Run one cognition turn for the agent.
 fn run_cognition_turn(kernel: &mut Kernel) {
-    let Some(msg) = kernel.take_pending_message() else {
-        return;
+    let source = match kernel.take_pending_message() {
+        Some(msg) => format!("(agent/cognize {:?})", msg),
+        None => "(agent/cognize nil)".to_string(),
     };
-    let source = format!("(agent/cognize \"{}\")", msg);
-
-    match kernel.eval(&source) {
-        Ok(_) => {}
-        Err(e) => {
-            slog(&format!("[agent] error: {}", e));
-            kernel.snapshot(SnapshotKind::Incremental);
-        }
-    }
+    let _ = kernel.eval(&source);
 }
 
 fn main() {
@@ -209,15 +202,16 @@ fn main() {
 
     // Load agent core
     let agent_core = r#"
-        (define-data result/Result
+                                (define-data result/Result
           (Ok value)
           (Err problem)
           (Cancelled reason)
           (Indeterminate problem))
 
-        (define (agent/cognize context)
-          (println context)
-          context)
+        (define (agent/cognize msg)
+          (if msg
+              (begin (println msg) msg)
+              (begin (println "thinking...") nil)))
     "#;
 
     // Route all Lisp output through the log buffer
@@ -347,6 +341,5 @@ fn main() {
 
         // Check for pending messages and cognize
         run_cognition_turn(kernel);
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

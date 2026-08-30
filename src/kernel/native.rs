@@ -261,6 +261,28 @@ impl Kernel {
 
                  
         
+
+        self.define_native("string-append", 2, |_kernel, args| {
+            let result = format!("{}{}", args[0], args[1]);
+            Ok(Value::string(&result))
+        });
+        self.define_native("nth", 2, |_kernel, args| {
+            let idx = match &args[0] {
+                Value::Int(i) => *i as usize,
+                _ => return Err("nth: expected integer index".into()),
+            };
+            match &args[1] {
+                Value::List(items) => items.get(idx).cloned().ok_or_else(|| format!("nth: index {} out of bounds", idx)),
+                _ => Err("nth: expected list".into()),
+            }
+        });
+        self.define_native("length", 1, |_kernel, args| {
+            match &args[0] {
+                Value::List(items) => Ok(Value::Int(items.len() as i64)),
+                Value::String(s) => Ok(Value::Int(s.len() as i64)),
+                _ => Err("length: expected list or string".into()),
+            }
+        });
         self.define_native("bash", 1, |_kernel, args| {
             let cmd = match &args[0] {
                 Value::String(s) => s.clone(),
