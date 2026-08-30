@@ -1,13 +1,15 @@
 use crate::kernel::SnapshotKind;
+use crate::vm::env::EnvRef;
+
 use crate::vm::value::Value;
 use crate::kernel::Kernel;
 use std::collections::HashMap;
 
 impl Kernel {
-    pub fn register_tools(&mut self) {
+    pub fn register_tools(&mut self, env: &mut EnvRef) {
 
         // Arithmetic
-        self.define_native("kernel/+", 2, |_kernel, args| {
+        self.define_native("kernel/+", 2, |_kernel, _env, args| {
             let a = args[0].clone();
             let b = args[1].clone();
             match (a, b) {
@@ -17,9 +19,9 @@ impl Kernel {
                 (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
                 _ => Err("+: expected numbers".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/-", 2, |_kernel, args| {
+        self.define_native("kernel/-", 2, |_kernel, _env, args| {
             let a = args[0].clone();
             let b = args[1].clone();
             match (a, b) {
@@ -29,9 +31,9 @@ impl Kernel {
                 (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - b as f64)),
                 _ => Err("-: expected numbers".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/*", 2, |_kernel, args| {
+        self.define_native("kernel/*", 2, |_kernel, _env, args| {
             let a = args[0].clone();
             let b = args[1].clone();
             match (a, b) {
@@ -41,9 +43,9 @@ impl Kernel {
                 (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * b as f64)),
                 _ => Err("*: expected numbers".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel//", 2, |_kernel, args| {
+        self.define_native("kernel//", 2, |_kernel, _env, args| {
             let a = args[0].clone();
             let b = args[1].clone();
             match (a, b) {
@@ -55,13 +57,13 @@ impl Kernel {
                 }
                 _ => Err("/: expected numbers".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/=", 2, |_kernel, args| {
+        self.define_native("kernel/=", 2, |_kernel, _env, args| {
             Ok(Value::Bool(args[0] == args[1]))
-        });
+        }, env);
 
-        self.define_native("kernel/<", 2, |_kernel, args| {
+        self.define_native("kernel/<", 2, |_kernel, _env, args| {
             let a = args[0].clone();
             let b = args[1].clone();
             match (a, b) {
@@ -69,9 +71,9 @@ impl Kernel {
                 (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
                 _ => Err("<: expected numbers".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/>", 2, |_kernel, args| {
+        self.define_native("kernel/>", 2, |_kernel, _env, args| {
             let a = args[0].clone();
             let b = args[1].clone();
             match (a, b) {
@@ -79,9 +81,9 @@ impl Kernel {
                 (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
                 _ => Err(">: expected numbers".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/cons", 2, |_kernel, args| {
+        self.define_native("kernel/cons", 2, |_kernel, _env, args| {
             let car = args[0].clone();
             let cdr = args[1].clone();
             match cdr {
@@ -93,130 +95,130 @@ impl Kernel {
                 Value::Nil => Ok(Value::List(vec![car])),
                 _ => Err("cons: second argument must be a list".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/car", 1, |_kernel, args| {
+        self.define_native("kernel/car", 1, |_kernel, _env, args| {
             match &args[0] {
                 Value::List(items) => items.first().cloned().ok_or_else(|| "car: empty list".into()),
                 _ => Err("car: expected list".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/cdr", 1, |_kernel, args| {
+        self.define_native("kernel/cdr", 1, |_kernel, _env, args| {
             match &args[0] {
                 Value::List(items) if items.len() >= 2 => Ok(Value::List(items[1..].to_vec())),
                 Value::List(_) => Ok(Value::Nil),
                 _ => Err("cdr: expected list".into()),
             }
-        });
+        }, env);
 
-        self.define_native("kernel/list", 0, |_kernel, args| {
+        self.define_native("kernel/list", 0, |_kernel, _env, args| {
             Ok(Value::List(args.to_vec()))
-        });
+        }, env);
 
-        self.define_native("kernel/display", 1, |_kernel, args| {
+        self.define_native("kernel/display", 1, |_kernel, _env, args| {
             print!("{}", args[0]);
             Ok(args[0].clone())
-        });
+        }, env);
 
-        self.define_native("kernel/println", 1, |_kernel, args| {
+        self.define_native("kernel/println", 1, |_kernel, _env, args| {
             println!("{}", args[0]);
             Ok(args[0].clone())
-        });
+        }, env);
 
-        self.define_native("kernel/read", 0, |_kernel, _args| {
+        self.define_native("kernel/read", 0, |_kernel, _env, _args| {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)
                 .map_err(|e| format!("read error: {}", e))?;
             Ok(Value::string(input.trim()))
-        });
+        }, env);
 
         // Type predicates
-        self.define_native("kernel/nil?", 1, |_kernel, args| {
+        self.define_native("kernel/nil?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(matches!(args[0], Value::Nil)))
-        });
-        self.define_native("kernel/number?", 1, |_kernel, args| {
+        }, env);
+        self.define_native("kernel/number?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(matches!(args[0], Value::Int(_) | Value::Float(_))))
-        });
-        self.define_native("kernel/symbol?", 1, |_kernel, args| {
+        }, env);
+        self.define_native("kernel/symbol?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
-        });
-        self.define_native("kernel/string?", 1, |_kernel, args| {
+        }, env);
+        self.define_native("kernel/string?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(matches!(args[0], Value::String(_))))
-        });
-        self.define_native("kernel/list?", 1, |_kernel, args| {
+        }, env);
+        self.define_native("kernel/list?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(args[0].is_list()))
-        });
-        self.define_native("kernel/function?", 1, |_kernel, args| {
+        }, env);
+        self.define_native("kernel/function?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(matches!(args[0], Value::Function(_))))
-        });
-        self.define_native("kernel/keyword?", 1, |_kernel, args| {
+        }, env);
+        self.define_native("kernel/keyword?", 1, |_kernel, _env, args| {
             Ok(Value::Bool(matches!(args[0], Value::Keyword(_))))
-        });
+        }, env);
 
         // Control
-        self.define_native("control/Continue", 0, |_kernel, _args| {
+        self.define_native("control/Continue", 0, |_kernel, _env, _args| {
             Ok(Value::Keyword("Continue".to_string()))
-        });
-        self.define_native("control/CancelCurrent", 1, |_kernel, args| {
+        }, env);
+        self.define_native("control/CancelCurrent", 1, |_kernel, _env, args| {
             Ok(Value::Tagged {
                 family: "control".into(),
                 variant: "CancelCurrent".into(),
                 fields: args.to_vec(),
             })
-        });
-        self.define_native("control/Error", 1, |_kernel, args| {
+        }, env);
+        self.define_native("control/Error", 1, |_kernel, _env, args| {
             let msg = format!("{}", args[0]);
             Err(msg)
-        });
+        }, env);
 
         // System
-        self.define_native("system/version", 0, |_kernel, _args| {
+        self.define_native("system/version", 0, |_kernel, _env, _args| {
             Ok(Value::string("persistent-lisp-harness/0.1.0"))
-        });
-        self.define_native("system/clock", 0, |_kernel, _args| {
+        }, env);
+        self.define_native("system/clock", 0, |_kernel, _env, _args| {
             Ok(Value::string(&chrono::Utc::now().to_rfc3339()))
-        });
-        self.define_native("system/interrupt", 0, |_kernel, _args| {
+        }, env);
+        self.define_native("system/interrupt", 0, |_kernel, _env, _args| {
             // Set the interrupt flag — Lisp will notice at the next safepoint
             crate::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(Value::keyword("interrupted"))
-        });
-        self.define_native("system/clear-interrupt", 0, |_kernel, _args| {
+        }, env);
+        self.define_native("system/clear-interrupt", 0, |_kernel, _env, _args| {
             crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
             crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
             Ok(Value::keyword("cleared"))
-        });
-        self.define_native("system/snapshot", 0, |_kernel, _args| {
-                let snap = _kernel.snapshot(SnapshotKind::Incremental);
+        }, env);
+        self.define_native("system/snapshot", 0, |_kernel, _env, _args| {
+                let snap = _kernel.snapshot(SnapshotKind::Incremental, _env);
                 Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
-        });
-        self.define_native("system/event-log", 0, |_kernel, _args| {
+        }, env);
+        self.define_native("system/event-log", 0, |_kernel, _env, _args| {
                 Ok(Value::string(&format!(
                     "{} events recorded (latest id: {})",
                     _kernel.event_counter, _kernel.event_counter
                 )))
-        });
-        self.define_native("inspect/namespaces", 0, |_kernel, _args| {
-                let names: Vec<Value> = _kernel.env.namespace_names().iter().map(|n| {
-                    let count = _kernel.env.namespaces.get(n)
+        }, env);
+        self.define_native("inspect/namespaces", 0, |_kernel, _env, _args| {
+                let names: Vec<Value> = _env.namespace_names().iter().map(|n| {
+                    let count = _env.namespaces.get(n)
                         .map(|ns| ns.list_bindings().len())
                         .unwrap_or(0);
                     Value::list(vec![Value::symbol(n), Value::int(count as i64)])
                 }).collect();
                 Ok(Value::List(names))
-        });
-        self.define_native("inspect/bindings", 1, |_kernel, args| {
+        }, env);
+        self.define_native("inspect/bindings", 1, |_kernel, _env, args| {
             let ns_name = match &args[0] {
                 Value::Symbol(s) => s.clone(),
                 _ => return Err("inspect/bindings: expected symbol".into()),
             };
-                let bindings = _kernel.inspect_namespace(&ns_name)
+                let bindings = _kernel.inspect_namespace(&ns_name, _env)
                     .unwrap_or_default();
                 let items: Vec<Value> = bindings.iter().map(|b| Value::symbol(b)).collect();
                 Ok(Value::List(items))
-        });
-        self.define_native("inspect/history", 1, |_kernel, args| {
+        }, env);
+        self.define_native("inspect/history", 1, |_kernel, _env, args| {
             let name = match &args[0] {
                 Value::Symbol(s) => s.clone(),
                 _ => return Err("inspect/history: expected symbol".into()),
@@ -224,7 +226,7 @@ impl Kernel {
                 let qualified = if name.contains('/') { name.clone() } else { format!("user/{}", name) };
                 let parts: Vec<&str> = qualified.splitn(2, '/').collect();
                 if parts.len() == 2 {
-                    if let Some(ns) = _kernel.env.namespaces.get(parts[0]) {
+                    if let Some(ns) = _env.namespaces.get(parts[0]) {
                         let records = ns.history(parts[1]);
                         if records.is_empty() {
                             return Ok(Value::string("no history"));
@@ -240,12 +242,12 @@ impl Kernel {
                     }
                 }
                 Err(format!("no history for {}", name))
-        });
+        }, env);
     
 
                  
         
-        self.define_native("bash", 1, |_kernel, args| {
+        self.define_native("bash", 1, |_kernel, _env, args| {
             let cmd = match &args[0] {
                 Value::String(s) => s.clone(),
                 Value::List(items) => {
@@ -272,10 +274,10 @@ impl Kernel {
                 }
                 Err(e) => Err(format!("proc/run: {}", e)),
             }
-        });
+        }, env);
 
         
-        self.define_native("wake", 2, |_kernel, args| {
+        self.define_native("wake", 2, |_kernel, _env, args| {
             let duration_ms = match &args[0] {
                 Value::Int(ms) => *ms,
                 other => return Err(format!("wake: expected integer milliseconds, got {}", other)),
@@ -290,9 +292,9 @@ impl Kernel {
                     frame_id,
                 });
                 Ok(Value::keyword("scheduled"))
-        });
+        }, env);
 
-                self.define_native("agent/call", 2, |_kernel, args| {
+                self.define_native("agent/call", 2, |_kernel, _env, args| {
             let name = match &args[0] {
                 Value::String(s) => s.clone(),
                 Value::Symbol(s) => s.clone(),
@@ -304,7 +306,7 @@ impl Kernel {
                 let request_text = request.clone();
 
                 // Spawn the child frame
-                let _child_id = _kernel.spawn_subagent(&child_name, &request_text)?;
+                let _child_id = _kernel.spawn_subagent(&child_name, &request_text, _env)?;
 
                 // Mark parent as waiting (paused)
                 if let Some(frame) = _kernel.frames.last_mut() {
@@ -312,7 +314,7 @@ impl Kernel {
                 }
 
                 // Evaluate in the child frame context
-                let child_result = _kernel.eval(&request_text).map_err(|e| {
+                let child_result = _kernel.eval(&request_text, _env).map_err(|e| {
                     format!("agent/call: child error: {}", e)
                 })?;
 
@@ -328,21 +330,21 @@ impl Kernel {
                 }
 
                 Ok(child_result)
-        });
+        }, env);
 
         
         
         
-        self.define_native("map/get", 2, |_kernel, args| {
+        self.define_native("map/get", 2, |_kernel, _env, args| {
             let map = match &args[0] {
                 Value::Map(m) => m,
                 other => return Err(format!("map/get: expected map, got {}", other)),
             };
             let key = &args[1];
             Ok(map.get(key).cloned().unwrap_or(Value::Nil))
-        });
+        }, env);
 
-        self.define_native("vector/get", 2, |_kernel, args| {
+        self.define_native("vector/get", 2, |_kernel, _env, args| {
             let vec = match &args[0] {
                 Value::Vector(v) => v,
                 other => return Err(format!("vector/get: expected vector, got {}", other)),
@@ -352,41 +354,41 @@ impl Kernel {
                 other => return Err(format!("vector/get: expected integer index, got {}", other)),
             };
             vec.get(idx).cloned().ok_or_else(|| format!("vector/get: index {} out of bounds (len {})", idx, vec.len()))
-        });
+        }, env);
 
-        self.define_native("kernel/error", 1, |_kernel, args| {
+        self.define_native("kernel/error", 1, |_kernel, _env, args| {
             let msg = format!("{}", args[0]);
             Err(msg)
-        });
+        }, env);
 
         // inspect/find — semantic search returning compact summaries first
-        self.define_native("inspect/find", 1, |_kernel, args| {
+        self.define_native("inspect/find", 1, |_kernel, _env, args| {
             let query = match &args[0] {
                 Value::String(s) => s.clone(),
                 other => return Err(format!("inspect/find: expected string, got {}", other)),
             };
 
-                let results = _kernel.find_bindings(&query);
+                let results = _kernel.find_bindings(&query, _env);
                 // Return compact summaries: just the qualified names
                 let items: Vec<Value> = results.iter().map(|r| Value::string(r)).collect();
                 Ok(Value::List(items))
-        });
+        }, env);
 
         // inspect/describe — full details for a specific binding
         
         // inspect/source — show source code of a definition
-        self.define_native("inspect/source", 1, |_kernel, args| {
+        self.define_native("inspect/source", 1, |_kernel, _env, args| {
             let name = match &args[0] {
                 Value::Symbol(s) => s.clone(),
                 other => return Err(format!("inspect/source: expected symbol, got {}", other)),
             };
 
                 let qualified = if name.contains('/') { name.clone() } else { format!("user/{}", name) };
-                match _kernel.env.lookup(&qualified) {
+                match _env.lookup(&qualified) {
                     Some(val) => Ok(Value::string(&format!("{}", val))),
                     None => Err(format!("no binding for {}", name)),
                 }
-        });
+        }, env);
 
         // history/read — read a specific event by ID
 

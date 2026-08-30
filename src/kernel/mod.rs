@@ -19,7 +19,6 @@ pub struct WakeEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Kernel {
-    pub env: EnvRef,
     pub frames: Vec<Frame>,
     pub storage: SnapshotConfig,
     pub event_counter: u64,
@@ -89,6 +88,7 @@ pub struct Snapshot {
     pub id: String,
     pub timestamp: String,
     pub kernel: Kernel,
+    pub env: EnvRef,
     pub checksum: String,
     pub kind: SnapshotKind,
 }
@@ -100,9 +100,9 @@ pub enum SnapshotKind {
 }
 
 impl Kernel {
-    pub fn new() -> Self {
+    pub fn new() -> (Self, EnvRef) {
+        let mut env = EnvRef::new();
         let mut kernel = Kernel {
-            env: EnvRef::new(),
             frames: Vec::new(),
             wake_timers: Vec::new(),
             storage: SnapshotConfig::default(),
@@ -112,7 +112,7 @@ impl Kernel {
 
         };
 
-        kernel.register_tools();
+        kernel.register_tools(&mut env);
 
         let root_frame = Frame {
             id: format!("frame-{}", kernel.next_frame_id),
@@ -135,13 +135,13 @@ impl Kernel {
         let _ = std::fs::create_dir_all("data");
         let _ = std::fs::create_dir_all("snapshots");
 
-        kernel
+        (kernel, env)
     }
 
-    pub fn eval(&mut self, source: &str) -> Result<Value, eval::EvalError> {
+    pub fn eval(&mut self, source: &str, env: &mut EnvRef) -> Result<Value, eval::EvalError> {
         // Record event
 
-        let result = eval::eval(source, &mut self.env);
+        let result = eval::eval(source, self, env);
 
         result
     }
@@ -159,7 +159,7 @@ impl Kernel {
 
     /// Evaluate Lisp in a read-eval-print loop, returning the result as a display string.
     /// Checks that the source hasn't been cancelled before executing.
-    pub fn eval_repl(&mut self, source: &str) -> String {
+    pub fn eval_repl(&mut self, source: &str, env: &mut EnvRef) -> String {
         // Check if this source matches a cancelled call
         if let Some(frame) = self.frames.last() {
             for token in &frame.state.cancelled_tokens {
@@ -169,7 +169,7 @@ impl Kernel {
             }
         }
 
-        match self.eval(source) {
+        match self.eval(source, env) {
             Ok(val) => {
                 // If the result was CancelCurrent, record the cancelled SOURCE
                 // so the exact same call can't be re-executed.
@@ -197,7 +197,7 @@ impl Kernel {
 
     /// Create a child frame for a subagent call.
     /// Returns the child's frame ID.
-    pub fn spawn_subagent(&mut self, name: &str, request: &str) -> Result<String, String> {
+    pub fn spawn_subagent(&mut self, name: &str, request: &str, env: &mut EnvRef) -> Result<String, String> {
         let id = format!("frame-{}", self.next_frame_id);
         self.next_frame_id += 1;
 
@@ -226,7 +226,7 @@ impl Kernel {
 
         // Push child frame, evaluate the request setup
         self.frames.push(frame);
-        let _ = self.eval(&child_source);
+        let _ = self.eval(&child_source, env);
 
         // Record event
 
@@ -292,18 +292,18 @@ impl Kernel {
 
     /// Perform a snapshot.
     /// Check if an hourly full snapshot is due, and take one if so.
-    pub fn check_hourly_snapshot(&mut self) {
+    pub fn check_hourly_snapshot(&mut self, env: &EnvRef) {
         if let Some(ref last) = self.storage.last_full_snapshot {
             if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last) {
                 let last_utc = last_time.with_timezone(&chrono::Utc);
                 let elapsed = (chrono::Utc::now() - last_utc).num_hours();
                 if elapsed >= self.storage.full_snapshot_interval_hours as i64 {
-                    self.snapshot(SnapshotKind::Full);
+                    self.snapshot(SnapshotKind::Full, env);
                     self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
                 }
             }
         } else {
-            self.snapshot(SnapshotKind::Full);
+            self.snapshot(SnapshotKind::Full, env);
             self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
         }
 
@@ -326,13 +326,17 @@ impl Kernel {
         }
     }
 
-    pub fn snapshot(&mut self, kind: SnapshotKind) -> Snapshot {
+    pub fn snapshot(&mut self, kind: SnapshotKind, env: &EnvRef) -> Snapshot {
         let timestamp = chrono::Utc::now().to_rfc3339();
         let id = format!("snap-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
 
         // Record snapshot event before serializing
 
-        let kernel_bytes = serde_json::to_vec(&self).unwrap_or_default();
+        let state = serde_json::json!({
+            "kernel": self,
+            "env": env,
+        });
+        let kernel_bytes = serde_json::to_vec(&state).unwrap_or_default();
         let checksum = {
             use sha2::{Sha256, Digest};
             let mut hasher = Sha256::new();
@@ -344,6 +348,7 @@ impl Kernel {
             id: id.clone(),
             timestamp: timestamp.clone(),
             kernel: self.clone(),
+            env: env.clone(),
             checksum: checksum.clone(),
             kind: kind.clone(),
         };
@@ -369,7 +374,7 @@ impl Kernel {
         snapshot
     }
 
-    pub fn recover_from_latest() -> Result<Self, String> {
+    pub fn recover_from_latest() -> Result<(Self, EnvRef), String> {
 
         let snapshot_dir = "snapshots";
         let _ = std::fs::create_dir_all(snapshot_dir);
@@ -424,11 +429,17 @@ impl Kernel {
         let bytes = std::fs::read(&latest_path)
             .map_err(|e| format!("cannot read snapshot: {}", e))?;
 
-        let mut kernel: Kernel = serde_json::from_slice(&bytes)
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("cannot deserialize snapshot: {}", e))?;
+
+        let mut kernel: Kernel = serde_json::from_value(parsed["kernel"].clone())
             .map_err(|e| format!("cannot deserialize kernel: {}", e))?;
 
+        let mut env: EnvRef = serde_json::from_value(parsed["env"].clone())
+            .map_err(|e| format!("cannot deserialize env: {}", e))?;
+
         // Re-register native function pointers (they can't survive serialization)
-        kernel.register_tools();
+        kernel.register_tools(&mut env);
 
         // Queue (system/Restarted) event for every active frame
         let downtime = chrono::Utc::now().to_rfc3339();
@@ -447,14 +458,14 @@ impl Kernel {
 
         println!("[kernel] recovered from {} (natives re-registered, {} frames notified)", 
             latest_path.display(), kernel.frames.len());
-        Ok(kernel)
+        Ok((kernel, env))
     }
 
     // ---- Registration ----
 
     
 
-    fn define_native(&mut self, qualified_name: &str, arity: u32, func: fn(&mut Kernel, Vec<Value>) -> Result<Value, String>) {
+    fn define_native(&mut self, qualified_name: &str, arity: u32, func: fn(&mut Kernel, &mut EnvRef, Vec<Value>) -> Result<Value, String>, env: &mut EnvRef) {
         let val = Value::Function(Function::Native {
             name: qualified_name.to_string(),
             arity,
@@ -466,17 +477,17 @@ impl Kernel {
         } else {
             format!("kernel/{}", qualified_name)
         };
-        self.env.force_define(&full_name, val);
+        env.force_define(&full_name, val);
     }
 
-    pub fn inspect_namespace(&self, name: &str) -> Option<Vec<String>> {
-        self.env.namespaces.get(name).map(|ns| ns.list_bindings())
+    pub fn inspect_namespace(&self, name: &str, env: &EnvRef) -> Option<Vec<String>> {
+        env.namespaces.get(name).map(|ns| ns.list_bindings())
     }
 
-    pub fn find_bindings(&self, query: &str) -> Vec<String> {
+    pub fn find_bindings(&self, query: &str, env: &EnvRef) -> Vec<String> {
         let q = query.to_lowercase();
         let mut results = Vec::new();
-        for (ns_name, ns) in self.env.namespaces.iter() {
+        for (ns_name, ns) in env.namespaces.iter() {
             for binding in ns.list_bindings() {
                 let qualified = format!("{}/{}", ns_name, binding);
                 if qualified.to_lowercase().contains(&q) {

@@ -7,44 +7,39 @@
 
 use persistent_lisp_harness::kernel::{self, SnapshotKind, FrameStatus};
 use persistent_lisp_harness::Kernel;
+use persistent_lisp_harness::EnvRef;
 use std::io::{self, BufRead};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn load_or_create_kernel() -> &'static mut Kernel {
+fn load_or_create_kernel() -> (&'static mut Kernel, EnvRef) {
     if Path::new("snapshots").exists() {
         match Kernel::recover_from_latest() {
-            Ok(mut k) => {
-                k.register_tools();
-                // Box and store in KERNEL for native access
+            Ok((k, env)) => {
                 let ptr = Box::leak(Box::new(k));
-                persistent_lisp_harness::vm::eval::KERNEL.store(ptr as *mut Kernel, std::sync::atomic::Ordering::Release);
                 println!("[kernel] recovered from snapshot");
-                return ptr;
+                return (ptr, env);
             }
             Err(e) => {
                 println!("[kernel] recovery failed: {} — starting fresh", e);
             }
         }
     }
-    let mut k = Kernel::new();
-    k.register_tools();
+    let (k, env) = Kernel::new();
     let _ = std::fs::create_dir_all("data");
-    // Box and store in KERNEL for native access
     let ptr = Box::leak(Box::new(k));
-    persistent_lisp_harness::vm::eval::KERNEL.store(ptr as *mut Kernel, std::sync::atomic::Ordering::Release);
     println!("[kernel] fresh start — version {}", ptr.version);
-    ptr
+    (ptr, env)
 }
 
 /// Check for human messages from stdin. Returns true if exit was requested.
-fn handle_human_input(kernel: &mut Kernel, rx: &mpsc::Receiver<String>) -> bool {
+fn handle_human_input(kernel: &mut Kernel, env: &EnvRef, rx: &mpsc::Receiver<String>) -> bool {
     let human_msg = rx.try_recv().ok();
     if let Some(msg) = human_msg {
         if msg == "!!exit" || msg == "!!quit" {
-            kernel.snapshot(SnapshotKind::Full);
+            kernel.snapshot(SnapshotKind::Full, env);
             println!("[kernel] goodbye!");
             return true;
         }
@@ -55,9 +50,9 @@ fn handle_human_input(kernel: &mut Kernel, rx: &mpsc::Receiver<String>) -> bool 
 }
 
 /// Take an hourly full snapshot if due.
-fn check_hourly_snapshot(kernel: &mut Kernel, timer: &mut Instant) {
+fn check_hourly_snapshot(kernel: &mut Kernel, env: &EnvRef, timer: &mut Instant) {
     if timer.elapsed() >= Duration::from_secs(3600) {
-        kernel.check_hourly_snapshot();
+        kernel.check_hourly_snapshot(env);
         *timer = Instant::now();
     }
 }
@@ -85,12 +80,12 @@ fn check_supervision(kernel: &mut Kernel, timer: &mut Instant) {
 }
 
 /// Check if the agent's root frame has completed and needs restarting.
-fn maybe_restart_agent(kernel: &mut Kernel) -> bool {
+fn maybe_restart_agent(kernel: &mut Kernel, env: &mut EnvRef) -> bool {
     if kernel.frames.is_empty()
         || kernel.frames.iter().all(|f| f.status == FrameStatus::Completed)
     {
         println!("[agent] all frames completed. Restarting...");
-        kernel.eval("(agent/loop \"Initial context\")").ok();
+        kernel.eval("(agent/loop \"Initial context\")", env).ok();
         true
     } else {
         false
@@ -105,7 +100,7 @@ fn handle_subagent_result(kernel: &mut Kernel) {
 }
 
 /// Check if the current frame is waiting for human input, and deliver it.
-fn handle_waiting_frame(kernel: &mut Kernel) -> bool {
+fn handle_waiting_frame(kernel: &mut Kernel, env: &mut EnvRef) -> bool {
     let is_waiting = kernel
         .frames
         .last()
@@ -117,7 +112,7 @@ fn handle_waiting_frame(kernel: &mut Kernel) -> bool {
             let _ = kernel.eval_repl(&format!(
                 r#"(agent/cognize "Human message received: {}")"#,
                 msg
-            ));
+            ), env);
         }
         true
     } else {
@@ -126,7 +121,7 @@ fn handle_waiting_frame(kernel: &mut Kernel) -> bool {
 }
 
 /// Run one cognition turn for the agent.
-fn run_cognition_turn(kernel: &mut Kernel) {
+fn run_cognition_turn(kernel: &mut Kernel, env: &mut EnvRef) {
     let has_pending = kernel
         .frames
         .last()
@@ -143,13 +138,13 @@ fn run_cognition_turn(kernel: &mut Kernel) {
         "(agent/loop nil)".to_string()
     };
 
-    match kernel.eval(&source) {
+    match kernel.eval(&source, env) {
         Ok(_) => {
             // Continue immediately — no backoff
         }
         Err(e) => {
             println!("[agent] error: {}", e);
-            kernel.snapshot(SnapshotKind::Incremental);
+        kernel.snapshot(SnapshotKind::Incremental, env);
         }
     }
 }
@@ -162,7 +157,7 @@ fn main() {
     println!("║  Type '!!exit' to quit.                     ║");
     println!("╚══════════════════════════════════════════════╝");
 
-    let kernel = load_or_create_kernel();
+    let (kernel, mut env) = load_or_create_kernel();
 
     // Load agent core
     let agent_core = r#"
@@ -180,7 +175,7 @@ fn main() {
           (agent/loop (agent/cognize context)))
     "#;
 
-    match kernel.eval(agent_core) {
+    match kernel.eval(agent_core, &mut env) {
         Ok(_) => println!("[agent] core loaded"),
         Err(e) => println!("[agent] core: {}", e),
     }
@@ -207,22 +202,22 @@ fn main() {
     let mut supervision_timer = Instant::now();
 
     loop {
-        if handle_human_input(kernel, &rx) {
+        if handle_human_input(kernel, &env, &rx) {
             break;
         }
-        check_hourly_snapshot(kernel, &mut hourly_timer);
+        check_hourly_snapshot(kernel, &env, &mut hourly_timer);
         check_supervision(kernel, &mut supervision_timer);
 
 
-        if maybe_restart_agent(kernel) {
+        if maybe_restart_agent(kernel, &mut env) {
             continue;
         }
         handle_subagent_result(kernel);
 
-        if handle_waiting_frame(kernel) {
+        if handle_waiting_frame(kernel, &mut env) {
             continue;
         }
 
-        run_cognition_turn(kernel);
+        run_cognition_turn(kernel, &mut env);
     }
 }
