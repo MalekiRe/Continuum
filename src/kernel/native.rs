@@ -213,7 +213,38 @@ impl Kernel {
                 let snap = _kernel.snapshot(SnapshotKind::Incremental);
                 Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
         });
-                self.define_native("inspect/namespaces", 0, |_kernel, _args| {
+                
+        self.define_native("model/chat", 1, |_kernel, args| {
+            let prompt = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("model/chat: expected string prompt, got {}", other)),
+            };
+
+            let client = reqwest::blocking::Client::new();
+            let resp = client.post("https://api.pinference.ai/api/v1/chat/completions").timeout(std::time::Duration::from_secs(30))
+                .header("Authorization", &format!("Bearer {}", std::env::var("PRIME_API_KEY").unwrap_or_default()))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "openai/gpt-4.1-mini",
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                }))
+                .send()
+                .map_err(|e| format!("model/chat: request failed: {}", e))?;
+
+            let body: serde_json::Value = resp.json()
+                .map_err(|e| format!("model/chat: parse failed: {}", e))?;
+
+            let content = body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or(&format!("model error (insufficient balance?): {}", body["error"]["message"].as_str().unwrap_or("unknown")))
+                .to_string();
+
+            Ok(Value::string(&content))
+        });
+
+        self.define_native("inspect/namespaces", 0, |_kernel, _args| {
                 let names: Vec<Value> = _kernel.env.namespace_names().iter().map(|n| {
                     let count = _kernel.env.namespaces.get(n)
                         .map(|ns| ns.list_bindings().len())

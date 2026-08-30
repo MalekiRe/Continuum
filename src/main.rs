@@ -187,10 +187,14 @@ fn run_cognition_turn(kernel: &mut Kernel) {
         Some(msg) => format!("(agent/cognize {:?})", msg),
         None => "(agent/step)".to_string(),
     };
-    let _ = kernel.eval(&source);
+    if let Err(e) = kernel.eval(&source) {
+        slog(&format!("[agent] error: {}", e));
+    }
 }
 
 fn main() {
+    let _ = dotenvy::dotenv();
+
     slog("╔══════════════════════════════════════════════╗");
     slog("║  Persistent Agent Lisp Harness v0.1.0       ║");
     slog("║  Continuous autonomous agent.                ║");
@@ -202,7 +206,7 @@ fn main() {
 
     // Load agent core
     let agent_core = r#"
-                                        (define-data result/Result
+                                                        (define-data result/Result
           (Ok value)
           (Err problem)
           (Cancelled reason)
@@ -230,14 +234,20 @@ fn main() {
           "Synthesis follows analysis."
           "What would be valuable to build?"))
 
+        (define n 0)
+
         (define (agent/step)
-          (let ((thought (car thoughts)))
-            (println thought)
-            (set! thoughts (append (cdr thoughts) (list thought)))
-            nil))
+          (if (< n 20)
+              (begin
+                (println (nth n thoughts))
+                (set! n (+ n 1))
+                nil)
+              (begin
+                (set! n 0)
+                nil)))
 
         (define (agent/cognize msg)
-          (println msg)
+          (println (model/chat msg))
           msg)
     "#;
 
