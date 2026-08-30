@@ -1,7 +1,6 @@
-/target
-data/
-snapshots/
-
-.idea/
-
 .env
+.idea/
+snapshots/
+data/
+agent.log
+*.log
