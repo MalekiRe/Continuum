@@ -30,7 +30,7 @@ A Scheme-like Lisp with:
 **Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
 
 **Supervision.** Every cognition loop iteration checks two conditions and delivers advisory notices — the agent stays in control:
-- **Long-running eval** (advisory at 15min, hard kill at 1hr): if a top-level eval runs for 15+ minutes, the agent gets a `system/SupervisorNotice` suggesting it check whether it's making progress. At 1 hour, the kernel force-interrupts as a circuit breaker.
+- **Long-running eval** (advisory at 15min): if a top-level eval runs for 15+ minutes, the agent gets a `system/SupervisorNotice` suggesting it check whether it's making progress. No hard kill — the agent always decides.
 - **Low token efficiency** (advisory, starts after 120s): token reports from Lisp (`(system/report-tokens N)`) are tracked in a 30-minute sliding window. If elapsed time exceeds 6x the expected time at 10 tok/s, the agent receives a notice suggesting it optimize its approach — batch bash calls, reduce redundant testing, etc. If zero tokens are reported for 5+ minutes, a notice suggests the agent may be stuck in a blocking tool call.
 
 **Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
