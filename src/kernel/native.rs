@@ -248,10 +248,10 @@ impl Kernel {
                 return Err(format!("model/chat: HTTP {}: {:?}", status, body["error"].get("message").unwrap_or(&serde_json::Value::String("unknown".into()))));
             }
 
-            let content = body["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("no response")
-                .to_string();
+            let content = match body["choices"][0]["message"]["content"].as_str() {
+                Some(s) => s.to_string(),
+                None => format!("no response (choices: {})", body["choices"]),
+            };
 
             Ok(Value::string(&content))
         });
@@ -523,7 +523,7 @@ self.define_native("kernel/error", 1, |_kernel, args| {
             };
             match _kernel.eval(&source) {
                 Ok(v) => Ok(Value::string(&format!("{}", v))),
-                Err(e) => Ok(Value::string(&format!("error: {}", e))),
+                Err(e) => Ok(Value::string(&format!("error evaluating code: {}", e))),
             }
         });
         self.define_native("string-search", 2, |_kernel, args| {

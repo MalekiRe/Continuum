@@ -19,6 +19,11 @@ use std::time::{Duration, Instant};
 static LOG_BUF: std::sync::LazyLock<Arc<Mutex<VecDeque<String>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(1000))));
 
+
+/// Shared chat history for /chat endpoint.
+static CHAT_HISTORY: std::sync::LazyLock<Arc<Mutex<Vec<ChatEntry>>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+
 /// Push a log line to stdout and the shared buffer.
 fn slog(msg: impl AsRef<str>) {
     let msg = msg.as_ref();
@@ -187,8 +192,24 @@ fn run_cognition_turn(kernel: &mut Kernel) {
         Some(msg) => format!("(agent/cognize {:?})", msg),
         None => "(agent/step)".to_string(),
     };
-    if let Err(e) = kernel.eval(&source) {
-        slog(&format!("[agent] error: {}", e));
+    let is_chat = source.starts_with("(agent/cognize");
+    match kernel.eval(&source) {
+        Ok(v) => {
+            if is_chat {
+                let response = format!("{}", v);
+                let trimmed = response.trim_matches('\"');
+                if !trimmed.is_empty() && trimmed != "nil" {
+                    if let Ok(mut history) = CHAT_HISTORY.lock() {
+                        history.push(ChatEntry {
+                            role: "agent".into(),
+                            message: trimmed.to_string(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        });
+                    }
+                }
+            }
+        }
+        Err(e) => slog(&format!("[agent] error: {}", e)),
     }
 }
 
@@ -254,7 +275,7 @@ fn main() {
     });
     // ---- HTTP server — HTML pages + chat API ----
     let log_buf = LOG_BUF.clone();
-    let chat_history: Arc<Mutex<Vec<ChatEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
 
     thread::spawn(move || {
         let server = tiny_http::Server::http("0.0.0.0:8080").unwrap();
@@ -284,7 +305,7 @@ fn main() {
                             .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap())
                     }
                     ("GET", "/chat/history") => {
-                        let history = chat_history.lock().unwrap();
+                        let history = CHAT_HISTORY.lock().unwrap();
                         let mut html = String::new();
                         for entry in history.iter() {
                             let cls = if entry.role == "user" { "msg user" } else { "msg agent" };
@@ -308,12 +329,12 @@ fn main() {
                                 message: msg.clone(),
                                 timestamp: chrono::Utc::now().to_rfc3339(),
                             };
-                            chat_history.lock().unwrap().push(entry);
+                            CHAT_HISTORY.lock().unwrap().push(entry);
                             let _ = chat_tx.send(msg);
                         }
 
                         // Return updated chat HTML
-                        let history = chat_history.lock().unwrap();
+                        let history = CHAT_HISTORY.lock().unwrap();
                         let mut html = String::new();
                         for entry in history.iter() {
                             let cls = if entry.role == "user" { "msg user" } else { "msg agent" };
