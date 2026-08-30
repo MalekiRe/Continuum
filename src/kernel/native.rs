@@ -1,84 +1,63 @@
-use crate::kernel::SnapshotKind;
-use crate::vm::value::Value;
 use crate::kernel::Kernel;
-use std::collections::HashMap;
+use crate::vm::value::{VARIADIC_ARITY, Value};
+
+fn numbers(args: &[Value], name: &str) -> Result<(f64, f64), String> {
+    let number = |value: &Value| match value {
+        Value::Int(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
+        _ => None,
+    };
+    Ok((
+        number(&args[0]).ok_or_else(|| format!("{}: expected numbers", name))?,
+        number(&args[1]).ok_or_else(|| format!("{}: expected numbers", name))?,
+    ))
+}
+
+fn arithmetic(
+    args: &[Value],
+    name: &str,
+    ints: fn(i64, i64) -> Option<i64>,
+    floats: fn(f64, f64) -> f64,
+) -> Result<Value, String> {
+    if let (Value::Int(a), Value::Int(b)) = (&args[0], &args[1]) {
+        return ints(*a, *b)
+            .map(Value::Int)
+            .ok_or_else(|| format!("{}: integer overflow", name));
+    }
+    let (a, b) = numbers(args, name)?;
+    Ok(Value::Float(floats(a, b)))
+}
 
 impl Kernel {
     pub fn register_tools(&mut self) {
-
         // Arithmetic
         self.define_native("kernel/+", 2, |_kernel, args| {
-            let a = args[0].clone();
-            let b = args[1].clone();
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-                (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
-                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
-                _ => Err("+: expected numbers".into()),
-            }
+            arithmetic(&args, "+", i64::checked_add, |a, b| a + b)
         });
-
         self.define_native("kernel/-", 2, |_kernel, args| {
-            let a = args[0].clone();
-            let b = args[1].clone();
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
-                (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 - b)),
-                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - b as f64)),
-                _ => Err("-: expected numbers".into()),
-            }
+            arithmetic(&args, "-", i64::checked_sub, |a, b| a - b)
         });
-
         self.define_native("kernel/*", 2, |_kernel, args| {
-            let a = args[0].clone();
-            let b = args[1].clone();
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
-                (Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 * b)),
-                (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * b as f64)),
-                _ => Err("*: expected numbers".into()),
-            }
+            arithmetic(&args, "*", i64::checked_mul, |a, b| a * b)
         });
-
         self.define_native("kernel//", 2, |_kernel, args| {
-            let a = args[0].clone();
-            let b = args[1].clone();
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => {
-                    if b == 0 { Err("/: division by zero".into()) } else { Ok(Value::Float(a as f64 / b as f64)) }
-                }
-                (Value::Float(a), Value::Float(b)) => {
-                    if b == 0.0 { Err("/: division by zero".into()) } else { Ok(Value::Float(a / b)) }
-                }
-                _ => Err("/: expected numbers".into()),
+            let (a, b) = numbers(&args, "/")?;
+            if b == 0.0 {
+                Err("/: division by zero".into())
+            } else {
+                Ok(Value::Float(a / b))
             }
         });
-
         self.define_native("kernel/=", 2, |_kernel, args| {
             Ok(Value::Bool(args[0] == args[1]))
         });
-
         self.define_native("kernel/<", 2, |_kernel, args| {
-            let a = args[0].clone();
-            let b = args[1].clone();
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a < b)),
-                _ => Err("<: expected numbers".into()),
-            }
+            let (a, b) = numbers(&args, "<")?;
+            Ok(Value::Bool(a < b))
         });
-
         self.define_native("kernel/>", 2, |_kernel, args| {
-            let a = args[0].clone();
-            let b = args[1].clone();
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(a > b)),
-                _ => Err(">: expected numbers".into()),
-            }
+            let (a, b) = numbers(&args, ">")?;
+            Ok(Value::Bool(a > b))
         });
 
         self.define_native("kernel/cons", 2, |_kernel, args| {
@@ -95,22 +74,21 @@ impl Kernel {
             }
         });
 
-        self.define_native("kernel/car", 1, |_kernel, args| {
-            match &args[0] {
-                Value::List(items) => items.first().cloned().ok_or_else(|| "car: empty list".into()),
-                _ => Err("car: expected list".into()),
-            }
+        self.define_native("kernel/car", 1, |_kernel, args| match &args[0] {
+            Value::List(items) => items
+                .first()
+                .cloned()
+                .ok_or_else(|| "car: empty list".into()),
+            _ => Err("car: expected list".into()),
         });
 
-        self.define_native("kernel/cdr", 1, |_kernel, args| {
-            match &args[0] {
-                Value::List(items) if items.len() >= 2 => Ok(Value::List(items[1..].to_vec())),
-                Value::List(_) => Ok(Value::Nil),
-                _ => Err("cdr: expected list".into()),
-            }
+        self.define_native("kernel/cdr", 1, |_kernel, args| match &args[0] {
+            Value::List(items) if items.len() >= 2 => Ok(Value::List(items[1..].to_vec())),
+            Value::List(_) => Ok(Value::Nil),
+            _ => Err("cdr: expected list".into()),
         });
 
-        self.define_native("kernel/list", 0, |_kernel, args| {
+        self.define_native("kernel/list", VARIADIC_ARITY, |_kernel, args| {
             Ok(Value::List(args.to_vec()))
         });
 
@@ -136,7 +114,8 @@ impl Kernel {
 
         self.define_native("kernel/read", 0, |_kernel, _args| {
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input)
+            std::io::stdin()
+                .read_line(&mut input)
                 .map_err(|e| format!("read error: {}", e))?;
             Ok(Value::string(input.trim()))
         });
@@ -146,7 +125,10 @@ impl Kernel {
             Ok(Value::Bool(matches!(args[0], Value::Nil)))
         });
         self.define_native("kernel/number?", 1, |_kernel, args| {
-            Ok(Value::Bool(matches!(args[0], Value::Int(_) | Value::Float(_))))
+            Ok(Value::Bool(matches!(
+                args[0],
+                Value::Int(_) | Value::Float(_)
+            )))
         });
         self.define_native("kernel/symbol?", 1, |_kernel, args| {
             Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
@@ -165,146 +147,265 @@ impl Kernel {
         });
 
         // Control
-        self.define_native("control/Continue", 0, |_kernel, _args| {
-            Ok(Value::Keyword("Continue".to_string()))
-        });
-        self.define_native("control/CancelCurrent", 1, |_kernel, args| {
-            Ok(Value::Tagged {
-                family: "control".into(),
-                variant: "CancelCurrent".into(),
-                fields: args.to_vec(),
-            })
-        });
-        self.define_native("control/Error", 1, |_kernel, args| {
-            let msg = format!("{}", args[0]);
-            Err(msg)
-        });
-
         // System
         self.define_native("system/version", 0, |_kernel, _args| {
-            Ok(Value::string("persistent-lisp-harness/0.1.0"))
+            Ok(Value::string(concat!(
+                "persistent-lisp-harness/",
+                env!("CARGO_PKG_VERSION")
+            )))
         });
         self.define_native("system/clock", 0, |_kernel, _args| {
             Ok(Value::string(&chrono::Utc::now().to_rfc3339()))
         });
-        self.define_native("system/interrupt", 0, |_kernel, _args| {
-            // Set the interrupt flag — Lisp will notice at the next safepoint
-            crate::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            Ok(Value::keyword("interrupted"))
-        });
-        self.define_native("system/clear-interrupt", 0, |_kernel, _args| {
-            crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
-            crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
-            Ok(Value::keyword("cleared"))
+        self.define_native("agent/return", 1, |kernel, args| {
+            if !kernel.current_form_is("agent/return") {
+                return Err("agent/return must be a top-level form".into());
+            }
+            if kernel.frames.len() <= 1 {
+                return Err("agent/return: root frame has no parent".into());
+            }
+            let value = args.into_iter().next().unwrap_or(Value::Nil);
+            kernel.set_trap(crate::kernel::VmTrap::ReturnAgent { value })?;
+            Ok(Value::keyword("suspended"))
         });
 
-        self.define_native("system/report-tokens", 1, |_kernel, args| {
-            let count = match &args[0] {
-                Value::Int(n) => *n,
-                Value::Float(f) => *f as i64,
-                _ => return Err("system/report-tokens: expected integer".into()),
+        self.define_native("message/reply", 2, |kernel, args| {
+            if !kernel.current_form_is("message/reply") {
+                return Err("message/reply must be a top-level form".into());
+            }
+            let message_id = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
             };
-            if count > 0 {
-                _kernel.token_reports.push_back((chrono::Utc::now(), count as u64));
+            let text = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            if !kernel.has_pending_message(&message_id) {
+                return Err(format!(
+                    "message/reply: unknown or completed message '{}'",
+                    message_id
+                ));
+            }
+            kernel.set_trap(crate::kernel::VmTrap::Reply { message_id, text })?;
+            Ok(Value::keyword("suspended"))
+        });
+
+        // Model calls inside Lisp are explicit top-level scheduler traps. Ordinary
+        // cognition is driven by the Rust scheduler, not by agent/step.
+        self.define_native("model/call", 1, |kernel, args| {
+            if !kernel.current_form_is("model/call") {
+                return Err("model/call must be a top-level form".into());
+            }
+            let prompt = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            kernel.set_trap(crate::kernel::VmTrap::CallModel { prompt })?;
+            Ok(Value::keyword("suspended"))
+        });
+        self.define_native("human/wait", 0, |kernel, _args| {
+            if !kernel.current_form_is("human/wait") {
+                return Err("human/wait must be a top-level form".into());
+            }
+            kernel.set_trap(crate::kernel::VmTrap::AwaitHuman)?;
+            Ok(Value::keyword("suspended"))
+        });
+
+        self.define_native("transcript/recent", 1, |kernel, args| {
+            let count = match &args[0] {
+                Value::Int(n) if *n >= 0 => *n as usize,
+                _ => return Err("transcript/recent: expected a non-negative integer".into()),
+            };
+            let Some(frame) = kernel.frames.last() else {
+                return Ok(Value::Nil);
+            };
+            let start = frame.state.transcript.len().saturating_sub(count);
+            Ok(Value::List(
+                frame.state.transcript[start..]
+                    .iter()
+                    .map(|entry| {
+                        Value::list(vec![
+                            Value::string(&entry.timestamp),
+                            Value::string(&entry.source),
+                            Value::string(&entry.result),
+                        ])
+                    })
+                    .collect(),
+            ))
+        });
+
+        self.define_native("source/get", 1, |kernel, args| {
+            let name = match &args[0] {
+                Value::Symbol(s) | Value::String(s) => s.clone(),
+                other => return Err(format!("source/get: expected name, got {}", other)),
+            };
+            let qualified = if name.contains('/') {
+                name
+            } else {
+                format!("user/{}", name)
+            };
+            Ok(kernel
+                .env
+                .source(&qualified)
+                .map(Value::string)
+                .unwrap_or(Value::Nil))
+        });
+        self.define_native("source/list", 0, |kernel, _args| {
+            let mut names = Vec::new();
+            for (ns_name, ns) in kernel.env.namespaces.iter() {
+                for name in ns.sources.keys() {
+                    names.push(Value::symbol(&format!("{}/{}", ns_name, name)));
+                }
+            }
+            names.sort_by_key(|v| format!("{}", v));
+            Ok(Value::List(names))
+        });
+        self.define_native("context/add-hook", 1, |kernel, args| {
+            let hook = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            if hook.chars().count() > 2_000 {
+                return Err("context/add-hook: hook exceeds 2000 characters".into());
+            }
+            let frame = kernel
+                .frames
+                .last_mut()
+                .ok_or_else(|| "context/add-hook: no frame".to_string())?;
+            if frame.state.context_hooks.len() >= 16 {
+                return Err("context/add-hook: at most 16 hooks are allowed".into());
+            }
+            frame.state.context_hooks.push(hook);
+            Ok(Value::keyword("ok"))
+        });
+        self.define_native("context/clear-hooks", 0, |kernel, _args| {
+            if let Some(frame) = kernel.frames.last_mut() {
+                frame.state.context_hooks.clear();
             }
             Ok(Value::keyword("ok"))
         });
-        self.define_native("system/snapshot", 0, |_kernel, _args| {
-                let snap = _kernel.snapshot(SnapshotKind::Incremental);
-                Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
-        });
-                
-        
-        self.define_native("model/chat", 1, |_kernel, args| {
-            let prompt = match &args[0] {
+        self.define_native("memory/remember", 2, |kernel, args| {
+            let key = match &args[0] {
+                Value::String(s) | Value::Symbol(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            let value = match &args[1] {
                 Value::String(s) => s.clone(),
-                other => return Err(format!("model/chat: expected string prompt, got {}", other)),
+                other => format!("{}", other),
             };
-
-            let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .map_err(|e| format!("model/chat: client build failed: {}", e))?;
-
-            let resp = client.post("https://openrouter.ai/api/v1/chat/completions")
-                .header("Authorization", &format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({
-                    "model": "deepseek/deepseek-v4-flash",
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "max_tokens": 200,
-                }))
-                .send()
-                .map_err(|e| format!("model/chat: request failed: {}", e))?;
-
-            let status = resp.status();
-            let body: serde_json::Value = resp.json()
-                .map_err(|e| format!("model/chat: parse failed: {}", e))?;
-
-            if !status.is_success() {
-                return Err(format!("model/chat: HTTP {}: {:?}", status, body["error"].get("message").unwrap_or(&serde_json::Value::String("unknown".into()))));
+            if key.chars().count() > 200 || value.chars().count() > 2_000 {
+                return Err("memory/remember: key or value exceeds context limits".into());
             }
-
-            let content = match body["choices"][0]["message"]["content"].as_str() {
-                Some(s) => s.to_string(),
-                None => format!("no response (choices: {})", body["choices"]),
-            };
-
-            Ok(Value::string(&content))
+            let frame = kernel
+                .frames
+                .last_mut()
+                .ok_or_else(|| "memory/remember: no frame".to_string())?;
+            if frame.state.memory.len() >= 64
+                && !frame.state.memory.iter().any(|entry| entry.key == key)
+            {
+                return Err("memory/remember: at most 64 entries are allowed".into());
+            }
+            if let Some(entry) = frame.state.memory.iter_mut().find(|entry| entry.key == key) {
+                entry.value = value;
+                entry.updated_at = chrono::Utc::now().to_rfc3339();
+            } else {
+                frame.state.memory.push(crate::kernel::MemoryEntry {
+                    key,
+                    value,
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+            Ok(Value::keyword("ok"))
         });
-
+        self.define_native("memory/forget", 1, |kernel, args| {
+            let key = match &args[0] {
+                Value::String(s) | Value::Symbol(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            if let Some(frame) = kernel.frames.last_mut() {
+                frame.state.memory.retain(|entry| entry.key != key);
+            }
+            Ok(Value::keyword("ok"))
+        });
+        self.define_native("memory/list", 0, |kernel, _args| {
+            let Some(frame) = kernel.frames.last() else {
+                return Ok(Value::Nil);
+            };
+            Ok(Value::List(
+                frame
+                    .state
+                    .memory
+                    .iter()
+                    .map(|entry| {
+                        Value::list(vec![
+                            Value::string(&entry.key),
+                            Value::string(&entry.value),
+                            Value::string(&entry.updated_at),
+                        ])
+                    })
+                    .collect(),
+            ))
+        });
 
         self.define_native("inspect/namespaces", 0, |_kernel, _args| {
-                let names: Vec<Value> = _kernel.env.namespace_names().iter().map(|n| {
-                    let count = _kernel.env.namespaces.get(n)
+            let names: Vec<Value> = _kernel
+                .env
+                .namespace_names()
+                .iter()
+                .map(|n| {
+                    let count = _kernel
+                        .env
+                        .namespaces
+                        .get(n)
                         .map(|ns| ns.list_bindings().len())
                         .unwrap_or(0);
                     Value::list(vec![Value::symbol(n), Value::int(count as i64)])
-                }).collect();
-                Ok(Value::List(names))
+                })
+                .collect();
+            Ok(Value::List(names))
         });
         self.define_native("inspect/bindings", 1, |_kernel, args| {
             let ns_name = match &args[0] {
                 Value::Symbol(s) => s.clone(),
                 _ => return Err("inspect/bindings: expected symbol".into()),
             };
-                let bindings = _kernel.inspect_namespace(&ns_name)
-                    .unwrap_or_default();
-                let items: Vec<Value> = bindings.iter().map(|b| Value::symbol(b)).collect();
-                Ok(Value::List(items))
+            let bindings = _kernel.inspect_namespace(&ns_name).unwrap_or_default();
+            let items: Vec<Value> = bindings.iter().map(|b| Value::symbol(b)).collect();
+            Ok(Value::List(items))
         });
         self.define_native("inspect/history", 1, |_kernel, args| {
-            let name = match &args[0] {
-                Value::Symbol(s) => s.clone(),
-                _ => return Err("inspect/history: expected symbol".into()),
+            let Value::Symbol(name) = &args[0] else {
+                return Err("inspect/history: expected symbol".into());
             };
-                let qualified = if name.contains('/') { name.clone() } else { format!("user/{}", name) };
-                let parts: Vec<&str> = qualified.splitn(2, '/').collect();
-                if parts.len() == 2 {
-                    if let Some(ns) = _kernel.env.namespaces.get(parts[0]) {
-                        let records = ns.history(parts[1]);
-                        if records.is_empty() {
-                            return Ok(Value::string("no history"));
-                        }
-                        let entries: Vec<Value> = records.iter().map(|r| {
-                            Value::list(vec![
-                                Value::string(&r.timestamp),
-                                Value::int(r.version as i64),
-                                Value::string(&format!("{}", r.value)),
-                            ])
-                        }).collect();
-                        return Ok(Value::List(entries));
-                    }
-                }
-                Err(format!("no history for {}", name))
+            let qualified = if name.contains('/') {
+                name.clone()
+            } else {
+                format!("user/{}", name)
+            };
+            let (namespace, binding) = qualified.split_once('/').unwrap();
+            let ns = _kernel
+                .env
+                .namespaces
+                .get(namespace)
+                .ok_or_else(|| format!("no history for {}", name))?;
+            let records = ns.history(binding);
+            if records.is_empty() {
+                return Ok(Value::string("no history"));
+            }
+            Ok(Value::List(
+                records
+                    .iter()
+                    .map(|record| {
+                        Value::list(vec![
+                            Value::string(&record.timestamp),
+                            Value::int(record.version as i64),
+                            Value::string(&format!("{}", record.value)),
+                        ])
+                    })
+                    .collect(),
+            ))
         });
-    
-
-                 
-        
 
         self.define_native("string-append", 2, |_kernel, args| {
             let a = match &args[0] {
@@ -323,47 +424,31 @@ impl Kernel {
                 _ => return Err("nth: expected integer index".into()),
             };
             match &args[1] {
-                Value::List(items) => items.get(idx).cloned().ok_or_else(|| format!("nth: index {} out of bounds", idx)),
+                Value::List(items) => items
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| format!("nth: index {} out of bounds", idx)),
                 _ => Err("nth: expected list".into()),
             }
         });
-        self.define_native("length", 1, |_kernel, args| {
-            match &args[0] {
-                Value::List(items) => Ok(Value::Int(items.len() as i64)),
-                Value::String(s) => Ok(Value::Int(s.len() as i64)),
-                _ => Err("length: expected list or string".into()),
-            }
+        self.define_native("length", 1, |_kernel, args| match &args[0] {
+            Value::List(items) => Ok(Value::Int(items.len() as i64)),
+            Value::String(s) => Ok(Value::Int(s.len() as i64)),
+            _ => Err("length: expected list or string".into()),
         });
-        self.define_native("bash", 1, |_kernel, args| {
-            let cmd = match &args[0] {
+        self.define_native("bash", 1, |kernel, args| {
+            if !kernel.current_form_is("bash") {
+                return Err(
+                    "bash must be a top-level form until VM continuations are explicit".into(),
+                );
+            }
+            let command = match &args[0] {
                 Value::String(s) => s.clone(),
-                Value::List(items) => {
-                    items.iter().map(|v| match v {
-                        Value::String(s) => s.clone(),
-                        other => format!("{}", other),
-                    }).collect::<Vec<_>>().join(" ")
-                }
-                other => return Err(format!("proc/run: expected string or list, got {}", other)),
+                other => return Err(format!("bash: expected command string, got {}", other)),
             };
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .output()
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    Ok(Value::Map(HashMap::from([
-                        (Value::keyword("exit"), Value::Int(output.status.code().unwrap_or(-1) as i64)),
-                        (Value::keyword("stdout"), Value::string(&stdout)),
-                        (Value::keyword("stderr"), Value::string(&stderr)),
-                    ])))
-                }
-                Err(e) => Err(format!("proc/run: {}", e)),
-            }
+            kernel.set_trap(crate::kernel::VmTrap::RunBash { command })?;
+            Ok(Value::keyword("suspended"))
         });
-
-        
 
         self.define_native("sleep", 1, |_kernel, args| {
             let ms = match &args[0] {
@@ -378,61 +463,48 @@ impl Kernel {
         self.define_native("wake", 2, |_kernel, args| {
             let duration_ms = match &args[0] {
                 Value::Int(ms) => *ms,
-                other => return Err(format!("wake: expected integer milliseconds, got {}", other)),
+                other => {
+                    return Err(format!(
+                        "wake: expected integer milliseconds, got {}",
+                        other
+                    ));
+                }
             };
             let action = format!("{}", args[1]);
 
-                let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(duration_ms);
-                let frame_id = _kernel.frames.last().map(|f| f.id.clone()).unwrap_or_default();
-                _kernel.wake_timers.push(crate::kernel::WakeEntry {
-                    wake_at: wake_at.to_rfc3339(),
-                    action,
-                    frame_id,
-                });
-                Ok(Value::keyword("scheduled"))
+            let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(duration_ms);
+            let frame_id = _kernel
+                .frames
+                .last()
+                .map(|f| f.id.clone())
+                .unwrap_or_default();
+            _kernel.wake_timers.push(crate::kernel::WakeEntry {
+                wake_at,
+                action,
+                frame_id,
+            });
+            Ok(Value::keyword("scheduled"))
         });
 
-                self.define_native("agent/call", 2, |_kernel, args| {
+        self.define_native("agent/call", 2, |kernel, args| {
+            if !kernel.current_form_is("agent/call") {
+                return Err(
+                    "agent/call must be a top-level form until VM continuations are explicit"
+                        .into(),
+                );
+            }
             let name = match &args[0] {
-                Value::String(s) => s.clone(),
-                Value::Symbol(s) => s.clone(),
-                other => return Err(format!("agent/call: expected name, got {}", other)),
+                Value::String(s) | Value::Symbol(s) => s.clone(),
+                other => return Err(format!("agent/call: expected agent name, got {}", other)),
             };
-            let request = format!("{}", args[1]);
-
-                let child_name = name.clone();
-                let request_text = request.clone();
-
-                // Spawn the child frame
-                let _child_id = _kernel.spawn_subagent(&child_name, &request_text)?;
-
-                // Mark parent as waiting (paused)
-                if let Some(frame) = _kernel.frames.last_mut() {
-                    frame.status = crate::kernel::FrameStatus::Waiting;
-                }
-
-                // Evaluate in the child frame context
-                let child_result = _kernel.eval(&request_text).map_err(|e| {
-                    format!("agent/call: child error: {}", e)
-                })?;
-
-                // Return from subagent — pops child, delivers to parent
-                _kernel.return_from_subagent(child_result.clone());
-
-                // Check for delivered result in parent
-                if let Some(parent) = _kernel.frames.last_mut() {
-                    parent.status = crate::kernel::FrameStatus::Running;
-                    if let Some(result) = parent.state.pending_subagent_result.take() {
-                        return Ok(result);
-                    }
-                }
-
-                Ok(child_result)
+            let request = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            kernel.set_trap(crate::kernel::VmTrap::CallAgent { name, request })?;
+            Ok(Value::keyword("suspended"))
         });
 
-        
-        
-        
         self.define_native("map/get", 2, |_kernel, args| {
             let map = match &args[0] {
                 Value::Map(m) => m,
@@ -451,11 +523,16 @@ impl Kernel {
                 Value::Int(i) => *i as usize,
                 other => return Err(format!("vector/get: expected integer index, got {}", other)),
             };
-            vec.get(idx).cloned().ok_or_else(|| format!("vector/get: index {} out of bounds (len {})", idx, vec.len()))
+            vec.get(idx).cloned().ok_or_else(|| {
+                format!(
+                    "vector/get: index {} out of bounds (len {})",
+                    idx,
+                    vec.len()
+                )
+            })
         });
 
-        
-        self.define_native("append", 0, |_kernel, args| {
+        self.define_native("append", VARIADIC_ARITY, |_kernel, args| {
             let mut result = Vec::new();
             for arg in args {
                 match arg {
@@ -465,7 +542,7 @@ impl Kernel {
             }
             Ok(Value::List(result))
         });
-self.define_native("kernel/error", 1, |_kernel, args| {
+        self.define_native("kernel/error", 1, |_kernel, args| {
             let msg = format!("{}", args[0]);
             Err(msg)
         });
@@ -477,63 +554,33 @@ self.define_native("kernel/error", 1, |_kernel, args| {
                 other => return Err(format!("inspect/find: expected string, got {}", other)),
             };
 
-                let results = _kernel.find_bindings(&query);
-                // Return compact summaries: just the qualified names
-                let items: Vec<Value> = results.iter().map(|r| Value::string(r)).collect();
-                Ok(Value::List(items))
+            let results = _kernel.find_bindings(&query);
+            // Return compact summaries: just the qualified names
+            let items: Vec<Value> = results.iter().map(|r| Value::string(r)).collect();
+            Ok(Value::List(items))
         });
 
         // inspect/describe — full details for a specific binding
-        
+
         // inspect/source — show source code of a definition
-        self.define_native("inspect/source", 1, |_kernel, args| {
-            let name = match &args[0] {
-                Value::Symbol(s) => s.clone(),
-                other => return Err(format!("inspect/source: expected symbol, got {}", other)),
-            };
-
-                let qualified = if name.contains('/') { name.clone() } else { format!("user/{}", name) };
-                match _kernel.env.lookup(&qualified) {
-                    Some(val) => Ok(Value::string(&format!("{}", val))),
-                    None => Err(format!("no binding for {}", name)),
-                }
-        });
-        
-        self.define_native("extract-lisp", 1, |_kernel, args| {
-            let text = match &args[0] {
-                Value::String(s) => s.clone(),
-                other => return Err(format!("extract-lisp: expected string, got {}", other)),
-            };
-            let start_tag = "<lisp>";
-            let end_tag = "</lisp>";
-            if let Some(start) = text.find(start_tag) {
-                let content_start = start + start_tag.len();
-                if let Some(end) = text[content_start..].find(end_tag) {
-                    let content = text[content_start..content_start + end].trim().to_string();
-                    return Ok(Value::string(&content));
-                }
-            }
-            Ok(Value::Nil)
-        });
-
-        self.define_native("eval-code", 1, |_kernel, args| {
-            let source = match &args[0] {
-                Value::String(s) => s.clone(),
-                other => return Err(format!("eval-code: expected string, got {}", other)),
-            };
-            match _kernel.eval(&source) {
-                Ok(v) => Ok(Value::string(&format!("{}", v))),
-                Err(e) => Ok(Value::string(&format!("error evaluating code: {}", e))),
-            }
-        });
         self.define_native("string-search", 2, |_kernel, args| {
             let needle = match &args[0] {
                 Value::String(s) => s.clone(),
-                other => return Err(format!("string-search: expected string needle, got {}", other)),
+                other => {
+                    return Err(format!(
+                        "string-search: expected string needle, got {}",
+                        other
+                    ));
+                }
             };
             let haystack = match &args[1] {
                 Value::String(s) => s.clone(),
-                other => return Err(format!("string-search: expected string haystack, got {}", other)),
+                other => {
+                    return Err(format!(
+                        "string-search: expected string haystack, got {}",
+                        other
+                    ));
+                }
             };
             if let Some(i) = haystack.find(&needle) {
                 Ok(Value::Int(i as i64))
@@ -559,7 +606,6 @@ self.define_native("kernel/error", 1, |_kernel, args| {
             Ok(Value::string(&s[start..end]))
         });
 
-
         // history/read — read a specific event by ID
 
         // history/zoom — zoom into a summary range, returning raw events
@@ -567,9 +613,9 @@ self.define_native("kernel/error", 1, |_kernel, args| {
         // history/find — search events by text content
 
         // Model invocation — calls any OpenAI-compatible API
-        
+
         // Agent think: structured cognition call
-        
+
         // Model chat: multi-turn conversation
-            }
+    }
 }

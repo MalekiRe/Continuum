@@ -1,19 +1,33 @@
-use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// A Lisp function, either native (Rust) or interpreted.
-#[derive(Debug, Clone)]
+pub const VARIADIC_ARITY: u32 = u32::MAX;
+pub type NativeFn = fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, String>;
+
+fn missing_native(_: &mut crate::kernel::Kernel, _: Vec<Value>) -> Result<Value, String> {
+    Err("native function was not registered after snapshot recovery".into())
+}
+
+fn missing_native_fn() -> NativeFn {
+    missing_native
+}
+
+/// A Lisp function. Native pointers are runtime-only and are restored from the
+/// kernel registry after deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum Function {
     Native {
         name: String,
         arity: u32,
-        func: fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, String>,
+        #[serde(skip, default = "missing_native_fn")]
+        func: NativeFn,
     },
     Interpreted {
         params: Vec<String>,
         body: Vec<Value>,
-        env_serialized: String,
+        env_id: u64,
     },
     Constructor {
         family: String,
@@ -22,175 +36,35 @@ pub enum Function {
     },
 }
 
-impl Serialize for Function {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Function::Native { name, arity, .. } => {
-                let m = serde_json::json!({
-                    "type": "native",
-                    "name": name,
-                    "arity": arity,
-                });
-                serde_json::Value::serialize(&m, serializer)
-            }
-            Function::Interpreted { params, body, env_serialized } => {
-                let m = serde_json::json!({
-                    "type": "interpreted",
-                    "params": params,
-                    "body": body,
-                    "env_serialized": env_serialized,
-                });
-                serde_json::Value::serialize(&m, serializer)
-            }
-            Function::Constructor { family, variant, arity } => {
-                let m = serde_json::json!({
-                    "type": "constructor",
-                    "family": family,
-                    "variant": variant,
-                    "arity": arity,
-                });
-                serde_json::Value::serialize(&m, serializer)
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Function {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let m = serde_json::Value::deserialize(deserializer)?;
-        let type_ = m["type"].as_str().unwrap_or("");
-        match type_ {
-            "native" => {
-                // Native functions can't be deserialized from a snapshot;
-                // they must be re-registered by the kernel on recovery.
-                // We create a stub that returns an error if called.
-                let name = m["name"].as_str().unwrap_or("unknown").to_string();
-                let arity = m["arity"].as_u64().unwrap_or(0) as u32;
-                Ok(Function::Native {
-                    name,
-                    arity,
-                    func: |_, _| Err("native function not available after deserialization; re-register it".into()),
-                })
-            }
-            "interpreted" => {
-                let params: Vec<String> = m["params"].as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                let body: Vec<Value> = m["body"].as_array()
-                    .map(|a| a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect())
-                    .unwrap_or_default();
-                let env_serialized = m["env_serialized"].as_str().unwrap_or("{}").to_string();
-                Ok(Function::Interpreted { params, body, env_serialized })
-            }
-            "constructor" => {
-                let family = m["family"].as_str().unwrap_or("?").to_string();
-                let variant = m["variant"].as_str().unwrap_or("?").to_string();
-                let arity = m["arity"].as_u64().unwrap_or(0) as u32;
-                Ok(Function::Constructor { family, variant, arity })
-            }
-            _ => Err(serde::de::Error::custom("unknown function type")),
-        }
-    }
-}
-
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Function::Native { name, arity, .. } => write!(f, "#<native-fn {} arity {}>", name, arity),
+            Function::Native { name, arity, .. } => {
+                write!(f, "#<native-fn {} arity {}>", name, arity)
+            }
             Function::Interpreted { params, .. } => write!(f, "#<fn ({})>", params.join(" ")),
-            Function::Constructor { family, variant, .. } => write!(f, "#<constructor {}/{}>", family, variant),
+            Function::Constructor {
+                family, variant, ..
+            } => write!(f, "#<constructor {}/{}>", family, variant),
         }
     }
 }
 
-/// A Lisp macro.
-#[derive(Debug, Clone)]
+/// A declarative Lisp macro.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum Macro {
-    Native {
-        name: String,
-        func: fn(Vec<Value>) -> Result<Value, String>,
-    },
+    #[serde(rename = "syntax-rules")]
     SyntaxRules {
         literals: Vec<String>,
         rules: Vec<(Vec<Value>, Value)>,
-        env_serialized: String,
-    },}
+    },
+}
 
 impl fmt::Display for Macro {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Macro::Native { name, .. } => write!(f, "#<macro {}>", name),
-            Macro::SyntaxRules { .. } => write!(f, "#<macro>"),
-        }
+        write!(f, "#<macro>")
     }
-
-}
-
-impl Serialize for Macro {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Macro::Native { name, .. } => {
-                let m = serde_json::json!({
-                    "type": "native",
-                    "name": name,
-                });
-                serde_json::Value::serialize(&m, serializer)
-            }
-            Macro::SyntaxRules { literals, rules, env_serialized } => {
-                let m = serde_json::json!({
-                    "type": "syntax-rules",
-                    "literals": literals,
-                    "rules": rules,
-                    "env_serialized": env_serialized,
-                });
-                serde_json::Value::serialize(&m, serializer)
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Macro {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let m = serde_json::Value::deserialize(deserializer)?;
-        let type_ = m["type"].as_str().unwrap_or("");
-        match type_ {
-            "native" => {
-                let name = m["name"].as_str().unwrap_or("unknown").to_string();
-                Ok(Macro::Native {
-                    name,
-                    func: |_| Err("native macro not available after deserialization; re-register it".into()),
-                })
-            }
-            "syntax-rules" => {
-                let literals: Vec<String> = m["literals"].as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                let rules_raw: Vec<serde_json::Value> = m["rules"].as_array()
-                    .map(|a| a.iter().cloned().collect())
-                    .unwrap_or_default();
-                let mut rules = Vec::new();
-                for rule in rules_raw {
-                    if let (Some(pattern), Some(template)) = (
-                        rule[0].as_array().map(|a| a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()),
-                        serde_json::from_value(rule[1].clone()).ok(),
-                    ) {
-                        rules.push((pattern, template));
-                    }
-                }
-                let env_serialized = m["env_serialized"].as_str().unwrap_or("{}").to_string();
-                Ok(Macro::SyntaxRules { literals, rules, env_serialized })
-            }
-            _ => Err(serde::de::Error::custom("unknown macro type")),
-        }
-    }
-}
-
-/// Opaque kernel reference.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KernelRef {
-    pub kind: String,
-    pub id: String,
-    pub metadata: HashMap<String, String>,
 }
 
 /// The core Lisp value type.
@@ -205,7 +79,7 @@ pub enum Value {
     Keyword(String),
     List(Vec<Value>),
     Vector(Vec<Value>),
-    Map(HashMap<Value, Value>),
+    Map(IndexMap<Value, Value>),
     Function(Function),
     Macro(Macro),
     Tagged {
@@ -213,7 +87,6 @@ pub enum Value {
         variant: String,
         fields: Vec<Value>,
     },
-    KernelRef(KernelRef),
 }
 
 impl fmt::Display for Value {
@@ -223,13 +96,15 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{}", if *b { "#t" } else { "#f" }),
             Value::Int(n) => write!(f, "{}", n),
             Value::Float(n) => write!(f, "{}", n),
-            Value::String(s) => write!(f, "\"{}\"", s),
+            Value::String(s) => write!(f, "{:?}", s),
             Value::Symbol(s) => write!(f, "{}", s),
             Value::Keyword(k) => write!(f, ":{}", k),
             Value::List(items) => {
                 write!(f, "(")?;
                 for (i, v) in items.iter().enumerate() {
-                    if i > 0 { write!(f, " ")?; }
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, ")")
@@ -237,7 +112,9 @@ impl fmt::Display for Value {
             Value::Vector(items) => {
                 write!(f, "#(")?;
                 for (i, v) in items.iter().enumerate() {
-                    if i > 0 { write!(f, " ")?; }
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, ")")
@@ -246,20 +123,27 @@ impl fmt::Display for Value {
                 write!(f, "{{")?;
                 let mut first = true;
                 for (k, v) in map.iter() {
-                    if !first { write!(f, " ")?; }
+                    if !first {
+                        write!(f, " ")?;
+                    }
                     write!(f, "{} {}", k, v)?;
                     first = false;
                 }
                 write!(f, "}}")
             }
             Value::Function(fun) => write!(f, "{}", fun),
-            Value::Macro(m) => match m {
-                Macro::Native { name, .. } => write!(f, "#<macro {}>", name),
-                Macro::SyntaxRules { .. } => write!(f, "#<macro>"),
-            },
-            Value::Tagged { family, variant, .. } => write!(f, "({}/{} ...)", family, variant),
-            Value::KernelRef(kr) => write!(f, "#<{} {}>", kr.kind, kr.id),
-
+            Value::Macro(m) => write!(f, "{}", m),
+            Value::Tagged {
+                family,
+                variant,
+                fields,
+            } => {
+                write!(f, "({}/{}", family, variant)?;
+                for field in fields {
+                    write!(f, " {}", field)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -278,22 +162,67 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
-            (Value::Function(a), Value::Function(b)) => {
-                // Compare function name and arity, not function pointers
-                use std::fmt::Write;
-                let mut sa = String::new(); let _ = write!(sa, "{}", a);
-                let mut sb = String::new(); let _ = write!(sb, "{}", b);
-                sa == sb
-            }
-            (Value::Macro(a), Value::Macro(b)) => {
-                use std::fmt::Write;
-                let mut sa = String::new(); let _ = write!(sa, "{}", a);
-                let mut sb = String::new(); let _ = write!(sb, "{}", b);
-                sa == sb
-            }
-            (Value::Tagged { family: fa, variant: va, fields: fia },
-             Value::Tagged { family: fb, variant: vb, fields: fib }) => fa == fb && va == vb && fia == fib,
-            (Value::KernelRef(a), Value::KernelRef(b)) => a.kind == b.kind && a.id == b.id,
+            (Value::Function(a), Value::Function(b)) => match (a, b) {
+                (
+                    Function::Native {
+                        name: an,
+                        arity: aa,
+                        ..
+                    },
+                    Function::Native {
+                        name: bn,
+                        arity: ba,
+                        ..
+                    },
+                ) => an == bn && aa == ba,
+                (
+                    Function::Interpreted {
+                        params: ap,
+                        body: ab,
+                        env_id: ae,
+                    },
+                    Function::Interpreted {
+                        params: bp,
+                        body: bb,
+                        env_id: be,
+                    },
+                ) => ap == bp && ab == bb && ae == be,
+                (
+                    Function::Constructor {
+                        family: af,
+                        variant: av,
+                        arity: aa,
+                    },
+                    Function::Constructor {
+                        family: bf,
+                        variant: bv,
+                        arity: ba,
+                    },
+                ) => af == bf && av == bv && aa == ba,
+                _ => false,
+            },
+            (
+                Value::Macro(Macro::SyntaxRules {
+                    literals: al,
+                    rules: ar,
+                }),
+                Value::Macro(Macro::SyntaxRules {
+                    literals: bl,
+                    rules: br,
+                }),
+            ) => al == bl && ar == br,
+            (
+                Value::Tagged {
+                    family: fa,
+                    variant: va,
+                    fields: fia,
+                },
+                Value::Tagged {
+                    family: fb,
+                    variant: vb,
+                    fields: fib,
+                },
+            ) => fa == fb && va == vb && fia == fib,
             _ => false,
         }
     }
@@ -312,73 +241,74 @@ impl std::hash::Hash for Value {
             Value::List(items) => (7u8, items).hash(state),
             Value::Vector(items) => (8u8, items).hash(state),
             Value::Map(map) => {
+                // IndexMap equality is independent of insertion order, so the
+                // hash must be canonical too. Hash each entry, sort the entry
+                // digests, then feed that stable sequence to the caller.
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hasher;
                 9u8.hash(state);
-                for (k, v) in map {
-                    k.hash(state);
-                    v.hash(state);
+                let mut entries: Vec<u64> = map
+                    .iter()
+                    .map(|(key, value)| {
+                        let mut entry = DefaultHasher::new();
+                        key.hash(&mut entry);
+                        value.hash(&mut entry);
+                        entry.finish()
+                    })
+                    .collect();
+                entries.sort_unstable();
+                entries.hash(state);
+            }
+            Value::Function(function) => {
+                10u8.hash(state);
+                match function {
+                    Function::Native { name, arity, .. } => (0u8, name, arity).hash(state),
+                    Function::Interpreted {
+                        params,
+                        body,
+                        env_id,
+                    } => (1u8, params, body, env_id).hash(state),
+                    Function::Constructor {
+                        family,
+                        variant,
+                        arity,
+                    } => (2u8, family, variant, arity).hash(state),
                 }
             }
-            Value::Function(f) => (10u8, format!("{}", f)).hash(state),
-            Value::Macro(m) => (11u8, format!("{}", m)).hash(state),
-            Value::Tagged { family, variant, fields } => (12u8, family, variant, fields).hash(state),
-            Value::KernelRef(kr) => (13u8, &kr.kind, &kr.id).hash(state),
+            Value::Macro(Macro::SyntaxRules { literals, rules }) => {
+                (11u8, literals, rules).hash(state)
+            }
+            Value::Tagged {
+                family,
+                variant,
+                fields,
+            } => (12u8, family, variant, fields).hash(state),
         }
     }
 }
 
 impl Value {
-    pub fn symbol(s: &str) -> Self { Value::Symbol(s.to_string()) }
-    pub fn keyword(s: &str) -> Self { Value::Keyword(s.to_string()) }
-    pub fn string(s: &str) -> Self { Value::String(s.to_string()) }
-    pub fn int(n: i64) -> Self { Value::Int(n) }
-    pub fn list(items: Vec<Value>) -> Self { Value::List(items) }
-    pub fn nil() -> Self { Value::Nil }
-    pub fn bool(b: bool) -> Self { Value::Bool(b) }
+    pub fn symbol(s: &str) -> Self {
+        Value::Symbol(s.to_string())
+    }
+    pub fn keyword(s: &str) -> Self {
+        Value::Keyword(s.to_string())
+    }
+    pub fn string(s: &str) -> Self {
+        Value::String(s.to_string())
+    }
+    pub fn int(n: i64) -> Self {
+        Value::Int(n)
+    }
+    pub fn list(items: Vec<Value>) -> Self {
+        Value::List(items)
+    }
 
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
-    pub fn tagged(family: &str, variant: &str, fields: Vec<Value>) -> Self {
-        Value::Tagged {
-            family: family.to_string(),
-            variant: variant.to_string(),
-            fields,
-        }
-    }
-
-    pub fn car(&self) -> Option<&Value> {
-        match self {
-            Value::List(items) => items.first(),
-            _ => None,
-        }
-    }
-
-    pub fn cdr(&self) -> Value {
-        match self {
-            Value::List(items) if items.len() >= 2 => Value::List(items[1..].to_vec()),
-            Value::List(_) => Value::Nil,
-            _ => Value::Nil,
-        }
-    }
-
-    pub fn is_pair(&self) -> bool {
-        matches!(self, Value::List(items) if items.len() >= 1)
-    }
-
     pub fn is_list(&self) -> bool {
         matches!(self, Value::List(_) | Value::Nil)
     }
-}
-
-/// The `lisp_fn!` macro — exported at crate root level.
-#[macro_export]
-macro_rules! lisp_fn {
-    ($name:expr, $arity:expr, $func:expr) => {
-        $crate::vm::value::Value::Function($crate::vm::value::Function::Native {
-            name: $name.to_string(),
-            arity: $arity,
-            func: $func,
-        })
-    };
 }

@@ -1,93 +1,109 @@
 # Continuum
 
-A **continuously existing agent** whose computer is a persistent Lisp world.
+Continuum is a persistent Lisp world driven by a model-owned action loop:
 
-```
-Model/AI
-  ↕
-Lisp environment (continuum)
-  ↕
-bash — the universal tool interface
-  ↕
-Files, processes, network, everything else
+```text
+persistent frame context
+  → model emits exactly one Lisp form
+  → kernel evaluates it transactionally
+  → form and result enter the same frame transcript
+  → next model turn
 ```
 
-The kernel is the Lisp VM. It provides 41 native functions — arithmetic, list operations, type predicates, I/O, persistence, inspection, and `bash`. Everything else — file I/O, web requests, git, model inference, package management — goes through `bash`. The agent defines its own tools in Lisp.
+The model is not called by `agent/step`. Rust's scheduler owns model invocation, context assembly, tool traps, child-frame scheduling, transcript compaction, and snapshots.
 
-## Language
-
-A Scheme-like Lisp with:
-
-| Special forms | `define`, `lambda`, `if`, `begin`, `let`, `let*`, `letrec`, `set!`, `quote`, `quasiquote`, `undefine` |
-|---|---|
-| Macros | `define-syntax` with `syntax-rules` (including `...` ellipsis for variable-length patterns) |
-| Data types | `define-data` for tagged value families with automatic constructor functions |
-| Pattern matching | `match` with constructor pattern destructuring |
-| Tagged values | `(Ok value)`, `(Err problem)`, `(Cancelled reason)`, `(Indeterminate problem)` |
-
-## Design
-
-**Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
-
-**Supervision.** Every cognition loop iteration checks two conditions and delivers advisory notices — the agent stays in control:
-- **Long-running eval** (advisory at 15min): if a top-level eval runs for 15+ minutes, the agent gets a `system/SupervisorNotice` suggesting it check whether it's making progress. No hard kill — the agent always decides.
-- **Low token efficiency** (advisory, starts after 120s): token reports from Lisp (`(system/report-tokens N)`) are tracked in a 30-minute sliding window. If elapsed time exceeds 6x the expected time at 10 tok/s, the agent receives a notice suggesting it optimize its approach — batch bash calls, reduce redundant testing, etc. If zero tokens are reported for 5+ minutes, a notice suggests the agent may be stuck in a blocking tool call.
-
-**Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
-
-**Closures only capture frames, not namespaces.** Only lexical frames are serialized into closures. Namespaces are shared by reference at call time, avoiding O(n) serialization cost per closure.
-
-**Subagents.** `(agent/call 'name request)` pushes a child frame, evaluates the request, pops the frame, and delivers the result to the parent. Only one evaluation runs at a time.
-
-**Human interaction.** Messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and the agent returns `control/Continue` or `(control/CancelCurrent ...)`.
-
-**Snapshots.** Every snapshot serializes the full kernel state to JSON. Recovery loads the saved image directly — it never replays execution. Snapshots are checksummed (SHA256) and rotated. After recovery, every active frame receives a `(system/Restarted :kind :unclean :downtime ...)` notice.
-
-**Wake timers.** `(wake ms action)` schedules a Lisp expression to be evaluated as a message after `ms` milliseconds. Timers are checked once per cognition loop iteration.
-
-## Quick Start
+## Quick start
 
 ```bash
+export OPENROUTER_API_KEY=...
 cargo run
 ```
 
-Starts a continuous agent. The agent lives until `!!exit`. Type any Lisp expression:
+Optional configuration:
 
-```lisp
-lisp> (+ 1 2)
-3
-lisp> (bash "echo hello")
-{:exit 0 :stdout "hello\n" :stderr ""}
-lisp> (define-data result/Result (Ok value) (Err problem))
-result/Result
-lisp> (match (user/result/Result/Ok 42)
-         ((result/Result/Ok n) (+ n 1))
-         ((result/Result/Err msg) -1))
-43
+```bash
+export CONTINUUM_MODEL=deepseek/deepseek-v4-flash
+export CONTINUUM_AGENT_ROOT=$PWD/data/workspace
 ```
 
-Snapshots happen automatically. Recover from a crash with `cargo run` — it auto-detects the latest snapshot.
+The HTTP UI listens on `http://localhost:8080`.
 
-## Principles
+## Turn model
 
-1. **Kernel is minimal.** Only what the VM needs to function. Everything else is Lisp.
-2. **`bash` is the universal tool interface.** File I/O, web requests, network calls — all go through shell commands. No built-in HTTP, file APIs, or JSON parsing.
-3. **Definitions persist.** Every `define` creates a new version. `undefine` removes the current binding without erasing history.
-4. **Snapshots are atomic.** You can never save mid-call. Recovery restores the exact pre-call state.
+Each active frame persists:
 
-## Native Functions
+- immutable-ish agent instructions;
+- its own recent Lisp transcript;
+- chronological compacted context;
+- pending human/task messages;
+- selected key/value memory;
+- context hooks;
+- retained definition source;
+- pending top-level suspension traps.
 
-| Category | Functions |
-|---|---|
-| Arithmetic | `+` `-` `*` `/` `<` `=` `>` |
-| Lists | `cons` `car` `cdr` `list` |
-| I/O | `display` `println` `read` |
-| Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
-| Control | `control/Continue` `control/CancelCurrent` `control/Error` |
-| System | `system/clock` `system/version` `system/interrupt` `system/clear-interrupt` |
-| Persistence | `system/snapshot` `system/report-tokens` |
-| Inspection | `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/source` `inspect/history` |
-| Subagents | `agent/call` |
-| Shell | `bash` |
-| Scheduling | `wake` |
-| Utilities | `map/get` `vector/get` `kernel/error` |
+Model output must parse as exactly one Lisp form. Multiple operations can be grouped with `(begin ...)` only when none needs external suspension.
+
+Human messages are injected into the active frame context and answered explicitly with:
+
+```lisp
+(message/reply "message-id" "answer")
+```
+
+## External operations
+
+These forms must be top-level until the VM has a fully general serializable continuation stack:
+
+```lisp
+(bash "git status")
+(model/call "focused model subtask")
+(agent/call "researcher" "inspect the build")
+(agent/return value)
+(message/reply "message-id" "text")
+```
+
+The scheduler handles the resulting trap and puts the external result in the frame transcript. The next model turn sees that result.
+
+`bash` uses actual Bash with a fixed working directory, one owned process group, bounded concurrently-drained output, live progress, a timeout, and external cancellation. Concurrent runs are rejected and background descendants are killed and reaped. Human input can interrupt an active Lisp evaluation, model request, or shell command.
+
+The working directory is an execution root, not a filesystem sandbox: commands can still address absolute host paths. Use an OS/container sandbox when running untrusted agents.
+
+## Lisp VM guarantees
+
+- Top-level evaluation is transactional across namespaces, frames, wake timers, and lexical-heap allocation.
+- Tail calls are optimized only in actual tail position; caller lexical frames are restored after the trampoline completes.
+- Closures store stable lexical-heap IDs rather than serialized JSON environments.
+- Maps have deterministic insertion/evaluation order and order-independent canonical hashing.
+- `system`, `control`, `inspect`, and `kernel` namespaces are protected by exact identity.
+- Definition source is retained in the namespace and exposed by `source/get`.
+
+## Subagents
+
+A top-level `agent/call` marks the parent Waiting and pushes a child frame with independent instructions, messages, transcript, compaction, and selected memory. The scheduler runs the child until top-level `agent/return`, then pops it, records the result in the parent transcript, and wakes the parent.
+
+## Memory and context
+
+```lisp
+(memory/remember "project" "Continuum")
+(memory/forget "project")
+(memory/list)
+(context/add-hook "Prefer tests before edits")
+(context/clear-hooks)
+(transcript/recent 10)
+```
+
+Transcript compaction is chronological and bounded. There is deliberately no end-to-end event log.
+
+## Snapshots
+
+Snapshots use one strict versioned envelope with an embedded SHA-256 checksum. They are written through a synced temporary file, atomic rename, and directory sync. Recovery tries snapshots newest-first, verifies checksums, falls back across corrupt/truncated files, restores transcripts/frame stacks/closure heap/pending traps, and re-registers native functions without polluting binding history. The writer retains the newest 48 snapshots; recovery remains compatible with v2 full/incremental envelopes.
+
+If snapshot files exist and none is valid, startup exits with a continuity violation instead of silently creating a fresh kernel.
+
+## Tests
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Behavioral coverage includes the model→Lisp feedback loop with a fake model, human replies, subagent scheduling, source rollback, transcript compaction, shell timeout/cancellation/process groups/output bounds, real snapshot recovery/fallback/checksums, closure recovery, map hash contracts, tail-call correctness, and transactional evaluation.

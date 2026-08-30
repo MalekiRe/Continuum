@@ -1,14 +1,14 @@
-#[macro_use]
-pub mod vm;
-#[macro_use]
+pub mod executor;
 pub mod kernel;
+pub mod scheduler;
+pub mod vm;
 
-pub use vm::{
-    value::Value,
-    value::Function,
-    value::Macro,
-    eval::EvalError,
-    env::EnvRef,
-    reader::ReadError,
+pub use executor::{ExecutionResult, Executor, ExecutorConfig, ExecutorStatus};
+pub use kernel::{
+    FrameStatus, Kernel, PendingMessage, PendingTrap, SnapshotInfo, TranscriptEntry, VmTrap,
 };
-pub use kernel::Kernel;
+pub use vm::{
+    env::EnvRef, eval::EvalError, reader::ReadError, value::Function, value::Macro, value::Value,
+};
+
+pub use scheduler::{ModelClient, ModelRequest, OpenRouterModel, Scheduler, TurnOutcome};

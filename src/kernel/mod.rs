@@ -1,18 +1,20 @@
-
-pub mod snapshot;
 pub mod native;
 use crate::vm::env::EnvRef;
 use crate::vm::eval;
-use crate::vm::value::Value;
 use crate::vm::value::Function;
-use std::collections::VecDeque;
+use crate::vm::value::Value;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeEntry {
-    pub wake_at: String,
+    pub wake_at: chrono::DateTime<chrono::Utc>,
     pub action: String,
     pub frame_id: String,
+}
+
+fn default_next_lexical_env_id() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,14 +22,15 @@ pub struct Kernel {
     pub env: EnvRef,
     pub frames: Vec<Frame>,
     pub storage: SnapshotConfig,
-    pub event_counter: u64,
     pub next_frame_id: u64,
-    pub version: String,
-    pub supervision: SupervisionConfig,
     pub wake_timers: Vec<WakeEntry>,
-    pub eval_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Current expression source being evaluated (for source retention).
     #[serde(skip)]
-    pub token_reports: VecDeque<(chrono::DateTime<chrono::Utc>, u64)>,
+    pub current_source: Option<String>,
+    #[serde(default)]
+    pub lexical_heap: HashMap<u64, Vec<HashMap<String, Value>>>,
+    #[serde(default = "default_next_lexical_env_id")]
+    pub next_lexical_env_id: u64,
 }
 
 /// An agent frame.
@@ -35,10 +38,13 @@ pub struct Kernel {
 pub struct Frame {
     pub id: String,
     pub name: String,
-    pub parent_id: Option<String>,
     pub status: FrameStatus,
-    pub pending_message: Option<String>,
-    pub message_queue: Vec<String>,
+    #[serde(default)]
+    pub messages: Vec<PendingMessage>,
+    #[serde(default, skip_serializing)]
+    pending_message: Option<String>,
+    #[serde(default, skip_serializing)]
+    message_queue: Vec<String>,
     pub state: FrameState,
 }
 
@@ -46,88 +52,122 @@ pub struct Frame {
 pub enum FrameStatus {
     Running,
     Waiting,
-    Cancelled,
-    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingMessage {
+    pub id: Option<String>,
+    pub text: String,
+}
+
+/// A single model action and its evaluated result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptEntry {
+    pub source: String,
+    pub result: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub key: String,
+    pub value: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameState {
-    pub local_bindings: Vec<(String, Value)>,
-    pub current_continuation: Option<Continuation>,
-    /// Stores the pending agent/call return (subagent result).
-    pub pending_subagent_result: Option<Value>,
-    pub cancelled_tokens: Vec<String>,
+    #[serde(default, rename = "current_continuation", skip_serializing)]
+    legacy_continuation: Option<LegacyContinuation>,
+    #[serde(default)]
+    pub transcript: Vec<TranscriptEntry>,
+    #[serde(default)]
+    pub compacted_context: String,
+    #[serde(default, deserialize_with = "deserialize_pending_trap")]
+    pub pending_trap: Option<PendingTrap>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub context_hooks: Vec<String>,
+    #[serde(default)]
+    pub memory: Vec<MemoryEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Continuation {
-    pub depth: u32,
-    pub description: String,
-    /// Saved source expression for the continuation.
-    pub saved_source: Option<Vec<Value>>,
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyContinuation {
+    #[serde(default)]
+    saved_source: Option<Vec<Value>>,
+}
+
+/// A frame-owned top-level suspension request. Nested suspension is
+/// deliberately rejected until the evaluator has a serializable stack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingTrap {
+    pub source: String,
+    pub operation: VmTrap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum VmTrap {
+    CallModel { prompt: String },
+    RunBash { command: String },
+    AwaitHuman,
+    CallAgent { name: String, request: String },
+    ReturnAgent { value: Value },
+    Reply { message_id: String, text: String },
+}
+
+fn deserialize_pending_trap<'de, D>(deserializer: D) -> Result<Option<PendingTrap>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else { return Ok(None) };
+    if let Ok(pending) = serde_json::from_value::<PendingTrap>(value.clone()) {
+        return Ok(Some(pending));
+    }
+    // v2 snapshots stored the operation directly and the source separately.
+    let operation = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+    Ok(Some(PendingTrap {
+        source: "(resume external operation)".into(),
+        operation,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
     pub snapshot_dir: String,
-    pub full_snapshot_interval_hours: u64,
-    pub last_full_snapshot: Option<String>,
     pub snapshot_count: u64,
 }
 
 impl Default for SnapshotConfig {
     fn default() -> Self {
-        SnapshotConfig {
+        Self {
             snapshot_dir: "snapshots".into(),
-            full_snapshot_interval_hours: 1,
-            last_full_snapshot: None,
             snapshot_count: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Snapshot {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotInfo {
     pub id: String,
     pub timestamp: String,
-    pub kernel: Kernel,
-    pub env: EnvRef,
     pub checksum: String,
-    pub kind: SnapshotKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SnapshotKind {
-    Full,
-    Incremental,
+struct SnapshotEnvelope {
+    format_version: u32,
+    id: String,
+    timestamp: String,
+    kernel: serde_json::Value,
+    checksum: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisionConfig {
-    /// Window in seconds for rolling token rate calculation.
-    pub window_seconds: u64,
-    /// Minimum token rate (tok/s) within the window to consider the agent productive.
-    pub min_tokens_per_sec: u64,
-    /// Don't check rolling rate until eval has been running at least this long.
-    pub min_elapsed_seconds: u64,
-    /// Eval duration before sending advisory about progress (seconds).
-    pub advisory_after_seconds: u64,
-    /// Expected token generation rate for time-vs-tokens comparison.
-    pub expected_tokens_per_sec: u64,
-    /// Multiplier: if elapsed > expected_tokens_per_sec * multiplier * seconds, deliver notice.
-    pub timeout_multiplier: u64,
-}
-
-impl Default for SupervisionConfig {
+impl Default for Kernel {
     fn default() -> Self {
-        SupervisionConfig {
-            window_seconds: 1800,
-            min_tokens_per_sec: 2,
-            min_elapsed_seconds: 120,
-            advisory_after_seconds: 900,
-            expected_tokens_per_sec: 10,
-            timeout_multiplier: 6,
-        }
+        Self::new()
     }
 }
 
@@ -136,15 +176,12 @@ impl Kernel {
         let mut kernel = Kernel {
             env: EnvRef::new(),
             frames: Vec::new(),
-                        wake_timers: Vec::new(),
-            eval_started_at: None,
-            token_reports: VecDeque::new(),
+            wake_timers: Vec::new(),
+            lexical_heap: HashMap::new(),
+            next_lexical_env_id: 1,
+            current_source: None,
             storage: SnapshotConfig::default(),
-            event_counter: 0,
             next_frame_id: 1,
-            version: "0.1.0".into(),
-            supervision: SupervisionConfig::default(),
-
         };
 
         kernel.register_tools();
@@ -152,15 +189,18 @@ impl Kernel {
         let root_frame = Frame {
             id: format!("frame-{}", kernel.next_frame_id),
             name: "root".into(),
-            parent_id: None,
             status: FrameStatus::Running,
+            messages: Vec::new(),
             pending_message: None,
             message_queue: Vec::new(),
             state: FrameState {
-                local_bindings: Vec::new(),
-                current_continuation: None,
-                pending_subagent_result: None,
-                cancelled_tokens: Vec::new(),
+                legacy_continuation: None,
+                transcript: Vec::new(),
+                compacted_context: String::new(),
+                pending_trap: None,
+                instructions: String::new(),
+                context_hooks: Vec::new(),
+                memory: Vec::new(),
             },
         };
         kernel.frames.push(root_frame);
@@ -173,319 +213,390 @@ impl Kernel {
         kernel
     }
 
+    pub fn capture_lexical_env(&mut self) -> u64 {
+        let id = self.next_lexical_env_id;
+        self.next_lexical_env_id += 1;
+        self.lexical_heap.insert(id, self.env.frames.clone());
+        id
+    }
+
+    pub fn lexical_env(&self, id: u64) -> Option<Vec<HashMap<String, Value>>> {
+        self.lexical_heap.get(&id).cloned()
+    }
+
     pub fn eval(&mut self, source: &str) -> Result<Value, eval::EvalError> {
-        let is_top_level = self.eval_started_at.is_none();
-        if is_top_level {
-            self.eval_started_at = Some(chrono::Utc::now());
-        }
-
+        let checkpoint = (
+            self.env.clone(),
+            self.frames.clone(),
+            self.wake_timers.clone(),
+            self.next_frame_id,
+            self.next_lexical_env_id,
+        );
+        let previous_source = self.current_source.replace(source.to_string());
+        eval::EVAL_RUNNING.store(true, std::sync::atomic::Ordering::Release);
         let result = eval::eval(source, self);
+        eval::EVAL_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+        eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Release);
+        self.current_source = previous_source;
 
-        if is_top_level {
-            self.eval_started_at = None;
+        if result.is_err() {
+            let (env, frames, wake_timers, next_frame_id, next_lexical_env_id) = checkpoint;
+            self.env = env;
+            self.frames = frames;
+            self.wake_timers = wake_timers;
+            self.next_frame_id = next_frame_id;
+            self.lexical_heap.retain(|id, _| *id < next_lexical_env_id);
+            self.next_lexical_env_id = next_lexical_env_id;
         }
         result
     }
 
-/// Evaluate Lisp in a read-eval-print loop, returning the result as a display string.
-    /// Checks that the source hasn't been cancelled before executing.
-    pub fn eval_repl(&mut self, source: &str) -> String {
-        // Check if this source matches a cancelled call
-        if let Some(frame) = self.frames.last() {
-            for token in &frame.state.cancelled_tokens {
-                if source.trim() == token.as_str() {
-                    return format!("cancelled: call was previously cancelled and will not be re-executed");
-                }
-            }
+    /// True only when the current top-level form has the requested head.
+    /// Used to reject nested suspension until continuations are explicit.
+    pub fn current_form_is(&self, expected: &str) -> bool {
+        let Some(source) = self.current_source.as_deref() else {
+            return false;
+        };
+        let Ok(forms) = crate::vm::reader::read_all(source) else {
+            return false;
+        };
+        if forms.len() != 1 {
+            return false;
         }
-
-        match self.eval(source) {
-            Ok(val) => {
-                // If the result was CancelCurrent, record the cancelled SOURCE
-                // so the exact same call can't be re-executed.
-                if let Value::Tagged { family, variant, fields: _ } = &val {
-                    if family == "control" && variant == "CancelCurrent" {
-                        if let Some(frame) = self.frames.last_mut() {
-                            // Store the original source expression, not the reason.
-                            // The reason is a human message; the source is the expression
-                            // that was cancelled. Comparing source against source is correct.
-                            frame.state.cancelled_tokens.push(source.to_string());
-                        }
-                    }
-                }
-                format!("{}", val)
-            }
-            Err(e) => format!("error: {}", e),
-        }
+        matches!(&forms[0], Value::List(items)
+            if matches!(items.first(), Some(Value::Symbol(head)) if head == expected))
     }
 
-    
-
-/// Create a child frame for a subagent call.
+    /// Create a child frame for a subagent call.
     /// Returns the child's frame ID.
-    pub fn spawn_subagent(&mut self, name: &str, request: &str) -> Result<String, String> {
+    pub fn spawn_subagent(&mut self, name: &str, request: &str) -> String {
         let id = format!("frame-{}", self.next_frame_id);
         self.next_frame_id += 1;
-
-        let parent_id = self.frames.last().map(|f| f.id.clone());
-
-        let frame = Frame {
+        if let Some(parent) = self.frames.last_mut() {
+            parent.status = FrameStatus::Waiting;
+        }
+        self.frames.push(Frame {
             id: id.clone(),
             name: name.to_string(),
-            parent_id: parent_id.clone(),
             status: FrameStatus::Running,
+            messages: Vec::new(),
             pending_message: None,
             message_queue: Vec::new(),
             state: FrameState {
-                local_bindings: Vec::new(),
-                current_continuation: None,
-                pending_subagent_result: None,
-                cancelled_tokens: Vec::new(),
+                legacy_continuation: None,
+                transcript: Vec::new(),
+                compacted_context: String::new(),
+                pending_trap: None,
+                instructions: format!(
+                    "You are the '{}' subagent. Complete this task and finish with (agent/return value): {}",
+                    name, request
+                ),
+                context_hooks: Vec::new(),
+                memory: Vec::new(),
             },
-        };
-
-        let child_source = format!(
-            "(begin (define request '{}') (define parent '{}'))",
-            request,
-            parent_id.unwrap_or_default(),
-        );
-
-        // Push child frame, evaluate the request setup
-        self.frames.push(frame);
-        let _ = self.eval(&child_source);
-
-        Ok(id)
+        });
+        id
     }
 
     /// Complete the current subagent frame and return its result to the parent.
-    pub fn return_from_subagent(&mut self, value: Value) {
-        if let Some(mut frame) = self.frames.pop() {
-            frame.status = FrameStatus::Completed;
-
-            // Deliver result to parent frame
-            if let Some(parent_frame) = self.frames.last_mut() {
-                parent_frame.state.pending_subagent_result = Some(value.clone());
-                // If parent was waiting, wake it
-                if parent_frame.status == FrameStatus::Waiting {
-                    parent_frame.status = FrameStatus::Running;
-                }
-            }
-
+    pub fn return_from_subagent(&mut self) {
+        self.frames.pop();
+        if let Some(parent) = self.frames.last_mut() {
+            parent.status = FrameStatus::Running;
         }
     }
 
     /// Deliver a human message as an interrupt to the current frame.
-    pub fn human_message(&mut self, text: &str) {
-        // Deliver the notice to EVERY active frame (stack notices)
-        for frame in self.frames.iter_mut() {
-            // Queue the notice — every frame sees it before it next thinks
-            let notice = format!("(system/HumanMessage {:?})", text);
-            frame.message_queue.push(notice);
-            frame.pending_message = Some(text.to_string());
-            if frame.status == FrameStatus::Waiting {
-                frame.status = FrameStatus::Running;
+    pub fn human_message(&mut self, text: &str) -> Result<String, String> {
+        if self.frames.iter().any(|frame| {
+            frame
+                .messages
+                .iter()
+                .filter(|message| message.id.is_some())
+                .count()
+                >= 128
+        }) {
+            return Err("too many unanswered human messages".into());
+        }
+        let id = format!("msg-{}", uuid::Uuid::new_v4());
+        let text: String = text.chars().take(8_000).collect();
+        for frame in &mut self.frames {
+            frame.messages.push(PendingMessage {
+                id: Some(id.clone()),
+                text: text.clone(),
+            });
+            frame.status = FrameStatus::Running;
+        }
+        Ok(id)
+    }
+
+    pub fn has_pending_message(&self, id: &str) -> bool {
+        self.frames.last().is_some_and(|frame| {
+            frame
+                .messages
+                .iter()
+                .any(|message| message.id.as_deref() == Some(id))
+        })
+    }
+
+    pub fn complete_message(&mut self, id: &str) {
+        for frame in &mut self.frames {
+            frame
+                .messages
+                .retain(|message| message.id.as_deref() != Some(id));
+        }
+    }
+
+    fn migrate_legacy_messages(&mut self) {
+        fn convert(text: String) -> PendingMessage {
+            if let Some(rest) = text.strip_prefix("Human message [")
+                && let Some((id, body)) = rest.split_once("]: ")
+            {
+                return PendingMessage {
+                    id: Some(id.into()),
+                    text: body.into(),
+                };
+            }
+            PendingMessage { id: None, text }
+        }
+        for frame in &mut self.frames {
+            if let Some(legacy) = frame.state.legacy_continuation.take()
+                && let Some(pending) = frame.state.pending_trap.as_mut()
+                && pending.source == "(resume external operation)"
+                && let Some(forms) = legacy.saved_source
+            {
+                pending.source = forms
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            if let Some(text) = frame.pending_message.take() {
+                let message = convert(text);
+                if !frame
+                    .messages
+                    .iter()
+                    .any(|existing| existing.text == message.text)
+                {
+                    frame.messages.push(message);
+                }
+            }
+            for text in std::mem::take(&mut frame.message_queue) {
+                if text.starts_with("(system/HumanMessage ") {
+                    continue;
+                }
+                if !frame.messages.iter().any(|message| message.text == text) {
+                    frame.messages.push(PendingMessage { id: None, text });
+                }
             }
         }
-
     }
 
     /// Check and fire scheduled wake timers.
     pub fn check_wake_timers(&mut self) -> usize {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = chrono::Utc::now();
         let mut fired = Vec::new();
         self.wake_timers.retain(|entry| {
-            if entry.wake_at.as_str() <= now.as_str() {
-                fired.push(entry.action.clone());
+            if entry.wake_at <= now {
+                fired.push(entry.clone());
                 false
             } else {
                 true
             }
         });
-        for action in &fired {
-            if let Some(frame) = self.frames.last_mut() {
-                frame.message_queue.push(action.clone());
-                if frame.status == FrameStatus::Waiting {
-                    frame.status = FrameStatus::Running;
-                }
+        for entry in &fired {
+            if let Some(frame) = self
+                .frames
+                .iter_mut()
+                .find(|frame| frame.id == entry.frame_id)
+            {
+                frame.messages.push(PendingMessage {
+                    id: None,
+                    text: entry.action.clone(),
+                });
+                frame.status = FrameStatus::Running;
             }
         }
         fired.len()
     }
 
-    
-
-    /// Perform a snapshot.
-    /// Check if an hourly full snapshot is due, and take one if so.
-    pub fn check_hourly_snapshot(&mut self) {
-        if let Some(ref last) = self.storage.last_full_snapshot {
-            if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last) {
-                let last_utc = last_time.with_timezone(&chrono::Utc);
-                let elapsed = (chrono::Utc::now() - last_utc).num_hours();
-                if elapsed >= self.storage.full_snapshot_interval_hours as i64 {
-                    self.snapshot(SnapshotKind::Full);
-                    self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
-                }
-            }
-        } else {
-            self.snapshot(SnapshotKind::Full);
-            self.storage.last_full_snapshot = Some(chrono::Utc::now().to_rfc3339());
-        }
-
-        // Prune snapshots older than 7 days
-        if let Ok(entries) = std::fs::read_dir(&self.storage.snapshot_dir) {
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
-            for entry in entries.filter_map(|e| e.ok()) {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.created() {
-                        let modified_utc: chrono::DateTime<chrono::Utc> = modified.into();
-                        if modified_utc < cutoff {
-                            let path = entry.path();
-                            if path.extension().map_or(false, |ext| ext == "json" || ext == "meta") {
-                                let _ = std::fs::remove_file(&path);
-                            }
-                        }
+    fn collect_lexical_heap(&mut self) {
+        fn visit(value: &Value, ids: &mut HashSet<u64>) {
+            match value {
+                Value::Function(Function::Interpreted { env_id, body, .. }) => {
+                    ids.insert(*env_id);
+                    for value in body {
+                        visit(value, ids);
                     }
                 }
+                Value::List(values) | Value::Vector(values) => {
+                    for value in values {
+                        visit(value, ids);
+                    }
+                }
+                Value::Map(values) => {
+                    for (key, value) in values {
+                        visit(key, ids);
+                        visit(value, ids);
+                    }
+                }
+                Value::Macro(crate::vm::value::Macro::SyntaxRules { rules, .. }) => {
+                    for (pattern, template) in rules {
+                        for value in pattern {
+                            visit(value, ids);
+                        }
+                        visit(template, ids);
+                    }
+                }
+                Value::Tagged { fields, .. } => {
+                    for value in fields {
+                        visit(value, ids);
+                    }
+                }
+                _ => {}
             }
         }
+
+        let mut reachable = HashSet::new();
+        for namespace in self.env.namespaces.values() {
+            for value in namespace.bindings.values() {
+                visit(value, &mut reachable);
+            }
+            for history in namespace.history.values() {
+                for record in history {
+                    visit(&record.value, &mut reachable);
+                }
+            }
+        }
+        for frame in &self.env.frames {
+            for value in frame.values() {
+                visit(value, &mut reachable);
+            }
+        }
+        for frame in &self.frames {
+            if let Some(PendingTrap {
+                operation: VmTrap::ReturnAgent { value },
+                ..
+            }) = &frame.state.pending_trap
+            {
+                visit(value, &mut reachable);
+            }
+        }
+        let mut pending: Vec<_> = reachable.iter().copied().collect();
+        let mut scanned = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !scanned.insert(id) {
+                continue;
+            }
+            if let Some(frames) = self.lexical_heap.get(&id) {
+                for frame in frames {
+                    for value in frame.values() {
+                        visit(value, &mut reachable);
+                    }
+                }
+                pending.extend(reachable.difference(&scanned).copied());
+            }
+        }
+        self.lexical_heap.retain(|id, _| reachable.contains(id));
     }
 
-    pub fn snapshot(&mut self, kind: SnapshotKind) -> Snapshot {
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        let id = format!("snap-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"));
+    pub fn snapshot(&mut self) -> Result<SnapshotInfo, String> {
+        let now = chrono::Utc::now();
+        let timestamp = now.to_rfc3339();
+        let id = format!("snap-{}", now.format("%Y%m%d-%H%M%S-%6f"));
 
-        // Record snapshot event before serializing
-
-        let state = serde_json::json!({
-            "kernel": self,
-            "env": &self.env,
-        });
-        let kernel_bytes = serde_json::to_vec(&state).unwrap_or_default();
-        let checksum = {
-            use sha2::{Sha256, Digest};
-            let mut hasher = Sha256::new();
-            hasher.update(&kernel_bytes);
-            hex::encode(hasher.finalize())
-        };
-
-        let snapshot = Snapshot {
+        let mut saved = self.clone();
+        saved.collect_lexical_heap();
+        saved.storage.snapshot_count += 1;
+        let kernel = serde_json::to_value(&saved)
+            .map_err(|error| format!("snapshot serialization: {}", error))?;
+        let payload =
+            serde_json::to_vec(&kernel).map_err(|error| format!("snapshot payload: {}", error))?;
+        let checksum = sha256(&payload);
+        let envelope = SnapshotEnvelope {
+            format_version: 3,
             id: id.clone(),
             timestamp: timestamp.clone(),
-            kernel: self.clone(),
-            env: self.env.clone(),
+            kernel,
             checksum: checksum.clone(),
-            kind: kind.clone(),
         };
-
-        self.storage.snapshot_count += 1;
-
-        let filename = format!("{}/{}-{}.json", self.storage.snapshot_dir, kind_name(&kind), id);
-        let _ = std::fs::create_dir_all(&self.storage.snapshot_dir);
-        let _ = std::fs::write(&filename, &kernel_bytes);
-
-        let meta = serde_json::json!({
-            "id": id,
-            "timestamp": timestamp,
-            "kind": kind_name(&kind),
-            "checksum": checksum,
-            "size_bytes": kernel_bytes.len(),
-        });
-        let _ = std::fs::write(
-            format!("{}/{}-{}.meta", self.storage.snapshot_dir, kind_name(&kind), id),
-            serde_json::to_string_pretty(&meta).unwrap_or_default(),
-        );
-
-        snapshot
+        let bytes = serde_json::to_vec(&envelope)
+            .map_err(|error| format!("snapshot envelope: {}", error))?;
+        let directory = std::path::PathBuf::from(&self.storage.snapshot_dir);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("create snapshot directory: {}", error))?;
+        atomic_write(&directory.join(format!("snapshot-{}.json", id)), &bytes)?;
+        prune_snapshots(&directory, 48)?;
+        sync_directory(&directory)?;
+        self.storage = saved.storage;
+        self.lexical_heap = saved.lexical_heap;
+        Ok(SnapshotInfo {
+            id,
+            timestamp,
+            checksum,
+        })
     }
 
     pub fn recover_from_latest() -> Result<Self, String> {
+        Self::recover_from_dir("snapshots")
+    }
 
-        let snapshot_dir = "snapshots";
-        let _ = std::fs::create_dir_all(snapshot_dir);
-
-        // Try to find the latest full snapshot first
-        let mut full_files: Vec<_> = std::fs::read_dir(snapshot_dir)
-            .map_err(|e| format!("cannot read snapshot dir: {}", e))?
-            .filter_map(|entry| entry.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
-            .filter(|e| {
-                e.path().file_name()
-                    .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with("full-"))
+    pub fn recover_from_dir(directory: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let directory = directory.as_ref();
+        std::fs::create_dir_all(directory)
+            .map_err(|e| format!("create snapshot directory: {}", e))?;
+        let mut files: Vec<_> = std::fs::read_dir(directory)
+            .map_err(|e| format!("read snapshot directory: {}", e))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                path.extension().is_some_and(|ext| ext == "json")
+                    && ["full-", "inc-", "snapshot-"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
             })
             .collect();
-
-        full_files.sort_by_key(|e| {
-            e.path().file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        });
-
-        // Fall back to incremental snapshots if no full snapshot exists
-        let latest_path = if let Some(full) = full_files.last() {
-            full.path().clone()
-        } else {
-            let mut inc_files: Vec<_> = std::fs::read_dir(snapshot_dir)
-                .map_err(|e| format!("cannot read snapshot dir: {}", e))?
-                .filter_map(|entry| entry.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
-                .filter(|e| {
-                    e.path().file_name()
-                        .and_then(|n| n.to_str())
-                        .map_or(false, |n| n.starts_with("inc-"))
-                })
-                .collect();
-
-            inc_files.sort_by_key(|e| {
-                e.path().file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default()
-            });
-
-            inc_files.last()
-                .ok_or_else(|| "no snapshots found".to_string())?
-                .path()
-                .clone()
-        };
-
-        let bytes = std::fs::read(&latest_path)
-            .map_err(|e| format!("cannot read snapshot: {}", e))?;
-
-        let Snapshot { kernel: kernel_raw, .. } = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("cannot deserialize snapshot: {}", e))?;
-
-        let mut kernel = kernel_raw;
-
-        // Re-register native function pointers (they can't survive serialization)
-        kernel.register_tools();
-
-        // Queue (system/Restarted) event for every active frame
-        let downtime = chrono::Utc::now().to_rfc3339();
-        for frame in &mut kernel.frames {
-            let restarted = Value::Tagged {
-                family: "system".into(),
-                variant: "Restarted".into(),
-                fields: vec![
-                    Value::keyword("unclean"),
-                    Value::string(&downtime),
-                ],
-            };
-            frame.message_queue.push(format!("(system/Restarted :kind :unclean :downtime {:?})", downtime));
-            frame.pending_message = Some(format!("{}", restarted));
+        files.sort_by_key(|path| std::cmp::Reverse(snapshot_sort_key(path)));
+        if files.is_empty() {
+            return Err("no snapshots found".into());
         }
 
-        println!("[kernel] recovered from {} (natives re-registered, {} frames notified)", 
-            latest_path.display(), kernel.frames.len());
-        Ok(kernel)
+        let mut failures = Vec::new();
+        for path in files {
+            match recover_snapshot_file(&path) {
+                Ok(mut kernel) => {
+                    kernel.register_tools();
+                    kernel.current_source = None;
+                    kernel.migrate_legacy_messages();
+                    let notice = format!("Restarted from {}", path.display());
+                    for frame in &mut kernel.frames {
+                        frame.messages.push(PendingMessage {
+                            id: None,
+                            text: notice.clone(),
+                        });
+                        if frame.status == FrameStatus::Waiting
+                            && frame.state.pending_trap.is_none()
+                        {
+                            frame.status = FrameStatus::Running;
+                        }
+                    }
+                    return Ok(kernel);
+                }
+                Err(error) => failures.push(format!("{}: {}", path.display(), error)),
+            }
+        }
+        Err(format!("all snapshots invalid: {}", failures.join("; ")))
     }
 
     // ---- Registration ----
 
-    
-
-    fn define_native(&mut self, qualified_name: &str, arity: u32, func: fn(&mut Kernel, Vec<Value>) -> Result<Value, String>) {
+    fn define_native(
+        &mut self,
+        qualified_name: &str,
+        arity: u32,
+        func: fn(&mut Kernel, Vec<Value>) -> Result<Value, String>,
+    ) {
         let val = Value::Function(Function::Native {
             name: qualified_name.to_string(),
             arity,
@@ -519,19 +630,180 @@ impl Kernel {
         results
     }
 
-    /// Get the current frame's pending human message, if any.
-    pub fn take_pending_message(&mut self) -> Option<String> {
-        self.frames.last_mut().and_then(|f| f.pending_message.take())
+    pub fn set_trap(&mut self, operation: VmTrap) -> Result<(), String> {
+        let source = self.current_source.clone().unwrap_or_default();
+        let frame = self
+            .frames
+            .last_mut()
+            .ok_or_else(|| "no active frame".to_string())?;
+        if frame.state.pending_trap.is_some() {
+            return Err("frame already has a pending trap".into());
+        }
+        frame.state.pending_trap = Some(PendingTrap { source, operation });
+        Ok(())
     }
 
-    /// Take a pending subagent result.
-    pub fn take_subagent_result(&mut self) -> Option<Value> {
-        self.frames.last_mut().and_then(|f| f.state.pending_subagent_result.take())
+    pub fn append_transcript(&mut self, source: &str, result: &str) {
+        if let Some(id) = self.frames.last().map(|f| f.id.clone()) {
+            self.append_transcript_to(&id, source, result);
+        }
+    }
+
+    pub fn append_transcript_to(&mut self, frame_id: &str, source: &str, result: &str) {
+        if let Some(frame) = self.frames.iter_mut().find(|f| f.id == frame_id) {
+            frame.state.transcript.push(TranscriptEntry {
+                source: source.to_string(),
+                result: result.to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    }
+
+    pub fn store_source(&mut self, name: &str, source: &str) {
+        let qualified = qualify_user_name(name);
+        let _ = self.env.store_source(&qualified, source.to_string());
+    }
+
+    pub fn has_trap(&self) -> bool {
+        self.pending_trap().is_some()
+    }
+
+    pub fn pending_trap(&self) -> Option<PendingTrap> {
+        self.frames.last()?.state.pending_trap.clone()
+    }
+
+    pub fn clear_trap(&mut self) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.state.pending_trap = None;
+        }
+    }
+
+    pub fn take_trap(&mut self) -> Option<PendingTrap> {
+        self.frames.last_mut()?.state.pending_trap.take()
     }
 }
-fn kind_name(kind: &SnapshotKind) -> &str {
-    match kind {
-        SnapshotKind::Full => "full",
-        SnapshotKind::Incremental => "inc",
+fn qualify_user_name(name: &str) -> String {
+    if name.contains('/') {
+        name.into()
+    } else {
+        format!("user/{}", name)
     }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("file")
+    ));
+    let mut file = std::fs::File::create(&temporary)
+        .map_err(|e| format!("create {}: {}", temporary.display(), e))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {}: {}", temporary.display(), e))?;
+    file.sync_all()
+        .map_err(|e| format!("sync {}: {}", temporary.display(), e))?;
+    std::fs::rename(&temporary, path).map_err(|e| {
+        format!(
+            "rename {} to {}: {}",
+            temporary.display(),
+            path.display(),
+            e
+        )
+    })?;
+    Ok(())
+}
+
+fn sync_directory(path: &std::path::Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("sync snapshot directory {}: {}", path.display(), e))
+}
+
+fn prune_snapshots(directory: &std::path::Path, keep: usize) -> Result<(), String> {
+    let mut files: Vec<_> = std::fs::read_dir(directory)
+        .map_err(|error| format!("read snapshot directory: {}", error))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && ["full-", "inc-", "snapshot-"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    files.sort_by_key(|path| std::cmp::Reverse(snapshot_sort_key(path)));
+    for path in files.into_iter().skip(keep) {
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("remove {}: {}", path.display(), error))?;
+        let _ = std::fs::remove_file(path.with_extension("meta"));
+    }
+    Ok(())
+}
+
+fn snapshot_sort_key(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .trim_start_matches("full-")
+        .trim_start_matches("inc-")
+        .trim_start_matches("snapshot-")
+        .trim_end_matches(".json")
+        .to_string()
+}
+
+fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read: {}", e))?;
+    if let Ok(envelope) = serde_json::from_slice::<SnapshotEnvelope>(&bytes) {
+        if !matches!(envelope.format_version, 2 | 3) {
+            return Err(format!(
+                "unsupported snapshot format {}",
+                envelope.format_version
+            ));
+        }
+        let payload = serde_json::to_vec(&envelope.kernel)
+            .map_err(|e| format!("serialize payload for checksum: {}", e))?;
+        let actual = sha256(&payload);
+        if actual != envelope.checksum {
+            return Err(format!(
+                "checksum mismatch: expected {}, got {}",
+                envelope.checksum, actual
+            ));
+        }
+        return serde_json::from_value(envelope.kernel)
+            .map_err(|e| format!("deserialize kernel: {}", e));
+    }
+
+    // Legacy format used {kernel, env} with checksum in the sidecar metadata.
+    let legacy: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse JSON: {}", e))?;
+    let kernel_value = legacy
+        .get("kernel")
+        .cloned()
+        .ok_or_else(|| "missing kernel field".to_string())?;
+    let meta_path = path.with_extension("meta");
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&meta_path).map_err(|e| format!("legacy metadata required: {}", e))?,
+    )
+    .map_err(|e| format!("parse legacy metadata: {}", e))?;
+    let expected = meta
+        .get("checksum")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "legacy metadata missing checksum".to_string())?;
+    let actual = sha256(&bytes);
+    if expected != actual {
+        return Err("legacy checksum mismatch".into());
+    }
+    serde_json::from_value(kernel_value).map_err(|e| format!("deserialize legacy kernel: {}", e))
 }
