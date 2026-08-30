@@ -5,14 +5,14 @@ A **continuously existing agent** whose computer is a persistent Lisp world.
 ```
 Model/AI
   ↕
-Lisp VM (continuum)
+Lisp environment (continuum)
   ↕
-Rust kernel (3,145 lines)
+bash — the universal tool interface
   ↕
-Tools, APIs, processes, storage
+Files, processes, network, everything else
 ```
 
-The kernel is small. Lisp owns everything else. The kernel provides only what the VM cannot exist without — arithmetic, list operations, I/O, persistence, inspection, and a single `bash` function for executing shell commands. File I/O, web requests, string manipulation, model inference, and all higher-level tools are Lisp that the agent defines for itself.
+The kernel is the Lisp VM. It provides 41 native functions — arithmetic, list operations, type predicates, I/O, persistence, inspection, and `bash`. Everything else — file I/O, web requests, git, model inference, package management — goes through `bash`. The agent defines its own tools in Lisp.
 
 ## Language
 
