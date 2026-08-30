@@ -214,35 +214,48 @@ impl Kernel {
                 Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
         });
                 
+        
         self.define_native("model/chat", 1, |_kernel, args| {
             let prompt = match &args[0] {
                 Value::String(s) => s.clone(),
                 other => return Err(format!("model/chat: expected string prompt, got {}", other)),
             };
 
-            let client = reqwest::blocking::Client::new();
-            let resp = client.post("https://api.pinference.ai/api/v1/chat/completions").timeout(std::time::Duration::from_secs(30))
-                .header("Authorization", &format!("Bearer {}", std::env::var("PRIME_API_KEY").unwrap_or_default()))
+            let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| format!("model/chat: client build failed: {}", e))?;
+
+            let resp = client.post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", &format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&serde_json::json!({
-                    "model": "openai/gpt-4.1-mini",
+                    "model": "deepseek/deepseek-v4-flash",
                     "messages": [
                         {"role": "user", "content": prompt}
                     ],
+                    "max_tokens": 200,
                 }))
                 .send()
                 .map_err(|e| format!("model/chat: request failed: {}", e))?;
 
+            let status = resp.status();
             let body: serde_json::Value = resp.json()
                 .map_err(|e| format!("model/chat: parse failed: {}", e))?;
 
+            if !status.is_success() {
+                return Err(format!("model/chat: HTTP {}: {:?}", status, body["error"].get("message").unwrap_or(&serde_json::Value::String("unknown".into()))));
+            }
+
             let content = body["choices"][0]["message"]["content"]
                 .as_str()
-                .unwrap_or(&format!("model error (insufficient balance?): {}", body["error"]["message"].as_str().unwrap_or("unknown")))
+                .unwrap_or("no response")
                 .to_string();
 
             Ok(Value::string(&content))
         });
+
 
         self.define_native("inspect/namespaces", 0, |_kernel, _args| {
                 let names: Vec<Value> = _kernel.env.namespace_names().iter().map(|n| {

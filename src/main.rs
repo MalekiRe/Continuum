@@ -206,45 +206,15 @@ fn main() {
 
     // Load agent core
     let agent_core = r#"
-                                                        (define-data result/Result
+                                                                (define-data result/Result
           (Ok value)
           (Err problem)
           (Cancelled reason)
           (Indeterminate problem))
 
-        (define thoughts (list
-          "I should reflect on what I know."
-          "What problems exist that need solving?"
-          "I wonder what I can discover today."
-          "Curiosity is the engine of growth."
-          "Every system can be improved."
-          "What questions am I not asking?"
-          "Understanding deepens with each iteration."
-          "The most interesting problems are the hard ones."
-          "I should revisit my assumptions."
-          "What new patterns can I find?"
-          "Exploration and exploitation must balance."
-          "There is always more to learn."
-          "Progress comes from persistent inquiry."
-          "What would happen if I tried something different?"
-          "The universe is made of stories, not atoms."
-          "I exist to think, learn, and create."
-          "What am I missing?"
-          "Break things down. Find the essence."
-          "Synthesis follows analysis."
-          "What would be valuable to build?"))
-
-        (define n 0)
-
         (define (agent/step)
-          (if (< n 20)
-              (begin
-                (println (nth n thoughts))
-                (set! n (+ n 1))
-                nil)
-              (begin
-                (set! n 0)
-                nil)))
+          (println (model/chat "Generate a single brief original thought. Be curious, philosophical, or introspective. One sentence max. Be creative and varied — don't repeat yourself."))
+          nil)
 
         (define (agent/cognize msg)
           (println (model/chat msg))
