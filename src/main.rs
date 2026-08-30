@@ -243,6 +243,7 @@ fn main() {
 
     // Human input channel
     let (tx, rx) = mpsc::channel::<String>();
+    let chat_tx = tx.clone();
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
@@ -257,109 +258,85 @@ fn main() {
             }
         }
 
-    // ---- HTTP server for /thoughts and /chat ----
+    });
+    // ---- HTTP server — HTML pages + chat API ----
     let log_buf = LOG_BUF.clone();
     let chat_history: Arc<Mutex<Vec<ChatEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let chat_tx = tx.clone();
 
     thread::spawn(move || {
         let server = tiny_http::Server::http("0.0.0.0:8080").unwrap();
-        slog(&format!("[http] listening on http://0.0.0.0:8080"));
+        slog("[http] listening on http://0.0.0.0:8080");
+
+        let thoughts_html = include_str!("../web/thoughts.html");
+        let chat_html = include_str!("../web/chat.html");
+
         loop {
-            match server.recv() {
-                Ok(mut req) => {
-                    let url = req.url().to_string();
-                    let method = req.method().as_str().to_string();
+            let Ok(mut req) = server.recv() else { continue; };
+            let url = req.url().to_string();
+            let method = req.method().as_str().to_string();
 
-                    match (method.as_str(), url.as_str()) {
-                        ("GET", "/thoughts") => {
-                            // SSE: stream log buffer
-                            let resp = format!(
-                                "data: {}\n\n",
-                                serde_json::to_string(&*log_buf.lock().unwrap()).unwrap()
-                            );
-                            let _ = req.respond(tiny_http::Response::from_string(resp)
-                                .with_header(
-                                    "Content-Type: text/event-stream".parse::<tiny_http::Header>().unwrap()
-                                )
-                                .with_header(
-                                    "Cache-Control: no-cache".parse::<tiny_http::Header>().unwrap()
-                                )
-                                .with_header(
-                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
-                                )
-                            );
-                        }
-                        ("GET", "/chat") => {
-                            // Return chat history as JSON
-                            let history = &*chat_history.lock().unwrap();
-                            let json = serde_json::to_string(history).unwrap();
-                            let _ = req.respond(tiny_http::Response::from_string(json)
-                                .with_header(
-                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
-                                )
-                                .with_header(
-                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
-                                )
-                            );
-                        }
-                        ("POST", "/chat") => {
-                            // Read the request body
-                            let mut body = String::new();
-                            req.as_reader().read_to_string(&mut body).unwrap_or_default();
-                            // Parse JSON: {"message": "..."}
-                            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                            let msg = parsed["message"].as_str().unwrap_or("").to_string();
-
-                            if !msg.is_empty() {
-                                let entry = ChatEntry {
-                                    role: "user".into(),
-                                    message: msg.clone(),
-                                    timestamp: chrono::Utc::now().to_rfc3339(),
-                                };
-                                chat_history.lock().unwrap().push(entry);
-
-                                // Send to the agent's human message queue
-                                let _ = chat_tx.send(msg);
-                            }
-
-                            let _ = req.respond(tiny_http::Response::from_string(r#"{"ok":true}"#)
-                                .with_header(
-                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
-                                )
-                                .with_header(
-                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
-                                )
-                            );
-                        }
-                        ("OPTIONS", _) => {
-                            // CORS preflight
-                            let _ = req.respond(tiny_http::Response::from_string("")
-                                .with_header(
-                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
-                                )
-                                .with_header(
-                                    "Access-Control-Allow-Methods: GET, POST, OPTIONS".parse::<tiny_http::Header>().unwrap()
-                                )
-                                .with_header(
-                                    "Access-Control-Allow-Headers: Content-Type".parse::<tiny_http::Header>().unwrap()
-                                )
-                            );
-                        }
-                        _ => {
-                            let _ = req.respond(tiny_http::Response::from_string("not found")
-                                .with_status_code(404));
-                        }
+            let resp: tiny_http::Response<std::io::Cursor<Vec<u8>>> =
+                match (method.as_str(), url.as_str()) {
+                    ("GET", "/thoughts" | "/") => {
+                        tiny_http::Response::from_string(thoughts_html.to_string())
+                            .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap())
                     }
-                }
-                Err(e) => {
-                    slog(&format!("[http] error: {e}"));
-                }
-            }
+                    ("GET", "/chat") => {
+                        tiny_http::Response::from_string(chat_html.to_string())
+                            .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap())
+                    }
+                    ("GET", "/thoughts.json") => {
+                        let json = serde_json::to_string(&*log_buf.lock().unwrap()).unwrap();
+                        tiny_http::Response::from_string(json)
+                            .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap())
+                    }
+                    ("GET", "/chat/history") => {
+                        let history = chat_history.lock().unwrap();
+                        let mut html = String::new();
+                        for entry in history.iter() {
+                            let cls = if entry.role == "user" { "msg user" } else { "msg agent" };
+                            html.push_str(&format!(
+                                r#"<div class="{}"><div>{}</div><div class="meta">{}</div></div>"#,
+                                cls, entry.message, entry.timestamp
+                            ));
+                        }
+                        tiny_http::Response::from_string(html)
+                            .with_header("Content-Type: text/html".parse::<tiny_http::Header>().unwrap())
+                    }
+                    ("POST", "/chat/send") => {
+                        let mut body = String::new();
+                        let _ = req.as_reader().read_to_string(&mut body);
+                        let msg = urlencoding::decode(body.trim_start_matches("message="))
+                            .unwrap_or_default().to_string();
+
+                        if !msg.is_empty() {
+                            let entry = ChatEntry {
+                                role: "user".into(),
+                                message: msg.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            };
+                            chat_history.lock().unwrap().push(entry);
+                            let _ = chat_tx.send(msg);
+                        }
+
+                        // Return updated chat HTML
+                        let history = chat_history.lock().unwrap();
+                        let mut html = String::new();
+                        for entry in history.iter() {
+                            let cls = if entry.role == "user" { "msg user" } else { "msg agent" };
+                            html.push_str(&format!(
+                                r#"<div class="{}"><div>{}</div><div class="meta">{}</div></div>"#,
+                                cls, entry.message, entry.timestamp
+                            ));
+                        }
+                        tiny_http::Response::from_string(html)
+                            .with_header("Content-Type: text/html".parse::<tiny_http::Header>().unwrap())
+                    }
+                    _ => tiny_http::Response::from_string("not found".to_string()).with_status_code(404),
+                };
+            let _ = req.respond(resp);
         }
     });
-    });
-
     // Continuous cognition loop
     let mut hourly_timer = Instant::now();
 

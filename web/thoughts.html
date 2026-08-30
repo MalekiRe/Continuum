@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Continuum — thoughts</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:14px/1.5 monospace;margin:0;padding:20px}
+#log{height:95vh;overflow-y:auto;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;white-space:pre-wrap;word-wrap:break-word}
+#log::-webkit-scrollbar{width:8px}
+#log::-webkit-scrollbar-track{background:#161b22}
+#log::-webkit-scrollbar-thumb{background:#30363d;border-radius:4px}
+</style>
+</head>
+<body><div id="log"></div>
+<script>
+const el=document.getElementById('log');
+async function poll(){try{let r=await fetch('/thoughts.json');let d=await r.json();el.textContent=d.join('\n');el.scrollTop=el.scrollHeight}catch(e){}setTimeout(poll,500)}
+poll()
+</script>
+</body></html>
