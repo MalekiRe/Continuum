@@ -32,7 +32,10 @@ where
         if ptr.is_null() {
             return Err("kernel hook not set".to_string());
         }
-        let kernel = unsafe { &mut *ptr };
+        // SAFETY: ptr comes from &mut Kernel in set_kernel_hook.
+    // Kernel lives on the stack in main() for the entire process lifetime.
+    // Single-threaded: no concurrent access.
+    let kernel = unsafe { &mut *ptr };
         f(kernel)
     })
 }
@@ -175,15 +178,6 @@ impl Kernel {
 
         let result = eval::eval(source, &mut self.env);
 
-        match &result {
-            Ok(val) => {
-
-            }
-            Err(e) => {
-
-            }
-        }
-
         result
     }
 
@@ -214,7 +208,7 @@ impl Kernel {
             Ok(val) => {
                 // If the result was CancelCurrent, record the cancelled SOURCE
                 // so the exact same call can't be re-executed.
-                if let Value::Tagged { family, variant, fields } = &val {
+                if let Value::Tagged { family, variant, fields: _ } = &val {
                     if family == "control" && variant == "CancelCurrent" {
                         if let Some(frame) = self.frames.last_mut() {
                             // Store the original source expression, not the reason.

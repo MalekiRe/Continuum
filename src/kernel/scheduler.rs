@@ -1,4 +1,4 @@
-use crate::kernel::{FrameStatus, Kernel};
+use crate::kernel::Kernel;
 use chrono;
 
 #[derive(Debug, Clone)]
