@@ -1,9 +1,6 @@
 
 pub mod snapshot;
 pub mod native;
-pub mod scheduler;
-pub use scheduler::{Scheduler, ReviewDecision};
-
 use crate::vm::env::EnvRef;
 use crate::vm::eval;
 use crate::vm::value::Value;

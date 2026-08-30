@@ -56,28 +56,6 @@ fn check_hourly_snapshot(kernel: &mut Kernel, timer: &mut Instant) {
     }
 }
 
-/// Check 15-minute supervision: if a top-level call runs too long, review it.
-fn check_supervision(kernel: &mut Kernel, timer: &mut Instant) {
-    if timer.elapsed() >= Duration::from_secs(900) {
-        let decision = kernel::Scheduler::fifteen_minute_review(
-            kernel, chrono::Utc::now(), 15 * 60 * 1000,
-        );
-        match &decision {
-            kernel::ReviewDecision::Cancel(reason) => {
-                println!("[supervisor] cancelling: {}", reason);
-                if let Some(frame) = kernel.frames.last_mut() {
-                    frame.status = FrameStatus::Completed;
-                }
-            }
-            kernel::ReviewDecision::Advice(advice) => {
-                println!("[supervisor] advice: {}", advice);
-            }
-            _ => {}
-        }
-        *timer = Instant::now();
-    }
-}
-
 /// Check if the agent's root frame has completed and needs restarting.
 fn maybe_restart_agent(kernel: &mut Kernel) -> bool {
     if kernel.frames.is_empty()
@@ -198,14 +176,12 @@ fn main() {
 
     // Continuous cognition loop
     let mut hourly_timer = Instant::now();
-    let mut supervision_timer = Instant::now();
 
     loop {
         if handle_human_input(kernel, &rx) {
             break;
         }
         check_hourly_snapshot(kernel, &mut hourly_timer);
-        check_supervision(kernel, &mut supervision_timer);
         kernel.check_wake_timers();
 
 

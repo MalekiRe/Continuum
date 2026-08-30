@@ -29,7 +29,9 @@ A Scheme-like Lisp with:
 
 ## Design
 
-**The kernel can always interrupt Lisp.** A safepoint mechanism checks a global flag every 1,000 expressions. The kernel can interrupt evaluation from another thread — useful for human interrupts, timeouts, and supervision.
+**Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
+
+**Human interaction.** Human messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and the agent returns `control/Continue` or `(control/CancelCurrent ...)`.
 
 **Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
 
@@ -37,11 +39,9 @@ A Scheme-like Lisp with:
 
 **Subagents.** `(agent/call 'name request)` pushes a child frame, evaluates the request, pops the frame, and delivers the result to the parent. Only one evaluation runs at a time.
 
-**Snapshots are atomic.** Every evaluation serializes the full kernel state to JSON. Recovery loads the saved image directly — it never replays execution. Snapshots are checksummed (SHA256) and rotated. After recovery, every active frame receives a `(system/Restarted :kind :unclean :downtime ...)` notice.
+**Snapshots.** Every snapshot serializes the full kernel state to JSON. Recovery loads the saved image directly — it never replays execution. Snapshots are checksummed (SHA256) and rotated. After recovery, every active frame receives a `(system/Restarted :kind :unclean :downtime ...)` notice.
 
-**Human interaction.** Messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and returns `control/Continue` or `(control/CancelCurrent ...)`.
-
-**Supervision.** The scheduler performs a 15-minute review of any top-level call that exceeds its budget. If a frame has been running with excessive queued messages, it can be cancelled.
+**Wake timers.** `(wake ms action)` schedules a Lisp expression to be evaluated as a message after `ms` milliseconds. Timers are checked once per cognition loop iteration.
 
 ## Quick Start
 
@@ -72,7 +72,6 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 2. **`bash` is the universal tool interface.** File I/O, web requests, network calls — all go through shell commands. No built-in HTTP, file APIs, or JSON parsing.
 3. **Definitions persist.** Every `define` creates a new version. `undefine` removes the current binding without erasing history.
 4. **Snapshots are atomic.** You can never save mid-call. Recovery restores the exact pre-call state.
-5. **The kernel can always interrupt Lisp.** A safepoint mechanism checks every 1,000 expressions.
 
 ## Native Functions
 
