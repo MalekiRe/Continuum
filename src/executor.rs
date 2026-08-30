@@ -93,22 +93,11 @@ pub struct ExecutionResult {
 
 // The executor's Rust API uses typed outcome/output fields, while the tool wire
 // format deliberately remains compatible with existing transcripts and clients.
-#[derive(Serialize)]
-struct ExecutionResultWireRef<'a> {
+#[derive(Serialize, Deserialize)]
+struct ExecutionResultWire<T> {
     exit_code: i32,
-    stdout: &'a str,
-    stderr: &'a str,
-    timed_out: bool,
-    cancelled: bool,
-    truncated: bool,
-    elapsed_ms: u128,
-}
-
-#[derive(Deserialize)]
-struct ExecutionResultWire {
-    exit_code: i32,
-    stdout: String,
-    stderr: String,
+    stdout: T,
+    stderr: T,
     timed_out: bool,
     cancelled: bool,
     truncated: bool,
@@ -120,7 +109,7 @@ impl Serialize for ExecutionResult {
     where
         S: Serializer,
     {
-        ExecutionResultWireRef {
+        ExecutionResultWire {
             exit_code: self.exit_code,
             stdout: &self.output.stdout,
             stderr: &self.output.stderr,
@@ -138,7 +127,7 @@ impl<'de> Deserialize<'de> for ExecutionResult {
     where
         D: Deserializer<'de>,
     {
-        let wire = ExecutionResultWire::deserialize(deserializer)?;
+        let wire = ExecutionResultWire::<String>::deserialize(deserializer)?;
         // Old results could represent both flags at once. Cancellation takes
         // precedence when migrating that invalid state into the typed model.
         let outcome = if wire.cancelled {
@@ -299,13 +288,7 @@ impl Executor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         unix::configure_process_session(&mut cmd);
-        let child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(source) => {
-                drop(state);
-                return Err(ExecutorError::Spawn(source));
-            }
-        };
+        let child = cmd.spawn().map_err(ExecutorError::Spawn)?;
         let process_group = child.id() as i32;
         state.active.as_mut().expect("reserved active run").phase =
             ActivePhase::Running { process_group };
@@ -326,26 +309,22 @@ impl Executor {
         let out_reader = thread::spawn(move || read_bounded(stdout, limit, stdout_progress));
         let err_reader = thread::spawn(move || read_bounded(stderr, limit, stderr_progress));
 
-        let mut status: Option<ExitStatus> = None;
-        let outcome = loop {
+        let (outcome, status) = loop {
             if self.active_cancelled() {
-                break ExecutionOutcome::Cancelled;
+                break (ExecutionOutcome::Cancelled, None);
             }
             if started.elapsed() >= timeout {
-                break ExecutionOutcome::TimedOut;
+                break (ExecutionOutcome::TimedOut, None);
             }
-            match run_guard.child_mut().try_wait() {
-                Ok(Some(exit)) => {
-                    status = Some(exit);
-                    break ExecutionOutcome::Exited;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(source) => {
-                    return Err(ExecutorError::Process {
-                        operation: "poll",
-                        source,
-                    });
-                }
+            match run_guard
+                .child_mut()
+                .try_wait()
+                .map_err(|source| ExecutorError::Process {
+                    operation: "poll",
+                    source,
+                })? {
+                Some(exit) => break (ExecutionOutcome::Exited, Some(exit)),
+                None => thread::sleep(Duration::from_millis(10)),
             }
         };
 
@@ -422,8 +401,7 @@ impl<'a> RunGuard<'a> {
     fn retire(&mut self, status: Option<ExitStatus>) -> Result<ExitStatus, ExecutorError> {
         self.begin_draining();
         let (child, process_group) = self.process.as_mut().expect("spawned process guard");
-        let exit = unix::retire_process_group(child, *process_group, status)
-            .map_err(|failure| failure.into_executor_error(*process_group))?;
+        let exit = unix::retire_process_group(child, *process_group, status)?;
         self.process = None;
         Ok(exit)
     }
@@ -435,10 +413,7 @@ impl Drop for RunGuard<'_> {
         if let Some((child, process_group)) = self.process.as_mut()
             && let Err(failure) = unix::retire_process_group(child, *process_group, None)
         {
-            eprintln!(
-                "executor cleanup failed: {}",
-                failure.into_executor_error(*process_group)
-            );
+            eprintln!("executor cleanup failed: {failure}");
         }
         if self.armed {
             self.executor.lock_state().active = None;

@@ -213,7 +213,7 @@ impl CompactedContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FrameState {
     #[serde(default, rename = "current_continuation", skip_serializing)]
     legacy_continuation: Option<LegacyContinuation>,
@@ -391,15 +391,7 @@ impl Kernel {
             notice_cursor: 0,
             pending_message: None,
             message_queue: Vec::new(),
-            state: FrameState {
-                legacy_continuation: None,
-                transcript: Vec::new(),
-                compacted_context: CompactedContext::default(),
-                pending_trap: None,
-                instructions: String::new(),
-                context_hooks: Vec::new(),
-                memory: Vec::new(),
-            },
+            state: FrameState::default(),
         };
         kernel.frames.push(root_frame);
         kernel.next_frame_id += 1;
@@ -542,16 +534,11 @@ impl Kernel {
             pending_message: None,
             message_queue: Vec::new(),
             state: FrameState {
-                legacy_continuation: None,
-                transcript: Vec::new(),
-                compacted_context: CompactedContext::default(),
-                pending_trap: None,
                 instructions: format!(
                     "You are the '{}' subagent. Complete this task and finish with (agent/return value): {}",
                     name, request
                 ),
-                context_hooks: Vec::new(),
-                memory: Vec::new(),
+                ..FrameState::default()
             },
         });
         id
@@ -805,26 +792,22 @@ impl Kernel {
     /// Check and fire scheduled wake timers.
     pub fn check_wake_timers(&mut self) -> usize {
         let now = chrono::Utc::now();
-        let mut fired = Vec::new();
-        self.wake_timers.retain(|entry| {
-            if entry.wake_at <= now {
-                fired.push(entry.clone());
-                false
-            } else {
-                true
-            }
-        });
-        for entry in &fired {
+        let fired: Vec<_> = self
+            .wake_timers
+            .extract_if(.., |entry| entry.wake_at <= now)
+            .collect();
+        let count = fired.len();
+        for entry in fired {
             if let Some(frame) = self
                 .frames
                 .iter_mut()
                 .find(|frame| frame.id == entry.frame_id)
             {
                 frame.status = FrameStatus::Running;
-                self.push_notice(None, entry.action.clone(), vec![entry.frame_id.clone()]);
+                self.push_notice(None, entry.action, vec![entry.frame_id]);
             }
         }
-        fired.len()
+        count
     }
 
     fn collect_lexical_arena(&mut self) {
@@ -973,19 +956,7 @@ impl Kernel {
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)
             .map_err(|error| SnapshotError::io("create snapshot directory", error))?;
-        let mut files: Vec<_> = std::fs::read_dir(directory)
-            .map_err(|error| SnapshotError::io("read snapshot directory", error))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                path.extension().is_some_and(|ext| ext == "json")
-                    && ["full-", "inc-", "snapshot-"]
-                        .iter()
-                        .any(|prefix| name.starts_with(prefix))
-            })
-            .collect();
-        files.sort_by_key(|path| std::cmp::Reverse(snapshot_sort_key(path)));
+        let files = snapshot_files(directory)?;
         if files.is_empty() {
             return Err("no snapshots found".into());
         }
@@ -1022,25 +993,8 @@ impl Kernel {
     pub(crate) fn define_native(
         &mut self,
         qualified_name: &str,
-        arity: u32,
-        func: fn(&mut Kernel, Vec<Value>) -> Result<Value, crate::vm::value::NativeError>,
-    ) {
-        self.define_native_with_arity(qualified_name, crate::vm::value::Arity::Exact(arity), func);
-    }
-
-    pub(crate) fn define_variadic_native(
-        &mut self,
-        qualified_name: &str,
-        func: fn(&mut Kernel, Vec<Value>) -> Result<Value, crate::vm::value::NativeError>,
-    ) {
-        self.define_native_with_arity(qualified_name, crate::vm::value::Arity::Variadic, func);
-    }
-
-    fn define_native_with_arity(
-        &mut self,
-        qualified_name: &str,
         arity: crate::vm::value::Arity,
-        func: fn(&mut Kernel, Vec<Value>) -> Result<Value, crate::vm::value::NativeError>,
+        func: crate::vm::value::NativeFn,
     ) {
         let val = Value::Function(Function::Native {
             name: qualified_name.to_string(),
@@ -1162,13 +1116,12 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), SnapshotErro
 fn sync_directory(path: &std::path::Path) -> Result<(), SnapshotError> {
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
-        .map_err(|source| SnapshotError::Io {
-            context: format!("sync snapshot directory {}", path.display()),
-            source,
+        .map_err(|error| {
+            SnapshotError::io(format!("sync snapshot directory {}", path.display()), error)
         })
 }
 
-fn prune_snapshots(directory: &std::path::Path, keep: usize) -> Result<(), SnapshotError> {
+fn snapshot_files(directory: &std::path::Path) -> Result<Vec<std::path::PathBuf>, SnapshotError> {
     let mut files: Vec<_> = std::fs::read_dir(directory)
         .map_err(|error| SnapshotError::io("read snapshot directory", error))?
         .filter_map(Result::ok)
@@ -1186,7 +1139,11 @@ fn prune_snapshots(directory: &std::path::Path, keep: usize) -> Result<(), Snaps
         })
         .collect();
     files.sort_by_key(|path| std::cmp::Reverse(snapshot_sort_key(path)));
-    for path in files.into_iter().skip(keep) {
+    Ok(files)
+}
+
+fn prune_snapshots(directory: &std::path::Path, keep: usize) -> Result<(), SnapshotError> {
+    for path in snapshot_files(directory)?.into_iter().skip(keep) {
         std::fs::remove_file(&path)
             .map_err(|error| SnapshotError::io(format!("remove {}", path.display()), error))?;
         let _ = std::fs::remove_file(path.with_extension("meta"));
@@ -1224,10 +1181,8 @@ fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, SnapshotError
                 envelope.checksum, actual
             )));
         }
-        return serde_json::from_value(envelope.kernel).map_err(|source| SnapshotError::Json {
-            context: "deserialize kernel",
-            source,
-        });
+        return serde_json::from_value(envelope.kernel)
+            .map_err(|error| SnapshotError::json("deserialize kernel", error));
     }
 
     // Legacy format used {kernel, env} with checksum in the sidecar metadata.
@@ -1251,8 +1206,6 @@ fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, SnapshotError
     if expected != actual {
         return Err("legacy checksum mismatch".into());
     }
-    serde_json::from_value(kernel_value).map_err(|source| SnapshotError::Json {
-        context: "deserialize legacy kernel",
-        source,
-    })
+    serde_json::from_value(kernel_value)
+        .map_err(|error| SnapshotError::json("deserialize legacy kernel", error))
 }

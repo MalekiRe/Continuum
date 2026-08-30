@@ -378,22 +378,33 @@ impl Value {
         Value::List(items)
     }
 
-    pub fn require_int(&self, function: &str, position: usize) -> Result<i64, NativeError> {
-        self.as_int().ok_or_else(|| {
+    pub(crate) fn coerce_text(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    fn required<T>(
+        value: Option<T>,
+        function: &str,
+        position: usize,
+        expected: &str,
+    ) -> Result<T, NativeError> {
+        value.ok_or_else(|| {
             NativeError::InvalidArgument(format!(
-                "{}: argument {} must be an integer",
-                function, position
+                "{}: argument {} must be {}",
+                function, position, expected
             ))
         })
     }
 
+    pub fn require_int(&self, function: &str, position: usize) -> Result<i64, NativeError> {
+        Self::required(self.as_int(), function, position, "an integer")
+    }
+
     pub fn require_number(&self, function: &str, position: usize) -> Result<f64, NativeError> {
-        self.as_number().ok_or_else(|| {
-            NativeError::InvalidArgument(format!(
-                "{}: argument {} must be a number",
-                function, position
-            ))
-        })
+        Self::required(self.as_number(), function, position, "a number")
     }
 
     pub fn require_string<'a>(
@@ -401,12 +412,7 @@ impl Value {
         function: &str,
         position: usize,
     ) -> Result<&'a str, NativeError> {
-        self.as_str().ok_or_else(|| {
-            NativeError::InvalidArgument(format!(
-                "{}: argument {} must be a string",
-                function, position
-            ))
-        })
+        Self::required(self.as_str(), function, position, "a string")
     }
 
     pub fn require_nonnegative_usize(

@@ -88,28 +88,38 @@ fn deliver_human(kernel: &mut Kernel, text: String) {
     }
 }
 
-fn start_input_thread(
+#[derive(Clone)]
+struct HumanIntervention {
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     executor: Executor,
-    model_interrupt: ModelInterruptHandle,
-    eval_interrupt: EvalInterruptHandle,
-    intervention_gate: Arc<Mutex<()>>,
-) {
+    model: ModelInterruptHandle,
+    eval: EvalInterruptHandle,
+    gate: Arc<Mutex<()>>,
+}
+
+impl HumanIntervention {
+    fn submit(&self, message: String) -> bool {
+        let _intervention = self.gate.lock().unwrap();
+        self.eval.request_interrupt();
+        self.model.request_interrupt();
+        if let Err(error) = self.executor.cancel() {
+            slog(format!("[executor] cancellation failed: {error}"));
+        }
+        self.tx.send(message).is_ok()
+    }
+
+    fn acknowledge(&self) {
+        let _intervention = self.gate.lock().unwrap();
+        self.model.clear_pending();
+        self.eval.clear_pending();
+    }
+}
+
+fn start_input_thread(intervention: HumanIntervention) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
             let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            // Publish cancellation and the corresponding message atomically with
-            // respect to main's acknowledgement of sticky pre-activation signals.
-            let _intervention = intervention_gate.lock().unwrap();
-            eval_interrupt.request_interrupt();
-            model_interrupt.request_interrupt();
-            if let Err(error) = executor.cancel() {
-                slog(format!("[executor] cancellation failed: {error}"));
-            }
-            if tx.send(line).is_err() {
+            if !line.is_empty() && !intervention.submit(line) {
                 break;
             }
         }
@@ -146,13 +156,11 @@ fn chat_html() -> String {
         .collect()
 }
 
-fn start_http(
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
-    executor: Executor,
-    model_interrupt: ModelInterruptHandle,
-    eval_interrupt: EvalInterruptHandle,
-    intervention_gate: Arc<Mutex<()>>,
-) {
+fn content_type(value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes("Content-Type", value).unwrap()
+}
+
+fn start_http(intervention: HumanIntervention) {
     let logs = LOG_BUF.clone();
     thread::spawn(move || {
         let server = tiny_http::Server::http("0.0.0.0:8080").expect("HTTP listen failed");
@@ -164,30 +172,15 @@ fn start_http(
             let url = request.url();
             let response = match (method, url) {
                 ("GET", "/" | "/thoughts") => tiny_http::Response::from_string(thoughts)
-                    .with_header(
-                        "Content-Type: text/html; charset=utf-8"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
-                ("GET", "/chat") => tiny_http::Response::from_string(chat).with_header(
-                    "Content-Type: text/html; charset=utf-8"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                ),
+                    .with_header(content_type("text/html; charset=utf-8")),
+                ("GET", "/chat") => tiny_http::Response::from_string(chat)
+                    .with_header(content_type("text/html; charset=utf-8")),
                 ("GET", "/thoughts.json") => tiny_http::Response::from_string(
                     serde_json::to_string(&*logs.lock().unwrap()).unwrap(),
                 )
-                .with_header(
-                    "Content-Type: application/json"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                ),
+                .with_header(content_type("application/json")),
                 ("GET", "/chat/history") => tiny_http::Response::from_string(chat_html())
-                    .with_header(
-                        "Content-Type: text/html"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
+                    .with_header(content_type("text/html")),
                 ("POST", "/chat/send") => {
                     let mut body = String::new();
                     let _ = request
@@ -198,19 +191,10 @@ fn start_http(
                         .find_map(|(name, value)| (name == "message").then(|| value.into_owned()))
                         .unwrap_or_default();
                     if !message.is_empty() {
-                        let _intervention = intervention_gate.lock().unwrap();
-                        eval_interrupt.request_interrupt();
-                        model_interrupt.request_interrupt();
-                        if let Err(error) = executor.cancel() {
-                            slog(format!("[executor] cancellation failed: {error}"));
-                        }
-                        let _ = tx.send(message);
+                        intervention.submit(message);
                     }
-                    tiny_http::Response::from_string(chat_html()).with_header(
-                        "Content-Type: text/html"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    )
+                    tiny_http::Response::from_string(chat_html())
+                        .with_header(content_type("text/html"))
                 }
                 _ => tiny_http::Response::from_string("not found").with_status_code(404),
             };
@@ -238,21 +222,15 @@ async fn main() -> Result<()> {
     let scheduler = Scheduler::new(OpenRouterModel::default(), executor.clone());
     let model_interrupt = scheduler.model_interrupt_handle();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let intervention_gate = Arc::new(Mutex::new(()));
-    start_input_thread(
-        tx.clone(),
-        executor.clone(),
-        model_interrupt.clone(),
-        eval_interrupt.clone(),
-        intervention_gate.clone(),
-    );
-    start_http(
+    let intervention = HumanIntervention {
         tx,
         executor,
-        model_interrupt.clone(),
-        eval_interrupt.clone(),
-        intervention_gate.clone(),
-    );
+        model: model_interrupt,
+        eval: eval_interrupt,
+        gate: Arc::new(Mutex::new(())),
+    };
+    start_input_thread(intervention.clone());
+    start_http(intervention.clone());
 
     enum RuntimeEvent {
         Human(Option<String>),
@@ -278,9 +256,7 @@ async fn main() -> Result<()> {
             RuntimeEvent::Human(Some(message)) => {
                 // The selected turn future is now dropped. Clear sticky pre-activation
                 // interrupts before starting a fresh turn that includes this message.
-                let _intervention = intervention_gate.lock().unwrap();
-                model_interrupt.clear_pending();
-                eval_interrupt.clear_pending();
+                intervention.acknowledge();
                 if matches!(message.as_str(), "!!exit" | "!!quit") {
                     if let Err(error) = kernel.snapshot() {
                         eprintln!("[snapshot] {}", error);

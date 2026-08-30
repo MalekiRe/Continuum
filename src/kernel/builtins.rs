@@ -1,20 +1,20 @@
 use crate::kernel::Kernel;
-use crate::kernel::native::{argument, integer_argument};
+use crate::kernel::native::exact_native;
 use crate::vm::value::{NativeError, Value};
 
 impl Kernel {
     pub(crate) fn register_kernel_builtins(&mut self) {
-        self.define_native("system/version", 0, |_kernel, _args| {
+        exact_native!(self, "system/version", |_kernel, []| {
             Ok(Value::string(concat!(
                 "persistent-lisp-harness/",
                 env!("CARGO_PKG_VERSION")
             )))
         });
-        self.define_native("system/clock", 0, |_kernel, _args| {
+        exact_native!(self, "system/clock", |_kernel, []| {
             Ok(Value::string(&chrono::Utc::now().to_rfc3339()))
         });
-        self.define_native("transcript/recent", 1, |kernel, args| {
-            let count = match &args[0] {
+        exact_native!(self, "transcript/recent", |kernel, [count_value]| {
+            let count = match count_value {
                 Value::Int(n) if *n >= 0 => *n as usize,
                 _ => return Err("transcript/recent: expected a non-negative integer".into()),
             };
@@ -35,8 +35,8 @@ impl Kernel {
                     .collect(),
             ))
         });
-        self.define_native("source/get", 1, |kernel, args| {
-            let name = match &args[0] {
+        exact_native!(self, "source/get", |kernel, [name_value]| {
+            let name = match name_value {
                 Value::Symbol(s) | Value::String(s) => s.clone(),
                 other => {
                     return Err(NativeError::Failed(format!(
@@ -56,7 +56,7 @@ impl Kernel {
                 .map(Value::string)
                 .unwrap_or(Value::Nil))
         });
-        self.define_native("source/list", 0, |kernel, _args| {
+        exact_native!(self, "source/list", |kernel, []| {
             let mut names = Vec::new();
             for (ns_name, ns) in kernel.env.namespaces.iter() {
                 for name in ns.sources.keys() {
@@ -66,11 +66,8 @@ impl Kernel {
             names.sort_by_key(|v| format!("{}", v));
             Ok(Value::List(names))
         });
-        self.define_native("context/add-hook", 1, |kernel, args| {
-            let hook = match &args[0] {
-                Value::String(s) => s.clone(),
-                other => format!("{}", other),
-            };
+        exact_native!(self, "context/add-hook", |kernel, [hook_value]| {
+            let hook = hook_value.coerce_text();
             if hook.chars().count() > 2_000 {
                 return Err("context/add-hook: hook exceeds 2000 characters".into());
             }
@@ -84,56 +81,51 @@ impl Kernel {
             frame.state.context_hooks.push(hook);
             Ok(Value::keyword("ok"))
         });
-        self.define_native("context/clear-hooks", 0, |kernel, _args| {
+        exact_native!(self, "context/clear-hooks", |kernel, []| {
             if let Some(frame) = kernel.frames.last_mut() {
                 frame.state.context_hooks.clear();
             }
             Ok(Value::keyword("ok"))
         });
-        self.define_native("memory/remember", 2, |kernel, args| {
-            let key = match &args[0] {
-                Value::String(s) | Value::Symbol(s) => s.clone(),
-                other => format!("{}", other),
-            };
-            let value = match &args[1] {
-                Value::String(s) => s.clone(),
-                other => format!("{}", other),
-            };
-            if key.chars().count() > 200 || value.chars().count() > 2_000 {
-                return Err("memory/remember: key or value exceeds context limits".into());
+        exact_native!(
+            self,
+            "memory/remember",
+            |kernel, [key_value, memory_value]| {
+                let key = key_value.coerce_text();
+                let value = memory_value.coerce_text();
+                if key.chars().count() > 200 || value.chars().count() > 2_000 {
+                    return Err("memory/remember: key or value exceeds context limits".into());
+                }
+                let frame = kernel
+                    .frames
+                    .last_mut()
+                    .ok_or_else(|| "memory/remember: no frame".to_string())?;
+                if frame.state.memory.len() >= 64
+                    && !frame.state.memory.iter().any(|entry| entry.key == key)
+                {
+                    return Err("memory/remember: at most 64 entries are allowed".into());
+                }
+                if let Some(entry) = frame.state.memory.iter_mut().find(|entry| entry.key == key) {
+                    entry.value = value;
+                    entry.updated_at = chrono::Utc::now().to_rfc3339();
+                } else {
+                    frame.state.memory.push(crate::kernel::MemoryEntry {
+                        key,
+                        value,
+                        updated_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                }
+                Ok(Value::keyword("ok"))
             }
-            let frame = kernel
-                .frames
-                .last_mut()
-                .ok_or_else(|| "memory/remember: no frame".to_string())?;
-            if frame.state.memory.len() >= 64
-                && !frame.state.memory.iter().any(|entry| entry.key == key)
-            {
-                return Err("memory/remember: at most 64 entries are allowed".into());
-            }
-            if let Some(entry) = frame.state.memory.iter_mut().find(|entry| entry.key == key) {
-                entry.value = value;
-                entry.updated_at = chrono::Utc::now().to_rfc3339();
-            } else {
-                frame.state.memory.push(crate::kernel::MemoryEntry {
-                    key,
-                    value,
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                });
-            }
-            Ok(Value::keyword("ok"))
-        });
-        self.define_native("memory/forget", 1, |kernel, args| {
-            let key = match &args[0] {
-                Value::String(s) | Value::Symbol(s) => s.clone(),
-                other => format!("{}", other),
-            };
+        );
+        exact_native!(self, "memory/forget", |kernel, [key_value]| {
+            let key = key_value.coerce_text();
             if let Some(frame) = kernel.frames.last_mut() {
                 frame.state.memory.retain(|entry| entry.key != key);
             }
             Ok(Value::keyword("ok"))
         });
-        self.define_native("memory/list", 0, |kernel, _args| {
+        exact_native!(self, "memory/list", |kernel, []| {
             let Some(frame) = kernel.frames.last() else {
                 return Ok(Value::Nil);
             };
@@ -152,13 +144,13 @@ impl Kernel {
                     .collect(),
             ))
         });
-        self.define_native("inspect/namespaces", 0, |_kernel, _args| {
-            let names: Vec<Value> = _kernel
+        exact_native!(self, "inspect/namespaces", |kernel, []| {
+            let names: Vec<Value> = kernel
                 .env
                 .namespace_names()
                 .iter()
                 .map(|n| {
-                    let count = _kernel
+                    let count = kernel
                         .env
                         .namespaces
                         .get(n)
@@ -169,17 +161,17 @@ impl Kernel {
                 .collect();
             Ok(Value::List(names))
         });
-        self.define_native("inspect/bindings", 1, |_kernel, args| {
-            let ns_name = match &args[0] {
+        exact_native!(self, "inspect/bindings", |kernel, [namespace_value]| {
+            let ns_name = match namespace_value {
                 Value::Symbol(s) => s.clone(),
                 _ => return Err("inspect/bindings: expected symbol".into()),
             };
-            let bindings = _kernel.inspect_namespace(&ns_name).unwrap_or_default();
+            let bindings = kernel.inspect_namespace(&ns_name).unwrap_or_default();
             let items: Vec<Value> = bindings.iter().map(|b| Value::symbol(b)).collect();
             Ok(Value::List(items))
         });
-        self.define_native("inspect/history", 1, |_kernel, args| {
-            let Value::Symbol(name) = &args[0] else {
+        exact_native!(self, "inspect/history", |kernel, [name_value]| {
+            let Value::Symbol(name) = name_value else {
                 return Err("inspect/history: expected symbol".into());
             };
             let qualified = if name.contains('/') {
@@ -189,7 +181,7 @@ impl Kernel {
             };
             let (namespace, binding) = qualified.split_once('/').unwrap();
             let ns =
-                _kernel.env.namespaces.get(namespace).ok_or_else(|| {
+                kernel.env.namespaces.get(namespace).ok_or_else(|| {
                     NativeError::InvalidArgument(format!("no history for {}", name))
                 })?;
             let records = ns.history(binding);
@@ -209,12 +201,12 @@ impl Kernel {
                     .collect(),
             ))
         });
-        self.define_native("wake", 2, |kernel, args| {
-            let duration_ms = integer_argument(&args, 0, "wake")?;
+        exact_native!(self, "wake", |kernel, [duration_value, action_value]| {
+            let duration_ms = duration_value.require_int("wake", 1)?;
             if duration_ms < 0 {
                 return Err("wake: duration must be non-negative".into());
             }
-            let action = format!("{}", argument(&args, 1, "wake")?);
+            let action = format!("{}", action_value);
             let wake_at = chrono::Utc::now()
                 .checked_add_signed(chrono::Duration::milliseconds(duration_ms))
                 .ok_or_else(|| "wake: duration is out of range".to_string())?;
@@ -230,9 +222,9 @@ impl Kernel {
             });
             Ok(Value::keyword("scheduled"))
         });
-        self.define_native("inspect/find", 1, |_kernel, args| {
-            let query = match &args[0] {
-                Value::String(s) => s.clone(),
+        exact_native!(self, "inspect/find", |kernel, [query_value]| {
+            let query = match query_value {
+                Value::String(query) => query,
                 other => {
                     return Err(NativeError::Failed(format!(
                         "inspect/find: expected string, got {}",
@@ -240,8 +232,7 @@ impl Kernel {
                     )));
                 }
             };
-
-            let results = _kernel.find_bindings(&query);
+            let results = kernel.find_bindings(query);
             // Return compact summaries: just the qualified names
             let items: Vec<Value> = results.iter().map(|r| Value::string(r)).collect();
             Ok(Value::List(items))

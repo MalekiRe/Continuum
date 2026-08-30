@@ -7,30 +7,6 @@ use std::time::{Duration, Instant};
 
 const TERMINATION_GRACE: Duration = Duration::from_millis(100);
 
-pub(super) enum CleanupFailure {
-    Signal {
-        signal: i32,
-        source: io::Error,
-    },
-    Process {
-        operation: &'static str,
-        source: io::Error,
-    },
-}
-
-impl CleanupFailure {
-    pub(super) fn into_executor_error(self, process_group: i32) -> ExecutorError {
-        match self {
-            Self::Signal { signal, source } => ExecutorError::Signal {
-                process_group,
-                signal,
-                source,
-            },
-            Self::Process { operation, source } => ExecutorError::Process { operation, source },
-        }
-    }
-}
-
 pub(super) fn configure_process_session(command: &mut Command) {
     // SAFETY: pre_exec runs after fork and before exec. The closure performs
     // only the async-signal-safe setsid syscall and constructs an io::Error
@@ -82,43 +58,37 @@ pub(super) fn retire_process_group(
     child: &mut Child,
     process_group: i32,
     mut status: Option<ExitStatus>,
-) -> Result<ExitStatus, CleanupFailure> {
-    signal_group(process_group, libc::SIGTERM).map_err(|source| CleanupFailure::Signal {
-        signal: libc::SIGTERM,
+) -> Result<ExitStatus, ExecutorError> {
+    let signal_error = |signal, source| ExecutorError::Signal {
+        process_group,
+        signal,
         source,
-    })?;
+    };
+    let process_error = |operation, source| ExecutorError::Process { operation, source };
+    signal_group(process_group, libc::SIGTERM)
+        .map_err(|source| signal_error(libc::SIGTERM, source))?;
     let deadline = Instant::now() + TERMINATION_GRACE;
     while Instant::now() < deadline {
         if status.is_none() {
-            status = child.try_wait().map_err(|source| CleanupFailure::Process {
-                operation: "poll during cleanup",
-                source,
-            })?;
+            status = child
+                .try_wait()
+                .map_err(|source| process_error("poll during cleanup", source))?;
         }
-        if !process_group_exists(process_group)
-            .map_err(|source| CleanupFailure::Signal { signal: 0, source })?
-        {
+        if !process_group_exists(process_group).map_err(|source| signal_error(0, source))? {
             break;
         }
         thread::sleep(Duration::from_millis(5));
     }
-
-    signal_group(process_group, libc::SIGKILL).map_err(|source| CleanupFailure::Signal {
-        signal: libc::SIGKILL,
-        source,
-    })?;
-    let status = if let Some(status) = status {
-        status
-    } else {
-        child.wait().map_err(|source| CleanupFailure::Process {
-            operation: "reap",
-            source,
-        })?
+    signal_group(process_group, libc::SIGKILL)
+        .map_err(|source| signal_error(libc::SIGKILL, source))?;
+    let status = match status {
+        Some(status) => status,
+        None => child
+            .wait()
+            .map_err(|source| process_error("reap", source))?,
     };
-    reap_group_children(process_group).map_err(|source| CleanupFailure::Process {
-        operation: "reap process-group descendant",
-        source,
-    })?;
+    reap_group_children(process_group)
+        .map_err(|source| process_error("reap process-group descendant", source))?;
     Ok(status)
 }
 

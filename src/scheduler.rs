@@ -5,7 +5,7 @@ use crate::vm::reader::{self, ReadError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -198,7 +198,7 @@ impl ModelClient for OpenRouterModel {
 
 #[derive(Clone)]
 pub struct ModelInterruptHandle {
-    active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    active: Arc<Mutex<Option<CancellationToken>>>,
     pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -207,8 +207,8 @@ impl ModelInterruptHandle {
     pub fn request_interrupt(&self) -> bool {
         let active = self.active.lock().unwrap();
         let newly_pending = !self.pending.swap(true, Ordering::AcqRel);
-        if let Some(active) = active.as_ref() {
-            active.cancellation.cancel();
+        if let Some(cancellation) = active.as_ref() {
+            cancellation.cancel();
         }
         newly_pending
     }
@@ -221,28 +221,14 @@ impl ModelInterruptHandle {
     }
 }
 
-struct ActiveModelRequest {
-    generation: u64,
-    cancellation: CancellationToken,
-}
-
+#[derive(Default)]
 struct ModelRuntime {
     gate: tokio::sync::Mutex<()>,
-    active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    active: Arc<Mutex<Option<CancellationToken>>>,
     pending: Arc<std::sync::atomic::AtomicBool>,
-    next_generation: AtomicU64,
 }
 
 impl ModelRuntime {
-    fn new() -> Self {
-        Self {
-            gate: tokio::sync::Mutex::new(()),
-            active: Arc::new(Mutex::new(None)),
-            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            next_generation: AtomicU64::new(0),
-        }
-    }
-
     fn interrupt_handle(&self) -> ModelInterruptHandle {
         ModelInterruptHandle {
             active: Arc::clone(&self.active),
@@ -251,21 +237,15 @@ impl ModelRuntime {
     }
 
     fn activate(&self) -> ActiveRequestGuard {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
         let mut active = self.active.lock().unwrap();
         if self.pending.load(Ordering::Acquire) {
             cancellation.cancel();
         }
-        *active = Some(ActiveModelRequest {
-            generation,
-            cancellation: cancellation.clone(),
-        });
-        drop(active);
+        *active = Some(cancellation.clone());
         ActiveRequestGuard {
             active: Arc::clone(&self.active),
             pending: Arc::clone(&self.pending),
-            generation,
             cancellation,
             finished: false,
         }
@@ -277,9 +257,8 @@ impl ModelRuntime {
 }
 
 struct ActiveRequestGuard {
-    active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    active: Arc<Mutex<Option<CancellationToken>>>,
     pending: Arc<std::sync::atomic::AtomicBool>,
-    generation: u64,
     cancellation: CancellationToken,
     finished: bool,
 }
@@ -287,13 +266,8 @@ struct ActiveRequestGuard {
 impl ActiveRequestGuard {
     fn finish<T>(mut self, result: Result<T, ModelError>) -> Result<T, ModelError> {
         let mut active = self.active.lock().unwrap();
-        let owns_slot = active
-            .as_ref()
-            .is_some_and(|request| request.generation == self.generation);
         let interrupted = self.pending.load(Ordering::Acquire) || self.cancellation.is_cancelled();
-        if owns_slot {
-            *active = None;
-        }
+        *active = None;
         self.finished = true;
         drop(active);
         if interrupted {
@@ -307,15 +281,8 @@ impl ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let mut active = self.active.lock().unwrap();
-        if active
-            .as_ref()
-            .is_some_and(|request| request.generation == self.generation)
-        {
-            *active = None;
+        if !self.finished {
+            *self.active.lock().unwrap() = None;
         }
     }
 }
@@ -357,7 +324,7 @@ impl<M: ModelClient> Scheduler<M> {
     pub fn new(model: M, executor: Executor) -> Self {
         Self {
             model,
-            model_runtime: ModelRuntime::new(),
+            model_runtime: ModelRuntime::default(),
             executor,
         }
     }
@@ -367,7 +334,8 @@ impl<M: ModelClient> Scheduler<M> {
     }
 
     async fn complete_model(&self, request: ModelRequest) -> Result<String, ModelError> {
-        let _generation_gate = self.model_runtime.gate.lock().await;
+        // Declared first so the active guard clears its slot before this gate unlocks.
+        let _request_gate = self.model_runtime.gate.lock().await;
         let active = self.model_runtime.activate();
         let cancellation = active.cancellation.clone();
         let result = tokio::select! {

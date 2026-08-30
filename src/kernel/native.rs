@@ -1,59 +1,43 @@
+macro_rules! exact_native {
+    ($kernel:expr, $name:literal, |$context:ident, [$($argument:ident),* $(,)?]| $body:expr) => {{
+        const ARITY: u32 = 0 $(+ { let _ = stringify!($argument); 1 })*;
+        $kernel.define_native(
+            $name,
+            $crate::vm::value::Arity::Exact(ARITY),
+            |$context, arguments| match arguments.as_slice() {
+                [$($argument),*] => $body,
+                _ => Err($crate::vm::value::NativeError::InvalidArgument(format!(
+                    "{}: expected {} arguments", $name, ARITY
+                ))),
+            },
+        );
+    }};
+}
+pub(crate) use exact_native;
+
 use crate::kernel::Kernel;
 use crate::vm::value::{NativeError, Value};
 
-pub(crate) fn argument<'a>(
-    args: &'a [Value],
-    index: usize,
-    name: &str,
-) -> Result<&'a Value, NativeError> {
-    args.get(index).ok_or_else(|| {
-        NativeError::InvalidArgument(format!("{}: missing argument {}", name, index + 1))
-    })
-}
-
-pub(crate) fn integer_argument(
-    args: &[Value],
-    index: usize,
-    name: &str,
-) -> Result<i64, NativeError> {
-    argument(args, index, name)?.require_int(name, index + 1)
-}
-
-pub(crate) fn index_argument(
-    args: &[Value],
-    index: usize,
-    name: &str,
-) -> Result<usize, NativeError> {
-    argument(args, index, name)?.require_nonnegative_usize(name, index + 1)
-}
-
-pub(crate) fn string_argument<'a>(
-    args: &'a [Value],
-    index: usize,
-    name: &str,
-) -> Result<&'a str, NativeError> {
-    argument(args, index, name)?.require_string(name, index + 1)
-}
-
-pub(crate) fn numbers(args: &[Value], name: &str) -> Result<(f64, f64), NativeError> {
+pub(crate) fn numbers(left: &Value, right: &Value, name: &str) -> Result<(f64, f64), NativeError> {
     Ok((
-        argument(args, 0, name)?.require_number(name, 1)?,
-        argument(args, 1, name)?.require_number(name, 2)?,
+        left.require_number(name, 1)?,
+        right.require_number(name, 2)?,
     ))
 }
 
 pub(crate) fn arithmetic(
-    args: &[Value],
+    left: &Value,
+    right: &Value,
     name: &str,
     ints: fn(i64, i64) -> Option<i64>,
     floats: fn(f64, f64) -> f64,
 ) -> Result<Value, NativeError> {
-    if let (Some(Value::Int(a)), Some(Value::Int(b))) = (args.first(), args.get(1)) {
+    if let (Value::Int(a), Value::Int(b)) = (left, right) {
         return ints(*a, *b)
             .map(Value::Int)
             .ok_or_else(|| NativeError::InvalidArgument(format!("{}: integer overflow", name)));
     }
-    let (a, b) = numbers(args, name)?;
+    let (a, b) = numbers(left, right, name)?;
     Ok(Value::Float(floats(a, b)))
 }
 
