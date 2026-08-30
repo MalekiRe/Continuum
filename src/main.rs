@@ -97,6 +97,30 @@ fn handle_waiting_frame(kernel: &mut Kernel) -> bool {
     }
 }
 
+/// Interrupt if eval runs too long or is stuck waiting for tool calls.
+fn check_supervision(kernel: &mut Kernel) {
+    let Some(started_at) = kernel.eval_started_at else {
+        return;
+    };
+    let elapsed = (chrono::Utc::now() - started_at).num_seconds() as u64;
+
+    // Absolute timeout: 15 minutes
+    if elapsed >= 900 {
+        println!("[supervisor] eval ran for {}s — interrupting", elapsed);
+        persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    // Token-aware timeout: if time > 4x expected at 10 tok/s, agent may be stuck in bash
+    let tokens = kernel.total_tokens;
+    let expected_secs = tokens / 10;
+    if expected_secs > 0 && elapsed > expected_secs * 4 {
+        println!("[supervisor] {}s elapsed with only {} tokens (expected ~{}s) — interrupting", 
+            elapsed, tokens, expected_secs);
+        persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Run one cognition turn for the agent.
 fn run_cognition_turn(kernel: &mut Kernel) {
     let has_pending = kernel
@@ -181,6 +205,7 @@ fn main() {
         if handle_human_input(kernel, &rx) {
             break;
         }
+        check_supervision(kernel);
         check_hourly_snapshot(kernel, &mut hourly_timer);
         kernel.check_wake_timers();
 

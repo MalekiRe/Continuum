@@ -22,7 +22,9 @@ pub struct Kernel {
     pub event_counter: u64,
     pub next_frame_id: u64,
     pub version: String,
-    pub wake_timers: Vec<WakeEntry>,
+        pub wake_timers: Vec<WakeEntry>,
+    pub eval_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub total_tokens: u64,
 }
 
 /// An agent frame.
@@ -102,7 +104,9 @@ impl Kernel {
         let mut kernel = Kernel {
             env: EnvRef::new(),
             frames: Vec::new(),
-            wake_timers: Vec::new(),
+                        wake_timers: Vec::new(),
+            eval_started_at: None,
+            total_tokens: 0,
             storage: SnapshotConfig::default(),
             event_counter: 0,
             next_frame_id: 1,
@@ -137,8 +141,16 @@ impl Kernel {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, eval::EvalError> {
+        let is_top_level = self.eval_started_at.is_none();
+        if is_top_level {
+            self.eval_started_at = Some(chrono::Utc::now());
+        }
+
         let result = eval::eval(source, self);
 
+        if is_top_level {
+            self.eval_started_at = None;
+        }
         result
     }
 

@@ -31,6 +31,10 @@ A Scheme-like Lisp with:
 
 **Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
 
+**Supervision.** Every cognition loop iteration checks two conditions:
+- **15-minute absolute timeout**: if a top-level eval has been running for 15+ minutes, it's interrupted.
+- **Token-aware timeout**: if elapsed time exceeds 4× the expected time for the reported token count (at a configurable baseline of 10 tok/s), the agent may be stuck in a blocking tool call (e.g., `bash`). Lisp code reports token usage with `(system/report-tokens N)` after model calls, enabling the supervisor to distinguish "thinking" from "stuck".
+
 **Human interaction.** Human messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and the agent returns `control/Continue` or `(control/CancelCurrent ...)`.
 
 **Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
@@ -83,7 +87,7 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 | Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
 | Control | `control/Continue` `control/CancelCurrent` `control/Error` |
 | System | `system/clock` `system/version` `system/interrupt` `system/clear-interrupt` |
-| Persistence | `system/snapshot` |
+| Persistence | `system/snapshot` `system/report-tokens` |
 | Inspection | `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/source` `inspect/history` |
 | Subagents | `agent/call` |
 | Shell | `bash` |

@@ -187,6 +187,16 @@ impl Kernel {
             crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
             Ok(Value::keyword("cleared"))
         });
+
+        self.define_native("system/report-tokens", 1, |_kernel, args| {
+            let count = match &args[0] {
+                Value::Int(n) => *n,
+                Value::Float(f) => *f as i64,
+                _ => return Err("system/report-tokens: expected integer".into()),
+            };
+            _kernel.total_tokens += count as u64;
+            Ok(Value::keyword("ok"))
+        });
         self.define_native("system/snapshot", 0, |_kernel, _args| {
                 let snap = _kernel.snapshot(SnapshotKind::Incremental);
                 Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
