@@ -1,5 +1,5 @@
-use persistent_lisp_harness::Kernel;
 use persistent_lisp_harness::Value;
+use persistent_lisp_harness::{EvalError, Kernel};
 
 // ===== BASIC REPL TESTS =====
 
@@ -207,7 +207,7 @@ fn test_repl_define_data_and_match() {
     let r = k.eval("(define-data result/Result (Ok value) (Err problem))");
     assert!(r.is_ok());
     let r = k.eval(
-        r#"(match (user/result/Result/Ok 42)
+        r#"(match (result/Result/Ok 42)
           ((result/Result/Ok n) (+ n 1))
           ((result/Result/Err msg) -1))"#,
     );
@@ -419,4 +419,148 @@ fn binding_history_is_bounded() {
 fn integer_overflow_is_an_eval_error_not_a_panic() {
     let mut kernel = Kernel::new();
     assert!(kernel.eval("(+ 9223372036854775807 1)").is_err());
+}
+
+#[test]
+fn captured_set_mutates_a_shared_persistent_cell() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval(
+            "(define make-counter
+               (lambda ()
+                 (let ((count 0))
+                   (lambda ()
+                     (set! count (+ count 1))
+                     count))))",
+        )
+        .unwrap();
+    kernel.eval("(define counter (make-counter))").unwrap();
+    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(1));
+    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(2));
+}
+
+#[test]
+fn letrec_closures_capture_the_recursive_placeholder_cell() {
+    let mut kernel = Kernel::new();
+    assert_eq!(
+        kernel
+            .eval(
+                "(letrec ((factorial
+                            (lambda (n)
+                              (if (= n 0)
+                                  1
+                                  (* n (factorial (- n 1)))))))
+                   (factorial 6))",
+            )
+            .unwrap(),
+        Value::Int(720)
+    );
+}
+
+#[test]
+fn calls_bind_parameters_in_a_child_of_the_captured_environment() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval(
+            "(define closures
+               (let ((x 7))
+                 (list (lambda (x) x)
+                       (lambda () x))))",
+        )
+        .unwrap();
+    assert_eq!(
+        kernel.eval("((nth 0 closures) 99)").unwrap(),
+        Value::Int(99)
+    );
+    assert_eq!(kernel.eval("((nth 1 closures))").unwrap(), Value::Int(7));
+}
+
+#[test]
+fn interpreted_functions_require_exact_arity() {
+    let mut kernel = Kernel::new();
+    kernel.eval("(define (pair x y) (list x y))").unwrap();
+    assert!(matches!(
+        kernel.eval("(pair 1)"),
+        Err(EvalError::ArityMismatch {
+            expected: 2,
+            got: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        kernel.eval("(pair 1 2 3)"),
+        Err(EvalError::ArityMismatch {
+            expected: 2,
+            got: 3,
+            ..
+        })
+    ));
+    kernel.eval("(define (nothing) 42)").unwrap();
+    assert!(matches!(
+        kernel.eval("(nothing 1)"),
+        Err(EvalError::ArityMismatch {
+            expected: 0,
+            got: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn failed_top_level_form_rolls_back_cells_and_arena_allocations() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval("(define counter (let ((x 0)) (lambda () (set! x (+ x 1)) x)))")
+        .unwrap();
+    let environments = kernel.env.lexical.environments.len();
+    let cells = kernel.env.lexical.cells.len();
+    assert!(
+        kernel
+            .eval("(begin (counter) (let ((temporary 1)) unknown-symbol))")
+            .is_err()
+    );
+    assert_eq!(kernel.env.lexical.environments.len(), environments);
+    assert_eq!(kernel.env.lexical.cells.len(), cells);
+    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(1));
+}
+
+#[test]
+fn data_families_use_exact_qualified_identity_and_bindings() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval("(define-data alpha/Result (Ok value) (Old value))")
+        .unwrap();
+    kernel.eval("(define-data beta/Result (Ok value))").unwrap();
+    kernel.eval("(define alpha/Result/unrelated 17)").unwrap();
+
+    assert!(kernel.eval("(alpha/Result/Ok 1)").is_ok());
+    assert!(kernel.eval("(beta/Result/Ok 2)").is_ok());
+    assert_eq!(
+        kernel
+            .eval("(match (beta/Result/Ok 2) ((alpha/Result/Ok x) 0) ((beta/Result/Ok x) x))")
+            .unwrap(),
+        Value::Int(2)
+    );
+
+    kernel.eval("(undefine alpha/Result)").unwrap();
+    assert!(kernel.eval("(alpha/Result/Ok 1)").is_err());
+    assert!(kernel.eval("(alpha/Result/Old 1)").is_err());
+    assert_eq!(
+        kernel.eval("alpha/Result/unrelated").unwrap(),
+        Value::Int(17)
+    );
+    assert!(kernel.eval("(beta/Result/Ok 2)").is_ok());
+}
+
+#[test]
+fn redefining_a_data_family_removes_only_its_stale_constructors() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval("(define-data shapes/Shape (Circle radius) (Square side))")
+        .unwrap();
+    kernel
+        .eval("(define-data shapes/Shape (Circle radius))")
+        .unwrap();
+    assert!(kernel.eval("(shapes/Shape/Square 2)").is_err());
+    assert!(kernel.eval("(shapes/Shape/Circle 2)").is_ok());
 }

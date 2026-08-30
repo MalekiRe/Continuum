@@ -103,20 +103,26 @@ pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
     let exprs = reader::read_all(input).map_err(|e| EvalError::SyntaxError(e.to_string()))?;
     let mut result = Value::Nil;
     for expr in exprs {
-        // Tail-call trampoline steps may temporarily replace lexical frames.
-        // A completed top-level form must always restore its caller frames.
-        let caller_frames = kernel.env.frames.clone();
+        // Tail-call trampoline steps may move the active arena cursor.
+        // A completed top-level form must always restore its caller scope.
+        let caller_environment = kernel.env.current_environment();
         let mut current = expr;
         loop {
             match eval_step(current, kernel) {
                 Ok(StepResult::Done(value)) => {
                     result = value;
-                    kernel.env.frames = caller_frames;
+                    kernel
+                        .env
+                        .activate_environment(caller_environment)
+                        .map_err(EvalError::KernelError)?;
                     break;
                 }
                 Ok(StepResult::Step(next)) => current = next,
                 Err(error) => {
-                    kernel.env.frames = caller_frames;
+                    kernel
+                        .env
+                        .activate_environment(caller_environment)
+                        .map_err(EvalError::KernelError)?;
                     return Err(error);
                 }
             }
@@ -264,11 +270,14 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
             };
             let param_names: Vec<String> = params[1..]
                 .iter()
-                .map(|p| match p {
-                    Value::Symbol(s) => s.clone(),
-                    other => other.to_string(),
+                .map(|parameter| match parameter {
+                    Value::Symbol(name) => Ok(name.clone()),
+                    other => Err(EvalError::InvalidForm(format!(
+                        "define: expected symbol parameter, got {}",
+                        other
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             let body = args[1..].to_vec();
             let reconstructed = format!(
                 "(define ({} {}) {})",
@@ -369,7 +378,6 @@ fn eval_lambda(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
             }
             names
         }
-        Value::Symbol(s) if s == "args" => vec!["args".into()],
         _ => {
             return Err(EvalError::InvalidForm(format!(
                 "lambda: expected parameter list, got {}",
@@ -570,10 +578,7 @@ fn eval_letrec_tail(
         }
     }
 
-    let body: Vec<Value> = args[1..].to_vec();
-    let result = eval_begin_tail(&body, kernel, tail_pos);
-    kernel.env.pop_frame();
-    result
+    finish_scoped_body(&args[1..], kernel, tail_pos)
 }
 
 fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
@@ -591,12 +596,9 @@ fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     };
     let val = eval_any(args[1].clone(), kernel)?;
 
-    // Check lexical frames first
-    for frame in kernel.env.frames.iter_mut().rev() {
-        if frame.contains_key(&name) {
-            frame.insert(name.clone(), val);
-            return Ok(Value::Nil);
-        }
+    // Mutate the shared cell found along the active lexical chain.
+    if kernel.env.set_existing_lexical(&name, val.clone()) {
+        return Ok(Value::Nil);
     }
 
     // Check namespaces
@@ -791,6 +793,11 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
         }
     };
 
+    let qualified_family = if family_name.contains('/') {
+        family_name.clone()
+    } else {
+        format!("user/{}", family_name)
+    };
     let mut variants = Vec::new();
     for variant_def in &args[1..] {
         match variant_def {
@@ -811,25 +818,6 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
                         other => format!("{}", other),
                     })
                     .collect();
-
-                // Register constructor as a Lisp function that returns a tagged value
-                let _fam = family_name.clone();
-                let _var = variant_name.clone();
-                let arity = field_names.len() as u32;
-                // Store constructors as user/{family}/{variant}
-                let constructor_name = format!("user/{}/{}", family_name, variant_name);
-
-                let constructor = Value::Function(Function::Constructor {
-                    family: family_name.clone(),
-                    variant: variant_name.clone(),
-                    arity,
-                });
-
-                kernel
-                    .env
-                    .define(&constructor_name, constructor)
-                    .map_err(EvalError::SyntaxError)?;
-
                 variants.push(DataVariant {
                     name: variant_name,
                     fields: field_names,
@@ -843,18 +831,30 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
         }
     }
 
-    // Store data family definition
-    let fam_name = family_name.clone();
+    let generated_bindings: Vec<_> = variants
+        .iter()
+        .map(|variant| format!("{}/{}", qualified_family, variant.name))
+        .collect();
     kernel
         .env
-        .set_data_family(
-            &fam_name,
-            DataFamily {
-                name: fam_name.clone(),
-                variants,
-            },
-        )
+        .set_data_family(DataFamily {
+            name: qualified_family.clone(),
+            variants: variants.clone(),
+            generated_bindings: generated_bindings.clone(),
+        })
         .map_err(EvalError::SyntaxError)?;
+
+    for (variant, constructor_name) in variants.iter().zip(generated_bindings) {
+        let constructor = Value::Function(Function::Constructor {
+            family: qualified_family.clone(),
+            variant: variant.name.clone(),
+            arity: variant.fields.len() as u32,
+        });
+        kernel
+            .env
+            .define(&constructor_name, constructor)
+            .map_err(EvalError::SyntaxError)?;
+    }
 
     Ok(Value::Symbol(family_name))
 }
@@ -1208,37 +1208,31 @@ fn apply_tail(
                     got: args.len(),
                 });
             }
-            let captured = kernel.lexical_env(env_id).ok_or_else(|| {
-                EvalError::KernelError(format!("closure environment {} is missing", env_id))
-            })?;
-            let saved_frames = std::mem::replace(&mut kernel.env.frames, captured);
 
-            // Tail-call path: for single-expression bodies called in tail position,
-            // bind params directly into the closure-swapped frames (no new frame),
-            // and return TailCall. The trampoline evaluates the expression using
-            // these same frames — no restoration needed.
+            let caller_environment = kernel.env.current_environment();
+            kernel
+                .env
+                .push_call_frame(env_id)
+                .map_err(EvalError::KernelError)?;
+            for (parameter, argument) in params.iter().zip(args) {
+                kernel.env.set_lexical(parameter, argument);
+            }
+
+            // The trampoline owns the active cursor after a tail call. The call
+            // frame remains parented to the closure environment, not the caller.
             if tail_ok && body.len() == 1 {
-                for (p, a) in params.iter().zip(args) {
-                    kernel.env.set_lexical(p, a);
-                }
                 let next_expr = body.into_iter().next().unwrap();
                 return Err(EvalError::TailCall(next_expr));
             }
 
-            // Non-tail path: push a new lexical frame for params.
-            kernel.env.push_frame();
-            for (p, a) in params.iter().zip(args) {
-                kernel.env.set_lexical(p, a);
-            }
-
-            // This call itself is not in tail position. Its body may use tail
-            // calls internally, but that trampoline must finish before we
-            // restore and continue the caller's expression.
             let result = match eval_begin_tail(&body, kernel, true) {
                 Err(EvalError::TailCall(expr)) => eval_any(expr, kernel),
                 other => other,
             };
-            kernel.env.frames = saved_frames;
+            kernel
+                .env
+                .activate_environment(caller_environment)
+                .map_err(EvalError::KernelError)?;
             result
         }
 

@@ -182,13 +182,13 @@ fn snapshot_collects_unreachable_closure_environments() {
     let mut kernel = Kernel::new();
     kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
     for _ in 0..100 {
-        kernel.eval("(lambda (x) x)").unwrap();
+        kernel.eval("(let ((x 1)) (lambda () x))").unwrap();
     }
-    assert!(kernel.lexical_heap.len() >= 100);
+    assert!(kernel.env.lexical.environments.len() >= 100);
     kernel.snapshot().unwrap();
-    assert!(kernel.lexical_heap.is_empty());
+    assert_eq!(kernel.env.lexical.environments.len(), 1);
     let recovered = Kernel::recover_from_dir(&dir).unwrap();
-    assert!(recovered.lexical_heap.is_empty());
+    assert_eq!(recovered.env.lexical.environments.len(), 1);
 }
 
 #[test]
@@ -228,4 +228,20 @@ fn v2_legacy_human_message_is_migrated_with_its_id() {
             .text,
         "still here"
     );
+}
+
+#[test]
+fn mutated_closure_cells_survive_snapshot_recovery() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel
+        .eval("(define counter (let ((x 0)) (lambda () (set! x (+ x 1)) x)))")
+        .unwrap();
+    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(1));
+    kernel.snapshot().unwrap();
+
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert_eq!(recovered.eval("(counter)").unwrap(), Value::Int(2));
+    assert_eq!(recovered.eval("(counter)").unwrap(), Value::Int(3));
 }

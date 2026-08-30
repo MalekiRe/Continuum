@@ -4,17 +4,13 @@ use crate::vm::eval;
 use crate::vm::value::Function;
 use crate::vm::value::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeEntry {
     pub wake_at: chrono::DateTime<chrono::Utc>,
     pub action: String,
     pub frame_id: String,
-}
-
-fn default_next_lexical_env_id() -> u64 {
-    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,10 +23,6 @@ pub struct Kernel {
     /// Current expression source being evaluated (for source retention).
     #[serde(skip)]
     pub current_source: Option<String>,
-    #[serde(default)]
-    pub lexical_heap: HashMap<u64, Vec<HashMap<String, Value>>>,
-    #[serde(default = "default_next_lexical_env_id")]
-    pub next_lexical_env_id: u64,
 }
 
 /// An agent frame.
@@ -177,8 +169,6 @@ impl Kernel {
             env: EnvRef::new(),
             frames: Vec::new(),
             wake_timers: Vec::new(),
-            lexical_heap: HashMap::new(),
-            next_lexical_env_id: 1,
             current_source: None,
             storage: SnapshotConfig::default(),
             next_frame_id: 1,
@@ -213,15 +203,8 @@ impl Kernel {
         kernel
     }
 
-    pub fn capture_lexical_env(&mut self) -> u64 {
-        let id = self.next_lexical_env_id;
-        self.next_lexical_env_id += 1;
-        self.lexical_heap.insert(id, self.env.frames.clone());
-        id
-    }
-
-    pub fn lexical_env(&self, id: u64) -> Option<Vec<HashMap<String, Value>>> {
-        self.lexical_heap.get(&id).cloned()
+    pub fn capture_lexical_env(&self) -> u64 {
+        self.env.current_environment()
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, eval::EvalError> {
@@ -230,7 +213,6 @@ impl Kernel {
             self.frames.clone(),
             self.wake_timers.clone(),
             self.next_frame_id,
-            self.next_lexical_env_id,
         );
         let previous_source = self.current_source.replace(source.to_string());
         eval::EVAL_RUNNING.store(true, std::sync::atomic::Ordering::Release);
@@ -240,13 +222,11 @@ impl Kernel {
         self.current_source = previous_source;
 
         if result.is_err() {
-            let (env, frames, wake_timers, next_frame_id, next_lexical_env_id) = checkpoint;
+            let (env, frames, wake_timers, next_frame_id) = checkpoint;
             self.env = env;
             self.frames = frames;
             self.wake_timers = wake_timers;
             self.next_frame_id = next_frame_id;
-            self.lexical_heap.retain(|id, _| *id < next_lexical_env_id);
-            self.next_lexical_env_id = next_lexical_env_id;
         }
         result
     }
@@ -420,44 +400,44 @@ impl Kernel {
         fired.len()
     }
 
-    fn collect_lexical_heap(&mut self) {
-        fn visit(value: &Value, ids: &mut HashSet<u64>) {
+    fn collect_lexical_arena(&mut self) {
+        fn visit(value: &Value, environments: &mut HashSet<u64>) {
             match value {
                 Value::Function(Function::Interpreted { env_id, body, .. }) => {
-                    ids.insert(*env_id);
+                    environments.insert(*env_id);
                     for value in body {
-                        visit(value, ids);
+                        visit(value, environments);
                     }
                 }
                 Value::List(values) | Value::Vector(values) => {
                     for value in values {
-                        visit(value, ids);
+                        visit(value, environments);
                     }
                 }
                 Value::Map(values) => {
                     for (key, value) in values {
-                        visit(key, ids);
-                        visit(value, ids);
+                        visit(key, environments);
+                        visit(value, environments);
                     }
                 }
                 Value::Macro(crate::vm::value::Macro::SyntaxRules { rules, .. }) => {
                     for (pattern, template) in rules {
                         for value in pattern {
-                            visit(value, ids);
+                            visit(value, environments);
                         }
-                        visit(template, ids);
+                        visit(template, environments);
                     }
                 }
                 Value::Tagged { fields, .. } => {
                     for value in fields {
-                        visit(value, ids);
+                        visit(value, environments);
                     }
                 }
                 _ => {}
             }
         }
 
-        let mut reachable = HashSet::new();
+        let mut reachable = HashSet::from([0, self.env.current_environment()]);
         for namespace in self.env.namespaces.values() {
             for value in namespace.bindings.values() {
                 visit(value, &mut reachable);
@@ -466,11 +446,6 @@ impl Kernel {
                 for record in history {
                     visit(&record.value, &mut reachable);
                 }
-            }
-        }
-        for frame in &self.env.frames {
-            for value in frame.values() {
-                visit(value, &mut reachable);
             }
         }
         for frame in &self.frames {
@@ -482,22 +457,41 @@ impl Kernel {
                 visit(value, &mut reachable);
             }
         }
+
         let mut pending: Vec<_> = reachable.iter().copied().collect();
         let mut scanned = HashSet::new();
         while let Some(id) = pending.pop() {
             if !scanned.insert(id) {
                 continue;
             }
-            if let Some(frames) = self.lexical_heap.get(&id) {
-                for frame in frames {
-                    for value in frame.values() {
+            if let Some(environment) = self.env.lexical.environments.get(&id) {
+                if let Some(parent) = environment.parent {
+                    reachable.insert(parent);
+                }
+                for cell in environment.bindings.values() {
+                    if let Some(value) = self.env.lexical.cells.get(cell) {
                         visit(value, &mut reachable);
                     }
                 }
                 pending.extend(reachable.difference(&scanned).copied());
             }
         }
-        self.lexical_heap.retain(|id, _| reachable.contains(id));
+
+        self.env
+            .lexical
+            .environments
+            .retain(|id, _| reachable.contains(id));
+        let reachable_cells: HashSet<_> = self
+            .env
+            .lexical
+            .environments
+            .values()
+            .flat_map(|environment| environment.bindings.values().copied())
+            .collect();
+        self.env
+            .lexical
+            .cells
+            .retain(|id, _| reachable_cells.contains(id));
     }
 
     pub fn snapshot(&mut self) -> Result<SnapshotInfo, String> {
@@ -506,7 +500,7 @@ impl Kernel {
         let id = format!("snap-{}", now.format("%Y%m%d-%H%M%S-%6f"));
 
         let mut saved = self.clone();
-        saved.collect_lexical_heap();
+        saved.collect_lexical_arena();
         saved.storage.snapshot_count += 1;
         let kernel = serde_json::to_value(&saved)
             .map_err(|error| format!("snapshot serialization: {}", error))?;
@@ -514,7 +508,7 @@ impl Kernel {
             serde_json::to_vec(&kernel).map_err(|error| format!("snapshot payload: {}", error))?;
         let checksum = sha256(&payload);
         let envelope = SnapshotEnvelope {
-            format_version: 3,
+            format_version: 4,
             id: id.clone(),
             timestamp: timestamp.clone(),
             kernel,
@@ -529,7 +523,7 @@ impl Kernel {
         prune_snapshots(&directory, 48)?;
         sync_directory(&directory)?;
         self.storage = saved.storage;
-        self.lexical_heap = saved.lexical_heap;
+        self.env.lexical = saved.env.lexical;
         Ok(SnapshotInfo {
             id,
             timestamp,
@@ -766,7 +760,7 @@ fn snapshot_sort_key(path: &std::path::Path) -> String {
 fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read: {}", e))?;
     if let Ok(envelope) = serde_json::from_slice::<SnapshotEnvelope>(&bytes) {
-        if !matches!(envelope.format_version, 2 | 3) {
+        if !matches!(envelope.format_version, 2..=4) {
             return Err(format!(
                 "unsupported snapshot format {}",
                 envelope.format_version

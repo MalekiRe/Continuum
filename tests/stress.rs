@@ -72,7 +72,7 @@ fn large_tagged_data_family_remains_usable() {
     definition.push(')');
     kernel.eval(&definition).unwrap();
     assert!(matches!(
-        kernel.eval("(user/many/Status/Variant49 1 2)").unwrap(),
+        kernel.eval("(many/Status/Variant49 1 2)").unwrap(),
         Value::Tagged { .. }
     ));
 }

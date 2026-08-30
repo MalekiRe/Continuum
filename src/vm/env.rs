@@ -21,8 +21,12 @@ pub struct DataVariant {
 /// A tagged data family.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataFamily {
+    /// Canonical `namespace/name` identity.
     pub name: String,
     pub variants: Vec<DataVariant>,
+    /// Exact qualified bindings installed for this definition.
+    #[serde(default)]
+    pub generated_bindings: Vec<String>,
 }
 
 /// A single namespace holding named bindings with version history.
@@ -101,11 +105,102 @@ impl Namespace {
     }
 }
 
-/// A reference to the root environment.
+/// Stable identifiers used by the serializable lexical arena.
+pub type EnvironmentId = u64;
+pub type CellId = u64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LexicalEnvironment {
+    pub parent: Option<EnvironmentId>,
+    pub bindings: HashMap<String, CellId>,
+}
+
+/// Serializable storage for lexical scopes and their mutable binding cells.
+///
+/// Environments point at cells rather than containing values directly. A
+/// closure therefore captures an environment id, and all closures which see a
+/// binding share the same cell (including after snapshot recovery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LexicalArena {
+    pub environments: HashMap<EnvironmentId, LexicalEnvironment>,
+    pub cells: HashMap<CellId, Value>,
+    next_environment_id: EnvironmentId,
+    next_cell_id: CellId,
+}
+
+impl Default for LexicalArena {
+    fn default() -> Self {
+        let mut environments = HashMap::new();
+        environments.insert(
+            0,
+            LexicalEnvironment {
+                parent: None,
+                bindings: HashMap::new(),
+            },
+        );
+        Self {
+            environments,
+            cells: HashMap::new(),
+            next_environment_id: 1,
+            next_cell_id: 1,
+        }
+    }
+}
+
+impl LexicalArena {
+    fn allocate_environment(&mut self, parent: EnvironmentId) -> EnvironmentId {
+        let id = self.next_environment_id;
+        self.next_environment_id += 1;
+        self.environments.insert(
+            id,
+            LexicalEnvironment {
+                parent: Some(parent),
+                bindings: HashMap::new(),
+            },
+        );
+        id
+    }
+
+    fn define(&mut self, environment: EnvironmentId, name: &str, value: Value) {
+        let existing = self
+            .environments
+            .get(&environment)
+            .and_then(|frame| frame.bindings.get(name))
+            .copied();
+        if let Some(cell) = existing {
+            self.cells.insert(cell, value);
+            return;
+        }
+
+        let cell = self.next_cell_id;
+        self.next_cell_id += 1;
+        self.cells.insert(cell, value);
+        self.environments
+            .get_mut(&environment)
+            .expect("active lexical environment must exist")
+            .bindings
+            .insert(name.to_string(), cell);
+    }
+
+    fn find_cell(&self, mut environment: EnvironmentId, name: &str) -> Option<CellId> {
+        loop {
+            let frame = self.environments.get(&environment)?;
+            if let Some(cell) = frame.bindings.get(name) {
+                return Some(*cell);
+            }
+            environment = frame.parent?;
+        }
+    }
+}
+
+/// The namespaces and current cursor into the lexical arena.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvRef {
     pub namespaces: Arc<HashMap<String, Namespace>>,
-    pub frames: Vec<HashMap<String, Value>>,
+    #[serde(default)]
+    pub lexical: LexicalArena,
+    #[serde(default)]
+    current_environment: EnvironmentId,
 }
 
 impl Default for EnvRef {
@@ -123,7 +218,8 @@ impl EnvRef {
         namespaces.insert("kernel".into(), Namespace::new("kernel"));
         EnvRef {
             namespaces: Arc::new(namespaces),
-            frames: vec![HashMap::new()],
+            lexical: LexicalArena::default(),
+            current_environment: 0,
         }
     }
 
@@ -131,10 +227,9 @@ impl EnvRef {
         if let Some((namespace, name)) = symbol.split_once('/') {
             return self.namespaces.get(namespace)?.get(name);
         }
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|frame| frame.get(symbol))
+        self.lexical
+            .find_cell(self.current_environment, symbol)
+            .and_then(|cell| self.lexical.cells.get(&cell))
             .or_else(|| {
                 self.namespaces
                     .get("user")
@@ -227,18 +322,54 @@ impl EnvRef {
         Ok(())
     }
 
+    /// Allocate a lexical child of the currently active environment.
     pub fn push_frame(&mut self) {
-        self.frames.push(HashMap::new());
+        self.current_environment = self.lexical.allocate_environment(self.current_environment);
     }
 
+    /// Restore the parent of the currently active lexical environment.
     pub fn pop_frame(&mut self) {
-        self.frames.pop();
+        if let Some(parent) = self
+            .lexical
+            .environments
+            .get(&self.current_environment)
+            .and_then(|environment| environment.parent)
+        {
+            self.current_environment = parent;
+        }
     }
 
     pub fn set_lexical(&mut self, name: &str, value: Value) {
-        if let Some(frame) = self.frames.last_mut() {
-            frame.insert(name.to_string(), value);
+        self.lexical.define(self.current_environment, name, value);
+    }
+
+    pub fn set_existing_lexical(&mut self, name: &str, value: Value) -> bool {
+        let Some(cell) = self.lexical.find_cell(self.current_environment, name) else {
+            return false;
+        };
+        self.lexical.cells.insert(cell, value);
+        true
+    }
+
+    pub fn current_environment(&self) -> EnvironmentId {
+        self.current_environment
+    }
+
+    pub fn activate_environment(&mut self, environment: EnvironmentId) -> Result<(), String> {
+        if !self.lexical.environments.contains_key(&environment) {
+            return Err(format!("closure environment {} is missing", environment));
         }
+        self.current_environment = environment;
+        Ok(())
+    }
+
+    /// Allocate a call frame parented directly to a closure's captured scope.
+    pub fn push_call_frame(&mut self, captured: EnvironmentId) -> Result<(), String> {
+        if !self.lexical.environments.contains_key(&captured) {
+            return Err(format!("closure environment {} is missing", captured));
+        }
+        self.current_environment = self.lexical.allocate_environment(captured);
+        Ok(())
     }
 
     pub fn namespace_names(&self) -> Vec<String> {
@@ -247,63 +378,89 @@ impl EnvRef {
         names
     }
 
-    pub fn set_data_family(&mut self, family_name: &str, family: DataFamily) -> Result<(), String> {
-        let (namespace, name) = family_name.split_once('/').unwrap_or(("user", family_name));
-        let ns = Arc::make_mut(&mut self.namespaces)
-            .entry(namespace.into())
-            .or_insert_with(|| Namespace::new(namespace));
+    fn qualify_data_family(family_name: &str) -> String {
+        if family_name.contains('/') {
+            family_name.to_string()
+        } else {
+            format!("user/{}", family_name)
+        }
+    }
+
+    /// Replace family metadata and remove only constructors generated by the
+    /// previous definition of this exact qualified family.
+    pub fn set_data_family(&mut self, mut family: DataFamily) -> Result<(), String> {
+        let qualified = Self::qualify_data_family(&family.name);
+        family.name = qualified.clone();
+        let (namespace, name) = qualified
+            .split_once('/')
+            .expect("qualified family always contains a namespace");
+        let namespaces = Arc::make_mut(&mut self.namespaces);
+        let previous = {
+            let ns = namespaces
+                .entry(namespace.into())
+                .or_insert_with(|| Namespace::new(namespace));
+            if ns.protected {
+                return Err(format!(
+                    "namespace '{}' is protected and cannot be modified",
+                    namespace
+                ));
+            }
+            ns.data_families.remove(name)
+        };
+        if let Some(previous) = previous {
+            for binding in previous.generated_bindings {
+                if let Some((binding_namespace, binding_name)) = binding.split_once('/')
+                    && let Some(binding_ns) = namespaces.get_mut(binding_namespace)
+                {
+                    binding_ns.undefine(binding_name);
+                }
+            }
+        }
+        namespaces
+            .get_mut(namespace)
+            .expect("family namespace was just created")
+            .data_families
+            .insert(name.into(), family);
+        Ok(())
+    }
+
+    pub fn is_data_family(&self, name: &str) -> bool {
+        let qualified = Self::qualify_data_family(name);
+        let Some((namespace, family)) = qualified.split_once('/') else {
+            return false;
+        };
+        self.namespaces
+            .get(namespace)
+            .is_some_and(|ns| ns.data_families.contains_key(family))
+    }
+
+    /// Undefine one exact qualified data family and its recorded constructors.
+    pub fn undefine_data_family(&mut self, family_name: &str) -> Result<(), String> {
+        let qualified = Self::qualify_data_family(family_name);
+        let (namespace, name) = qualified
+            .split_once('/')
+            .expect("qualified family always contains a namespace");
+        let namespaces = Arc::make_mut(&mut self.namespaces);
+        let ns = namespaces
+            .get_mut(namespace)
+            .ok_or_else(|| format!("data family '{}' not found", family_name))?;
         if ns.protected {
             return Err(format!(
                 "namespace '{}' is protected and cannot be modified",
                 namespace
             ));
         }
-        ns.data_families.insert(name.into(), family);
-        Ok(())
-    }
-
-    pub fn is_data_family(&self, name: &str) -> bool {
-        // Check if any namespace has a data family matching this name
-        // name can be "Foo" or "my/Foo"
-        for ns in self.namespaces.values() {
-            for fam_name in ns.data_families.keys() {
-                if fam_name == name || name.ends_with(fam_name) || fam_name.ends_with(name) {
-                    return true;
-                }
+        let family = ns
+            .data_families
+            .remove(name)
+            .ok_or_else(|| format!("data family '{}' not found", family_name))?;
+        for binding in family.generated_bindings {
+            if let Some((binding_namespace, binding_name)) = binding.split_once('/')
+                && let Some(binding_ns) = namespaces.get_mut(binding_namespace)
+            {
+                binding_ns.undefine(binding_name);
             }
         }
-        false
-    }
-
-    /// Undefine a data family, removing all its constructors atomically.
-    /// Undefine a data family, removing all its constructors atomically.
-    pub fn undefine_data_family(&mut self, family_name: &str) -> Result<(), String> {
-        let leaf = family_name
-            .split('/')
-            .next_back()
-            .unwrap_or(family_name)
-            .to_string();
-
-        // Check if this family exists in any namespace
-        let exists = self
-            .namespaces
-            .values()
-            .any(|ns| ns.data_families.contains_key(&leaf));
-        if !exists {
-            return Err(format!("data family '{}' not found", family_name));
-        }
-
-        // Remove constructors from user namespace by prefix
-        if let Some(user) = Arc::make_mut(&mut self.namespaces).get_mut("user") {
-            let prefix = format!("{}/", leaf);
-            user.bindings.retain(|k, _| !k.starts_with(&prefix));
-        }
-
-        // Remove the family metadata from all namespaces
-        for ns in Arc::make_mut(&mut self.namespaces).values_mut() {
-            ns.data_families.retain(|k, _| k != &leaf);
-        }
-
         Ok(())
     }
 }
