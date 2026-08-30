@@ -25,20 +25,7 @@ A Scheme-like Lisp with:
 | Pattern matching | `match` with constructor pattern destructuring |
 | Tagged values | `(Ok value)`, `(Err problem)`, `(Cancelled reason)`, `(Indeterminate problem)` |
 
-## Native Functions (41)
 
-**Arithmetic:** `+` `-` `*` `/` `<` `=` `>`
-**Lists:** `cons` `car` `cdr` `list`
-**I/O:** `display` `println` `read`
-**Types:** `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?`
-**Control:** `control/Continue` `control/CancelCurrent` `control/Error`
-**System:** `system/clock` `system/version` `system/interrupt` `system/clear-interrupt`
-**Persistence:** `system/snapshot` `system/event-log`
-**Inspection:** `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/source` `inspect/history`
-**Subagents:** `agent/call`
-**Shell:** `bash(cmd)` — the universal tool interface
-**Scheduling:** `wake(ms, action)` — fire-and-forget timer-based interrupts
-**Utilities:** `map/get` `vector/get`
 
 ## Design
 
@@ -86,3 +73,20 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 3. **Definitions persist.** Every `define` creates a new version. `undefine` removes the current binding without erasing history.
 4. **Snapshots are atomic.** You can never save mid-call. Recovery restores the exact pre-call state.
 5. **The kernel can always interrupt Lisp.** A safepoint mechanism checks every 1,000 expressions.
+
+## Native Functions
+
+| Category | Functions |
+|---|---|
+| Arithmetic | `+` `-` `*` `/` `<` `=` `>` |
+| Lists | `cons` `car` `cdr` `list` |
+| I/O | `display` `println` `read` |
+| Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
+| Control | `control/Continue` `control/CancelCurrent` `control/Error` |
+| System | `system/clock` `system/version` `system/interrupt` `system/clear-interrupt` |
+| Persistence | `system/snapshot` `system/event-log` |
+| Inspection | `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/source` `inspect/history` |
+| Subagents | `agent/call` |
+| Shell | `bash` |
+| Scheduling | `wake` |
+| Utilities | `map/get` `vector/get` `kernel/error` |
