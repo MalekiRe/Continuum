@@ -278,6 +278,28 @@ fn recent_results_and_total_context_are_bounded() {
 }
 
 #[test]
+fn context_budget_preserves_high_priority_guidance() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    let message_id = kernel.human_message("PRIORITY-HUMAN").unwrap();
+    kernel
+        .eval(r#"(memory/remember "priority" "PRIORITY-MEMORY")"#)
+        .unwrap();
+    kernel
+        .eval(r#"(context/add-hook "PRIORITY-HOOK")"#)
+        .unwrap();
+    for index in 0..100 {
+        kernel.append_transcript(&format!("action-{index}"), &"noise".repeat(10_000));
+    }
+    let request = scheduler.build_request(&kernel);
+    assert!(request.context.len() <= 62_000);
+    assert!(request.context.contains(&message_id));
+    assert!(request.context.contains("PRIORITY-HUMAN"));
+    assert!(request.context.contains("PRIORITY-MEMORY"));
+    assert!(request.context.contains("PRIORITY-HOOK"));
+}
+
+#[test]
 fn wake_timer_delivers_to_its_original_frame() {
     let mut kernel = Kernel::new();
     let root = kernel.frames[0].id.clone();
@@ -350,7 +372,10 @@ async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
         max_active: Arc::new(AtomicUsize::new(0)),
         started: Arc::new(tokio::sync::Notify::new()),
     };
-    let executor = Executor::new(ExecutorConfig::rooted(temp_root("model-cancel"))).unwrap();
+    let executor = Executor::new(ExecutorConfig::with_working_directory(temp_root(
+        "model-cancel",
+    )))
+    .unwrap();
     let scheduler = Scheduler::new(model.clone(), executor);
     let interrupt = scheduler.model_interrupt_handle();
     let mut kernel = Kernel::new();

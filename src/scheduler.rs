@@ -23,13 +23,20 @@ struct ContextBuilder {
 
 impl ContextBuilder {
     fn new(limit: usize) -> Self {
-        Self { text: String::with_capacity(limit), remaining: limit }
+        Self {
+            text: String::with_capacity(limit),
+            remaining: limit,
+        }
     }
 
     fn section(&mut self, heading: &str, body: &str, budget: usize) {
-        if body.is_empty() || self.remaining == 0 { return; }
+        if body.is_empty() || self.remaining == 0 {
+            return;
+        }
         let prefix = format!("\n# {heading}\n");
-        if prefix.len() >= self.remaining { return; }
+        if prefix.len() >= self.remaining {
+            return;
+        }
         self.text.push_str(&prefix);
         self.remaining -= prefix.len();
         let allowed = budget.min(self.remaining);
@@ -451,7 +458,10 @@ impl<M: ModelClient> Scheduler<M> {
     }
 
     pub fn build_request(&self, kernel: &Kernel) -> ModelRequest {
-        let frame = kernel.frames.last().expect("build_request requires a frame");
+        let frame = kernel
+            .frames
+            .last()
+            .expect("build_request requires a frame");
         let directive = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be top-level forms.\n";
         let mut context = ContextBuilder::new(MODEL_CONTEXT_LIMIT - directive.len());
 
@@ -459,7 +469,12 @@ impl<M: ModelClient> Scheduler<M> {
         for message in &frame.messages {
             match &message.id {
                 Some(id) => {
-                    let _ = writeln!(notices, "- Human message [{}]: {}", id, truncate(&message.text, 2_000));
+                    let _ = writeln!(
+                        notices,
+                        "- Human message [{}]: {}",
+                        id,
+                        truncate(&message.text, 2_000)
+                    );
                 }
                 None => {
                     let _ = writeln!(notices, "- {}", truncate(&message.text, 2_000));
@@ -470,7 +485,11 @@ impl<M: ModelClient> Scheduler<M> {
 
         let mut stack = String::new();
         for active in &kernel.frames {
-            let _ = writeln!(stack, "- {} [{}] {:?}", active.name, active.id, active.status);
+            let _ = writeln!(
+                stack,
+                "- {} [{}] {:?}",
+                active.name, active.id, active.status
+            );
         }
         context.section("Active frame stack", &stack, 4_000);
 
@@ -479,16 +498,30 @@ impl<M: ModelClient> Scheduler<M> {
             let _ = writeln!(guidance, "Hook: {}", truncate(hook, 2_000));
         }
         for entry in &frame.state.memory {
-            let _ = writeln!(guidance, "{}: {}", truncate(&entry.key, 200), truncate(&entry.value, 1_000));
+            let _ = writeln!(
+                guidance,
+                "{}: {}",
+                truncate(&entry.key, 200),
+                truncate(&entry.value, 1_000)
+            );
         }
         context.section("Context hooks and selected memory", &guidance, 12_000);
 
         let mut recent = String::new();
         for entry in &frame.state.transcript {
-            let _ = writeln!(recent, "> {}\n{}", truncate(&entry.source, 600), truncate(&entry.result, 1_200));
+            let _ = writeln!(
+                recent,
+                "> {}\n{}",
+                truncate(&entry.source, 600),
+                truncate(&entry.result, 1_200)
+            );
         }
         context.section("Recent Lisp actions and results", &recent, 24_000);
-        context.section("Earlier compacted context", &frame.state.compacted_context, 6_000);
+        context.section(
+            "Earlier compacted context",
+            &frame.state.compacted_context,
+            6_000,
+        );
 
         let mut library = String::new();
         for name in kernel.env.namespace_names() {
@@ -496,7 +529,7 @@ impl<M: ModelClient> Scheduler<M> {
             let _ = writeln!(library, "{}: {}", name, bindings.join(", "));
         }
         let _ = writeln!(library, "\nDefinitions with retained source:");
-        for (namespace, values) in &kernel.env.namespaces {
+        for (namespace, values) in kernel.env.namespaces.iter() {
             let mut names: Vec<_> = values.sources.keys().collect();
             names.sort();
             for name in names {
@@ -514,7 +547,6 @@ impl<M: ModelClient> Scheduler<M> {
             context: context.finish(directive),
         }
     }
-
 
     fn compact_current_frame(&self, kernel: &mut Kernel) {
         let Some(frame) = kernel.frames.last_mut() else {
