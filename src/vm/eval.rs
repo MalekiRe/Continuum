@@ -3,6 +3,7 @@ use crate::vm::env::{EnvRef, DataVariant, DataFamily};
 use crate::vm::reader;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
+pub static KERNEL: std::sync::atomic::AtomicPtr<crate::kernel::Kernel> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// Global interrupt flag — set by kernel to request interruption of Lisp evaluation.
 pub static EVAL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -859,7 +860,7 @@ fn apply(fun: Value, args: Vec<Value>, env: &mut EnvRef) -> Result<Value, EvalEr
             if arity > 0 && args.len() as u32 != arity {
                 return Err(EvalError::ArityMismatch { name, expected: arity, got: args.len() });
             }
-            (func)(args).map_err(|e| EvalError::UserError(e))
+            (func)(unsafe { &mut *KERNEL.load(std::sync::atomic::Ordering::Acquire) }, args).map_err(|e| EvalError::UserError(e))
         }
         Value::Function(Function::Constructor { family, variant, arity }) => {
             if arity > 0 && args.len() as u32 != arity {

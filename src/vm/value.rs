@@ -8,7 +8,7 @@ pub enum Function {
     Native {
         name: String,
         arity: u32,
-        func: fn(Vec<Value>) -> Result<Value, String>,
+        func: fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, String>,
     },
     Interpreted {
         params: Vec<String>,
@@ -69,7 +69,7 @@ impl<'de> Deserialize<'de> for Function {
                 Ok(Function::Native {
                     name,
                     arity,
-                    func: |_| Err("native function not available after deserialization; re-register it".into()),
+                    func: |_, _| Err("native function not available after deserialization; re-register it".into()),
                 })
             }
             "interpreted" => {

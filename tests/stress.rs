@@ -5,15 +5,18 @@ use persistent_lisp_harness::kernel;
 use std::time::Instant;
 
 /// Create a kernel with all tools registered.
-fn make_kernel() -> Kernel {
-    let mut k = Kernel::new();
-    k.register_tools();
-    k
+fn make_kernel() -> &'static mut Kernel {
+    let kernel = Kernel::new();
+    let leaked: &'static mut Kernel = Box::leak(Box::new(kernel));
+    persistent_lisp_harness::vm::eval::KERNEL.store(
+        leaked as *mut Kernel,
+        std::sync::atomic::Ordering::Release
+    );
+    leaked
 }
-
 #[test]
 fn stress_tail_recursion_deep() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     k.eval(r#"(define (count n) (if (= n 0) "done" (count (- n 1))))"#).unwrap();
     let start = Instant::now();
     let r = k.eval("(count 500)");
@@ -24,7 +27,7 @@ fn stress_tail_recursion_deep() {
 
 #[test]
 fn stress_many_definitions() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
     for i in 0..50 {
         let expr = format!("(define (fn{0} x) (+ x {0}))", i);
@@ -43,7 +46,7 @@ fn stress_many_definitions() {
 fn stress_many_snapshots() {
     // Reduce snapshot frequency by evaluating many expressions
     // and measuring the overhead
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
     for i in 0..20 {
         k.eval(&format!("(+ {} 1)", i)).unwrap();
@@ -55,7 +58,7 @@ fn stress_many_snapshots() {
 
 #[test]
 fn stress_big_closure_env() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     // Define 1000 functions first (bloats the env)
     for i in 0..20 {
@@ -76,7 +79,7 @@ fn stress_big_closure_env() {
 
 #[test]
 fn stress_mutual_tail_recursion() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     k.eval(r#"
         (define (even? n)
           (if (= n 0) #t (odd? (- n 1))))
@@ -94,7 +97,7 @@ fn stress_mutual_tail_recursion() {
 
 #[test]
 fn stress_deep_let_nesting() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
 
     // Build a deeply nested arithmetic expression to test the reader's recursion
@@ -114,7 +117,7 @@ fn stress_deep_let_nesting() {
 
 #[test]
 fn stress_human_messages() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
     for i in 0..20 {
         k.human_message(&format!("test message {}", i));
@@ -129,7 +132,7 @@ fn stress_human_messages() {
 
 #[test]
 fn stress_eval_errors_recover() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
     let mut errors = 0;
     for i in 0..20 {
@@ -150,8 +153,8 @@ fn stress_eval_errors_recover() {
 
 #[test]
 fn stress_wake_timers() {
-    let mut k = make_kernel();
-    kernel::set_kernel_hook(&mut k);
+    let k = make_kernel();
+    
 
     let start = Instant::now();
     for i in 0..20 {
@@ -169,7 +172,7 @@ fn stress_wake_timers() {
 
 #[test]
 fn stress_snapshot_then_continue() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     // Define things, snapshot, then define more things
     for i in 0..20 {
@@ -191,7 +194,7 @@ fn stress_snapshot_then_continue() {
 
 #[test]
 fn stress_namespace_growth() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
 
     // Define functions in different namespaces
@@ -209,7 +212,7 @@ fn stress_namespace_growth() {
 
 #[test]
 fn stress_define_data_large() {
-    let mut k = make_kernel();
+    let k = make_kernel();
     let start = Instant::now();
 
     // Define a data family with many variants
@@ -232,7 +235,7 @@ fn stress_define_data_large() {
 
 #[test]
 fn stress_continuous_cognition() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     // Define a simple cognition loop
     k.eval(r#"

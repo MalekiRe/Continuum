@@ -1,16 +1,20 @@
 
 use persistent_lisp_harness::Kernel;
+use std::boxed::Box;
 use persistent_lisp_harness::Value;
 
-fn make_kernel() -> Kernel {
-    let mut k = Kernel::new();
-    k.register_tools();
-    k
+fn make_kernel() -> &'static mut Kernel {
+    let kernel = Kernel::new();
+    let leaked: &'static mut Kernel = Box::leak(Box::new(kernel));
+    persistent_lisp_harness::vm::eval::KERNEL.store(
+        leaked as *mut Kernel,
+        std::sync::atomic::Ordering::Release
+    );
+    leaked
 }
-
 #[test]
 fn test_define_data_and_match() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     let r = k.eval(r#"(define-data result/Result (Ok value) (Err problem))"#);
     assert!(r.is_ok(), "define-data: {:?}", r.err());
@@ -37,7 +41,7 @@ fn test_define_data_and_match() {
 
 #[test]
 fn test_macro_syntax_rules() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     let r = k.eval(r#"
         (define-syntax my-when
@@ -61,7 +65,7 @@ fn test_macro_syntax_rules() {
 
 #[test]
 fn test_undefine_and_history() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     k.eval("(define x 10)").unwrap();
     k.eval("(define x 20)").unwrap();
@@ -75,7 +79,7 @@ fn test_undefine_and_history() {
 
 #[test]
 fn test_quasiquote_unquote() {
-    let mut k = make_kernel();
+    let k = make_kernel();
 
     let r = k.eval("(let ((x 42)) `(1 ,x 3))");
     assert!(r.is_ok());

@@ -13,12 +13,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn load_or_create_kernel() -> Kernel {
+fn load_or_create_kernel() -> &'static mut Kernel {
     if Path::new("snapshots").exists() {
         match Kernel::recover_from_latest() {
-            Ok(k) => {
+            Ok(mut k) => {
+                k.register_tools();
+                // Box and store in KERNEL for native access
+                let ptr = Box::leak(Box::new(k));
+                persistent_lisp_harness::vm::eval::KERNEL.store(ptr as *mut Kernel, std::sync::atomic::Ordering::Release);
                 println!("[kernel] recovered from snapshot");
-                return k;
+                return ptr;
             }
             Err(e) => {
                 println!("[kernel] recovery failed: {} — starting fresh", e);
@@ -28,8 +32,11 @@ fn load_or_create_kernel() -> Kernel {
     let mut k = Kernel::new();
     k.register_tools();
     let _ = std::fs::create_dir_all("data");
-    println!("[kernel] fresh start — version {}", k.version);
-    k
+    // Box and store in KERNEL for native access
+    let ptr = Box::leak(Box::new(k));
+    persistent_lisp_harness::vm::eval::KERNEL.store(ptr as *mut Kernel, std::sync::atomic::Ordering::Release);
+    println!("[kernel] fresh start — version {}", ptr.version);
+    ptr
 }
 
 /// Check for human messages from stdin. Returns true if exit was requested.
@@ -155,8 +162,7 @@ fn main() {
     println!("║  Type '!!exit' to quit.                     ║");
     println!("╚══════════════════════════════════════════════╝");
 
-    let mut kernel = load_or_create_kernel();
-    kernel::set_kernel_hook(&mut kernel);
+    let kernel = load_or_create_kernel();
 
     // Load agent core
     let agent_core = r#"
@@ -201,22 +207,22 @@ fn main() {
     let mut supervision_timer = Instant::now();
 
     loop {
-        if handle_human_input(&mut kernel, &rx) {
+        if handle_human_input(kernel, &rx) {
             break;
         }
-        check_hourly_snapshot(&mut kernel, &mut hourly_timer);
-        check_supervision(&mut kernel, &mut supervision_timer);
+        check_hourly_snapshot(kernel, &mut hourly_timer);
+        check_supervision(kernel, &mut supervision_timer);
 
 
-        if maybe_restart_agent(&mut kernel) {
+        if maybe_restart_agent(kernel) {
             continue;
         }
-        handle_subagent_result(&mut kernel);
+        handle_subagent_result(kernel);
 
-        if handle_waiting_frame(&mut kernel) {
+        if handle_waiting_frame(kernel) {
             continue;
         }
 
-        run_cognition_turn(&mut kernel);
+        run_cognition_turn(kernel);
     }
 }

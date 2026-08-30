@@ -9,39 +9,7 @@ use crate::vm::eval;
 use crate::vm::value::Value;
 use crate::vm::value::Function;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 
-thread_local! {
-    /// Thread-local kernel pointer for native function access.
-    /// Single-threaded: no locks or atomics needed.
-    static KERNEL_PTR: RefCell<*mut Kernel> = const { RefCell::new(std::ptr::null_mut()) };
-}
-
-/// Set the global kernel hook (called during initialization).
-pub fn set_kernel_hook(k: &mut Kernel) {
-    KERNEL_PTR.with(|cell| *cell.borrow_mut() = k as *mut Kernel);
-}
-
-/// Get access to the kernel from a native function.
-pub fn with_kernel<F, R>(f: F) -> Result<R, String>
-where
-    F: FnOnce(&mut Kernel) -> Result<R, String>,
-{
-    KERNEL_PTR.with(|cell| {
-        let ptr = *cell.borrow();
-        if ptr.is_null() {
-            return Err("kernel hook not set".to_string());
-        }
-        // SAFETY: ptr comes from &mut Kernel in set_kernel_hook.
-    // Kernel lives on the stack in main() for the entire process lifetime.
-    // Single-threaded: no concurrent access.
-    let kernel = unsafe { &mut *ptr };
-        f(kernel)
-    })
-}
-
-/// The Persistent Agent Lisp Harness Kernel.
-/// A scheduled wake-up call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WakeEntry {
     pub wake_at: String,
@@ -144,7 +112,7 @@ impl Kernel {
 
         };
 
-        kernel.register_natives();
+        kernel.register_tools();
 
         let root_frame = Frame {
             id: format!("frame-{}", kernel.next_frame_id),
@@ -166,9 +134,6 @@ impl Kernel {
         // Create data directory
         let _ = std::fs::create_dir_all("data");
         let _ = std::fs::create_dir_all("snapshots");
-
-        // Set up kernel hook for system-level natives
-        // (We create a temporary reference that lives for the kernel's lifetime)
 
         kernel
     }
@@ -463,7 +428,7 @@ impl Kernel {
             .map_err(|e| format!("cannot deserialize kernel: {}", e))?;
 
         // Re-register native function pointers (they can't survive serialization)
-        kernel.register_natives();
+        kernel.register_tools();
 
         // Queue (system/Restarted) event for every active frame
         let downtime = chrono::Utc::now().to_rfc3339();
@@ -487,12 +452,9 @@ impl Kernel {
 
     // ---- Registration ----
 
-    pub fn register_natives(&mut self) {
-        // Now delegates to register_tools (all natives are registered there)
-        self.register_tools();
-    }
+    
 
-    fn define_native(&mut self, qualified_name: &str, arity: u32, func: fn(Vec<Value>) -> Result<Value, String>) {
+    fn define_native(&mut self, qualified_name: &str, arity: u32, func: fn(&mut Kernel, Vec<Value>) -> Result<Value, String>) {
         let val = Value::Function(Function::Native {
             name: qualified_name.to_string(),
             arity,
