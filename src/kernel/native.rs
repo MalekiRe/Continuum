@@ -307,8 +307,15 @@ impl Kernel {
         
 
         self.define_native("string-append", 2, |_kernel, args| {
-            let result = format!("{}{}", args[0], args[1]);
-            Ok(Value::string(&result))
+            let a = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            let b = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => format!("{}", other),
+            };
+            Ok(Value::string(&format!("{}{}", a, b)))
         });
         self.define_native("nth", 2, |_kernel, args| {
             let idx = match &args[0] {
@@ -491,6 +498,24 @@ self.define_native("kernel/error", 1, |_kernel, args| {
                     None => Err(format!("no binding for {}", name)),
                 }
         });
+        
+        self.define_native("extract-lisp", 1, |_kernel, args| {
+            let text = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("extract-lisp: expected string, got {}", other)),
+            };
+            let start_tag = "<lisp>";
+            let end_tag = "</lisp>";
+            if let Some(start) = text.find(start_tag) {
+                let content_start = start + start_tag.len();
+                if let Some(end) = text[content_start..].find(end_tag) {
+                    let content = text[content_start..content_start + end].trim().to_string();
+                    return Ok(Value::string(&content));
+                }
+            }
+            Ok(Value::Nil)
+        });
+
         self.define_native("eval-code", 1, |_kernel, args| {
             let source = match &args[0] {
                 Value::String(s) => s.clone(),
@@ -502,8 +527,14 @@ self.define_native("kernel/error", 1, |_kernel, args| {
             }
         });
         self.define_native("string-search", 2, |_kernel, args| {
-            let needle = format!("{}", args[0]);
-            let haystack = format!("{}", args[1]);
+            let needle = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string-search: expected string needle, got {}", other)),
+            };
+            let haystack = match &args[1] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("string-search: expected string haystack, got {}", other)),
+            };
             if let Some(i) = haystack.find(&needle) {
                 Ok(Value::Int(i as i64))
             } else {
@@ -511,7 +542,10 @@ self.define_native("kernel/error", 1, |_kernel, args| {
             }
         });
         self.define_native("substring", 3, |_kernel, args| {
-            let s = format!("{}", args[0]);
+            let s = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("substring: expected string, got {}", other)),
+            };
             let start = match &args[1] {
                 Value::Int(i) => *i as usize,
                 _ => return Err("substring: expected integer start".into()),

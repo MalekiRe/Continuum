@@ -161,6 +161,19 @@ pub fn eval_value(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
 
 // ---- Special forms ----
 
+
+/// Evaluate a value, handling TailCall by following the trampoline.
+fn eval_any(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
+    let mut current = val;
+    loop {
+        match eval_step(current, kernel) {
+            Ok(StepResult::Done(v)) => return Ok(v),
+            Ok(StepResult::Step(next)) => { current = next; continue; }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("define requires arguments".into()));
@@ -171,7 +184,7 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
             if args.len() != 2 {
                 return Err(EvalError::InvalidForm(format!("define: expected (define name value), got {} args", args.len())));
             }
-            let val = eval_value(args[1].clone(), kernel)?;
+            let val = eval_any(args[1].clone(), kernel)?;
             if !name.contains('/') {
                 kernel.env.define(&format!("user/{}", name), val).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
@@ -408,7 +421,7 @@ fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
         Value::Symbol(s) => s.clone(),
         other => return Err(EvalError::InvalidForm(format!("set!: expected symbol, got {}", other))),
     };
-    let val = eval_value(args[1].clone(), kernel)?;
+    let val = eval_any(args[1].clone(), kernel)?;
 
     // Check lexical frames first
     for frame in kernel.env.frames.iter_mut().rev() {
