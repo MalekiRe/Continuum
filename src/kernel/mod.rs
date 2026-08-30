@@ -9,20 +9,17 @@ use crate::vm::eval;
 use crate::vm::value::Value;
 use crate::vm::value::Function;
 use serde::{Deserialize, Serialize};
-use std::sync::{OnceLock, Mutex};
+use std::cell::RefCell;
 
-/// Kernel pointer wrapper that is Send+Sync (single-threaded REPL usage).
-pub struct KernelPtr(*mut Kernel);
-unsafe impl Send for KernelPtr {}
-unsafe impl Sync for KernelPtr {}
-
-/// Global reference to the running kernel, for natives that need kernel access.
-static KERNEL_HOOK: OnceLock<Mutex<KernelPtr>> = OnceLock::new();
+thread_local! {
+    /// Thread-local kernel pointer for native function access.
+    /// Single-threaded: no locks or atomics needed.
+    static KERNEL_PTR: RefCell<*mut Kernel> = const { RefCell::new(std::ptr::null_mut()) };
+}
 
 /// Set the global kernel hook (called during initialization).
 pub fn set_kernel_hook(k: &mut Kernel) {
-    let ptr = KernelPtr(k as *mut Kernel);
-    KERNEL_HOOK.get_or_init(|| Mutex::new(ptr));
+    KERNEL_PTR.with(|cell| *cell.borrow_mut() = k as *mut Kernel);
 }
 
 /// Get access to the kernel from a native function.
@@ -30,13 +27,14 @@ pub fn with_kernel<F, R>(f: F) -> Result<R, String>
 where
     F: FnOnce(&mut Kernel) -> Result<R, String>,
 {
-    let lock = KERNEL_HOOK.get().ok_or_else(|| "kernel hook not set".to_string())?;
-    let ptr = lock.lock().map_err(|e| format!("lock error: {}", e))?.0;
-    if ptr.is_null() {
-        return Err("kernel hook is null".to_string());
-    }
-    let kernel = unsafe { &mut *ptr };
-    f(kernel)
+    KERNEL_PTR.with(|cell| {
+        let ptr = *cell.borrow();
+        if ptr.is_null() {
+            return Err("kernel hook not set".to_string());
+        }
+        let kernel = unsafe { &mut *ptr };
+        f(kernel)
+    })
 }
 
 /// The Persistent Agent Lisp Harness Kernel.

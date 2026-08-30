@@ -26,44 +26,177 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
+enum ParserState {
+    List(Vec<Value>),
+    Vector(Vec<Value>),
+    Map { pairs: Vec<(Value, Value)>, expect_key: bool, current_key: Option<Value> },
+}
+
 pub fn read_one(input: &str) -> Result<(Value, &str), ReadError> {
     let input = skip_whitespace_and_comments(input);
     if input.is_empty() {
         return Err(ReadError::UnexpectedEof("expected a value".into()));
     }
 
-    let ch = input.chars().next().unwrap();
-    if ch == '(' {
-        read_list(&input[1..])
-    } else if ch == ')' {
-        Err(ReadError::InvalidSyntax("unexpected ')'".into()))
-    } else if ch == '\'' {
-        let (val, rest) = read_one(&input[1..])?;
-        Ok((Value::list(vec![Value::symbol("quote"), val]), rest))
-    } else if ch == '`' {
-        let (val, rest) = read_one(&input[1..])?;
-        Ok((Value::list(vec![Value::symbol("quasiquote"), val]), rest))
-    } else if ch == ',' {
-        if input.len() > 1 && input.as_bytes()[1] == b'@' {
-            let (val, rest) = read_one(&input[2..])?;
-            Ok((Value::list(vec![Value::symbol("unquote-splicing"), val]), rest))
-        } else {
-            let (val, rest) = read_one(&input[1..])?;
-            Ok((Value::list(vec![Value::symbol("unquote"), val]), rest))
+    let mut stack: Vec<ParserState> = Vec::new();
+    let mut rest = input;
+
+    loop {
+        rest = skip_whitespace_and_comments(rest);
+        if rest.is_empty() {
+            return match stack.last() {
+                Some(ParserState::List(_)) => Err(ReadError::UnmatchedParen),
+                Some(ParserState::Vector(_)) => Err(ReadError::UnmatchedBracket),
+                Some(ParserState::Map { .. }) => Err(ReadError::UnmatchedBrace),
+                None => Err(ReadError::UnexpectedEof("expected a value".into())),
+            };
         }
-    } else if ch == '#' {
-        read_dispatch(&input[1..])
-    } else if ch == ':' {
-        let (name, rest) = read_raw_symbol(&input[1..])?;
-        Ok((Value::Keyword(name), rest))
-    } else if ch == '"' {
-        read_string(&input[1..])
-    } else if ch == '{' {
-        read_map(&input[1..])
-    } else if ch == '[' {
-        read_vector(&input[1..])
-    } else {
-        read_atom(input)
+
+        let ch = rest.chars().next().unwrap();
+
+        if ch == '(' {
+            stack.push(ParserState::List(Vec::new()));
+            rest = &rest[1..];
+            continue;
+        }
+
+        if ch == '[' {
+            stack.push(ParserState::Vector(Vec::new()));
+            rest = &rest[1..];
+            continue;
+        }
+
+        if ch == '{' {
+            stack.push(ParserState::Map { pairs: Vec::new(), expect_key: true, current_key: None });
+            rest = &rest[1..];
+            continue;
+        }
+
+        if ch == ')' {
+            match stack.pop() {
+                Some(ParserState::List(items)) => {
+                    let val = Value::List(items);
+                    rest = &rest[1..];
+                    if stack.is_empty() { return Ok((val, rest)); }
+                    append_to_parent(&mut stack, val)?;
+                    continue;
+                }
+                _ => return Err(ReadError::InvalidSyntax("unexpected ')'".into())),
+            }
+        }
+
+        if ch == ']' {
+            match stack.pop() {
+                Some(ParserState::Vector(items)) => {
+                    let val = Value::Vector(items);
+                    rest = &rest[1..];
+                    if stack.is_empty() { return Ok((val, rest)); }
+                    append_to_parent(&mut stack, val)?;
+                    continue;
+                }
+                _ => return Err(ReadError::InvalidSyntax("unexpected ']'".into())),
+            }
+        }
+
+        if ch == '}' {
+            match stack.pop() {
+                Some(ParserState::Map { pairs, .. }) => {
+                    let mut map = HashMap::new();
+                    for (k, v) in pairs { map.insert(k, v); }
+                    let val = Value::Map(map);
+                    rest = &rest[1..];
+                    if stack.is_empty() { return Ok((val, rest)); }
+                    append_to_parent(&mut stack, val)?;
+                    continue;
+                }
+                _ => return Err(ReadError::InvalidSyntax("unexpected '}'".into())),
+            }
+        }
+
+        if ch == '\'' {
+            let (val, new_rest) = read_one(&rest[1..])?;
+            let quoted = Value::list(vec![Value::symbol("quote"), val]);
+            rest = new_rest;
+            if stack.is_empty() { return Ok((quoted, rest)); }
+            append_to_parent(&mut stack, quoted)?;
+            continue;
+        }
+
+        if ch == '`' {
+            let (val, new_rest) = read_one(&rest[1..])?;
+            let qq = Value::list(vec![Value::symbol("quasiquote"), val]);
+            rest = new_rest;
+            if stack.is_empty() { return Ok((qq, rest)); }
+            append_to_parent(&mut stack, qq)?;
+            continue;
+        }
+
+        if ch == ',' {
+            if rest.len() > 1 && rest.as_bytes()[1] == b'@' {
+                let (val, new_rest) = read_one(&rest[2..])?;
+                let unq = Value::list(vec![Value::symbol("unquote-splicing"), val]);
+                rest = new_rest;
+                if stack.is_empty() { return Ok((unq, rest)); }
+                append_to_parent(&mut stack, unq)?;
+            } else {
+                let (val, new_rest) = read_one(&rest[1..])?;
+                let unq = Value::list(vec![Value::symbol("unquote"), val]);
+                rest = new_rest;
+                if stack.is_empty() { return Ok((unq, rest)); }
+                append_to_parent(&mut stack, unq)?;
+            }
+            continue;
+        }
+
+        if ch == '#' {
+            let (val, new_rest) = read_dispatch(&rest[1..])?;
+            rest = new_rest;
+            if stack.is_empty() { return Ok((val, rest)); }
+            append_to_parent(&mut stack, val)?;
+            continue;
+        }
+
+        if ch == ':' {
+            let (name, new_rest) = read_raw_symbol(&rest[1..])?;
+            let val = Value::Keyword(name);
+            rest = new_rest;
+            if stack.is_empty() { return Ok((val, rest)); }
+            append_to_parent(&mut stack, val)?;
+            continue;
+        }
+
+        if ch == '"' {
+            let (val, new_rest) = read_string(&rest[1..])?;
+            rest = new_rest;
+            if stack.is_empty() { return Ok((val, rest)); }
+            append_to_parent(&mut stack, val)?;
+            continue;
+        }
+
+        let (val, new_rest) = read_atom(rest)?;
+        rest = new_rest;
+        if stack.is_empty() { return Ok((val, rest)); }
+        append_to_parent(&mut stack, val)?;
+    }
+}
+
+fn append_to_parent(stack: &mut Vec<ParserState>, val: Value) -> Result<(), ReadError> {
+    match stack.last_mut() {
+        Some(ParserState::List(items)) => { items.push(val); Ok(()) }
+        Some(ParserState::Vector(items)) => { items.push(val); Ok(()) }
+        Some(ParserState::Map { pairs, expect_key, current_key }) => {
+            if *expect_key {
+                *current_key = Some(val);
+                *expect_key = false;
+            } else {
+                if let Some(key) = current_key.take() {
+                    pairs.push((key, val));
+                }
+                *expect_key = true;
+            }
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 
@@ -72,9 +205,7 @@ pub fn read_all(input: &str) -> Result<Vec<Value>, ReadError> {
     let mut rest = input;
     loop {
         rest = skip_whitespace_and_comments(rest);
-        if rest.is_empty() {
-            break;
-        }
+        if rest.is_empty() { break; }
         let (val, new_rest) = read_one(rest)?;
         results.push(val);
         rest = new_rest;
@@ -89,76 +220,12 @@ fn skip_whitespace_and_comments<'a>(input: &'a str) -> &'a str {
         if bytes[i].is_ascii_whitespace() {
             i += 1;
         } else if bytes[i] == b';' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
+            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
         } else {
             break;
         }
     }
     &input[i..]
-}
-
-fn read_list(input: &str) -> Result<(Value, &str), ReadError> {
-    let mut items = Vec::new();
-    let mut rest = input;
-    loop {
-        rest = skip_whitespace_and_comments(rest);
-        if rest.is_empty() {
-            return Err(ReadError::UnmatchedParen);
-        }
-        if rest.starts_with(')') {
-            return Ok((Value::List(items), &rest[1..]));
-        }
-        if rest.starts_with('.') && rest.len() > 1 && rest.as_bytes()[1].is_ascii_whitespace() {
-            return Err(ReadError::InvalidSyntax(
-                "dotted pairs not supported; use proper list syntax".into()));
-        }
-        let (val, new_rest) = read_one(rest)?;
-        items.push(val);
-        rest = new_rest;
-    }
-}
-
-fn read_vector(input: &str) -> Result<(Value, &str), ReadError> {
-    let mut items = Vec::new();
-    let mut rest = input;
-    loop {
-        rest = skip_whitespace_and_comments(rest);
-        if rest.is_empty() {
-            return Err(ReadError::UnmatchedBracket);
-        }
-        if rest.starts_with(']') {
-            return Ok((Value::Vector(items), &rest[1..]));
-        }
-        let (val, new_rest) = read_one(rest)?;
-        items.push(val);
-        rest = new_rest;
-    }
-}
-
-fn read_map(input: &str) -> Result<(Value, &str), ReadError> {
-    let mut map = HashMap::new();
-    let mut rest = input;
-    let mut expect_key = true;
-    let mut key = None;
-    loop {
-        rest = skip_whitespace_and_comments(rest);
-        if rest.is_empty() {
-            return Err(ReadError::UnmatchedBrace);
-        }
-        if rest.starts_with('}') {
-            return Ok((Value::Map(map), &rest[1..]));
-        }
-        let (val, new_rest) = read_one(rest)?;
-        if expect_key {
-            key = Some(val);
-        } else {
-            map.insert(key.take().unwrap(), val);
-        }
-        expect_key = !expect_key;
-        rest = new_rest;
-    }
 }
 
 fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
@@ -171,8 +238,7 @@ fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
         'f' => Ok((Value::Bool(false), &input[1..])),
         '\\' => {
             if input.len() >= 2 {
-                let char_lit = input.as_bytes()[1] as char;
-                Ok((Value::string(&char_lit.to_string()), &input[2..]))
+                Ok((Value::string(&input[1..2]), &input[2..]))
             } else {
                 Err(ReadError::UnexpectedEof("expected character after #\\".into()))
             }
@@ -180,17 +246,17 @@ fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
         'x' => {
             let (raw, rest) = read_raw_symbol(&input[1..])?;
             i64::from_str_radix(&raw, 16).map(|n| (Value::Int(n), rest))
-                .map_err(|_| ReadError::InvalidSyntax(format!("invalid hex number: #x{}", raw)))
+                .map_err(|_| ReadError::InvalidSyntax(format!("invalid hex: #x{}", raw)))
         }
         'o' => {
             let (raw, rest) = read_raw_symbol(&input[1..])?;
             i64::from_str_radix(&raw, 8).map(|n| (Value::Int(n), rest))
-                .map_err(|_| ReadError::InvalidSyntax(format!("invalid octal number: #o{}", raw)))
+                .map_err(|_| ReadError::InvalidSyntax(format!("invalid octal: #o{}", raw)))
         }
         'b' => {
             let (raw, rest) = read_raw_symbol(&input[1..])?;
             i64::from_str_radix(&raw, 2).map(|n| (Value::Int(n), rest))
-                .map_err(|_| ReadError::InvalidSyntax(format!("invalid binary number: #b{}", raw)))
+                .map_err(|_| ReadError::InvalidSyntax(format!("invalid binary: #b{}", raw)))
         }
         _ => Err(ReadError::UnknownDispatch(format!("#{}", ch))),
     }
@@ -222,24 +288,20 @@ fn read_string(input: &str) -> Result<(Value, &str), ReadError> {
 
 fn read_atom(input: &str) -> Result<(Value, &str), ReadError> {
     let (raw, rest) = read_raw_symbol(input)?;
-
     if let Ok(n) = raw.parse::<i64>() {
         return Ok((Value::Int(n), rest));
     }
-
     if raw.contains('.') || raw.contains('e') || raw.contains('E') {
         if let Ok(f) = raw.parse::<f64>() {
             return Ok((Value::Float(f), rest));
         }
     }
-
     match raw.as_str() {
         "nil" => return Ok((Value::Nil, rest)),
         "#t" | "true" => return Ok((Value::Bool(true), rest)),
         "#f" | "false" => return Ok((Value::Bool(false), rest)),
         _ => {}
     }
-
     Ok((Value::Symbol(raw), rest))
 }
 

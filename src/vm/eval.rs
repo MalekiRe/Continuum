@@ -24,6 +24,14 @@ pub fn check_safepoint() -> Result<(), EvalError> {
     Ok(())
 }
 
+/// Result of a single evaluation step.
+/// Step(expr) means evaluate expr next (tail call).
+/// Done(val) means evaluation completed.
+pub enum StepResult {
+    Done(Value),
+    Step(Value),
+}
+
 #[derive(Debug)]
 pub enum EvalError {
     UndefinedSymbol(String),
@@ -59,20 +67,24 @@ impl std::fmt::Display for EvalError {
 
 impl std::error::Error for EvalError {}
 
+/// Evaluate one step, converting TailCall to StepResult.
+fn eval_step(val: Value, env: &mut EnvRef) -> Result<StepResult, EvalError> {
+    match eval_value(val, env) {
+        Ok(v) => Ok(StepResult::Done(v)),
+        Err(EvalError::TailCall(expr)) => Ok(StepResult::Step(expr)),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn eval(input: &str, env: &mut EnvRef) -> Result<Value, EvalError> {
     let exprs = reader::read_all(input).map_err(|e| EvalError::SyntaxError(e.to_string()))?;
     let mut result = Value::Nil;
     for expr in exprs {
         let mut current = expr;
-        // Pass env directly — no clone needed. eval_value modifies env in place.
-        // TailCall signals "continue with current env" (frames already swapped in).
         loop {
-            match eval_value(current, env) {
-                Ok(v) => { result = v; break; }
-                Err(EvalError::TailCall(next_expr)) => {
-                    current = next_expr;
-                    continue;
-                }
+            match eval_step(current, env) {
+                Ok(StepResult::Done(v)) => { result = v; break; }
+                Ok(StepResult::Step(next)) => { current = next; continue; }
                 Err(e) => return Err(e),
             }
         }
