@@ -1,7 +1,10 @@
+use async_trait::async_trait;
 use persistent_lisp_harness::{
-    Executor, ExecutorConfig, Kernel, ModelClient, ModelRequest, Scheduler, TurnOutcome,
+    Executor, ExecutorConfig, Kernel, ModelClient, ModelError, ModelRequest, Scheduler, TurnOutcome,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct FakeModel {
@@ -20,14 +23,19 @@ impl FakeModel {
     }
 }
 
+#[async_trait]
 impl ModelClient for FakeModel {
-    fn complete(&self, request: ModelRequest) -> Result<String, String> {
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<String, ModelError> {
         self.requests.lock().unwrap().push(request);
         self.replies
             .lock()
             .unwrap()
             .pop()
-            .ok_or_else(|| "no fake reply".into())
+            .ok_or_else(|| ModelError::Client("no fake reply".into()))
     }
 }
 
@@ -43,36 +51,37 @@ fn scheduler(replies: &[&str]) -> (Scheduler<FakeModel>, FakeModel) {
     (Scheduler::new(model.clone(), executor), model)
 }
 
-#[test]
-fn model_bash_result_enters_next_context() {
+#[tokio::test]
+async fn model_bash_result_enters_next_context() {
     let (scheduler, model) = scheduler(&[
         r#"(bash "printf hello")"#,
         "(define git/status 42)",
         "git/status",
     ]);
     let mut kernel = Kernel::new();
-    let first = scheduler.run_turn(&mut kernel).unwrap();
+    let first = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(
         matches!(first, TurnOutcome::ToolCompleted { ref result, .. } if result.contains("hello"))
     );
-    scheduler.run_turn(&mut kernel).unwrap();
-    let requests = model.requests.lock().unwrap();
-    assert!(
-        requests[1].context.contains("hello"),
-        "next context omitted bash result"
-    );
-    drop(requests);
-    let third = scheduler.run_turn(&mut kernel).unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            requests[1].context.contains("hello"),
+            "next context omitted bash result"
+        );
+    }
+    let third = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(matches!(third, TurnOutcome::Evaluated { ref result, .. } if result == "42"));
 }
 
-#[test]
-fn human_message_is_seen_then_explicitly_replied_to() {
+#[tokio::test]
+async fn human_message_is_seen_then_explicitly_replied_to() {
     let mut kernel = Kernel::new();
     let id = kernel.human_message("question").unwrap();
     let reply = format!(r#"(message/reply "{}" "answer")"#, id);
     let (scheduler, model) = scheduler(&[&reply]);
-    let outcome = scheduler.run_turn(&mut kernel).unwrap();
+    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
     assert_eq!(
         outcome,
         TurnOutcome::Replied {
@@ -85,15 +94,15 @@ fn human_message_is_seen_then_explicitly_replied_to() {
     assert!(kernel.frames.last().unwrap().messages.is_empty());
 }
 
-#[test]
-fn subagent_gets_own_context_and_returns_to_parent() {
+#[tokio::test]
+async fn subagent_gets_own_context_and_returns_to_parent() {
     let (scheduler, model) = scheduler(&[
         r#"(agent/call "researcher" "inspect the build")"#,
         r#"(agent/return "done")"#,
     ]);
     let mut kernel = Kernel::new();
     let parent = kernel.frames[0].id.clone();
-    let first = scheduler.run_turn(&mut kernel).unwrap();
+    let first = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(matches!(first, TurnOutcome::Spawned { ref parent_id, .. } if parent_id == &parent));
     assert_eq!(kernel.frames.len(), 2);
     assert!(
@@ -109,7 +118,7 @@ fn subagent_gets_own_context_and_returns_to_parent() {
         kernel.frames[0].status,
         persistent_lisp_harness::FrameStatus::Waiting
     );
-    let second = scheduler.run_turn(&mut kernel).unwrap();
+    let second = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(
         matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "\"done\"")
     );
@@ -155,8 +164,8 @@ fn model_must_emit_exactly_one_form() {
     );
 }
 
-#[test]
-fn transcript_compacts_chronologically() {
+#[tokio::test]
+async fn transcript_compacts_chronologically() {
     let (mut scheduler, _) = scheduler(&["nil"]);
     scheduler.transcript_limit = 4;
     scheduler.compact_batch = 2;
@@ -164,7 +173,7 @@ fn transcript_compacts_chronologically() {
     for i in 0..5 {
         kernel.append_transcript(&format!("form-{}", i), &format!("result-{}", i));
     }
-    scheduler.run_turn(&mut kernel).unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
     let state = &kernel.frames[0].state;
     assert!(state.compacted_context.contains("form-0"));
     assert!(state.compacted_context.contains("form-1"));
@@ -172,8 +181,8 @@ fn transcript_compacts_chronologically() {
     assert_eq!(state.transcript.last().unwrap().source, "nil");
 }
 
-#[test]
-fn selected_memory_and_context_hooks_are_injected() {
+#[tokio::test]
+async fn selected_memory_and_context_hooks_are_injected() {
     let (scheduler, model) = scheduler(&["nil"]);
     let mut kernel = Kernel::new();
     kernel
@@ -182,18 +191,18 @@ fn selected_memory_and_context_hooks_are_injected() {
     kernel
         .eval(r#"(context/add-hook "Prefer tests before edits")"#)
         .unwrap();
-    scheduler.run_turn(&mut kernel).unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
     let request = &model.requests.lock().unwrap()[0];
     assert!(request.context.contains("project: Continuum"));
     assert!(request.context.contains("Prefer tests before edits"));
 }
 
-#[test]
-fn scheduler_resumes_pending_tool_without_new_model_call() {
+#[tokio::test]
+async fn scheduler_resumes_pending_tool_without_new_model_call() {
     let (scheduler, model) = scheduler(&[]);
     let mut kernel = Kernel::new();
     kernel.eval(r#"(bash "printf resumed")"#).unwrap();
-    let outcome = scheduler.run_turn(&mut kernel).unwrap();
+    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(
         matches!(outcome, TurnOutcome::ToolCompleted { ref result, .. } if result.contains("resumed"))
     );
@@ -201,8 +210,8 @@ fn scheduler_resumes_pending_tool_without_new_model_call() {
     assert!(!kernel.has_trap());
 }
 
-#[test]
-fn definition_is_recalled_after_ten_model_turns() {
+#[tokio::test]
+async fn definition_is_recalled_after_ten_model_turns() {
     let mut replies = vec![r#"(define git/status (lambda () "clean"))"#];
     replies.extend(std::iter::repeat_n("nil", 9));
     replies.push("(git/status)");
@@ -210,7 +219,7 @@ fn definition_is_recalled_after_ten_model_turns() {
     let mut kernel = Kernel::new();
     let mut last = None;
     for _ in 0..11 {
-        last = Some(scheduler.run_turn(&mut kernel).unwrap());
+        last = Some(scheduler.run_turn(&mut kernel).await.unwrap());
     }
     assert!(
         matches!(last, Some(TurnOutcome::Evaluated { ref result, .. }) if result == "\"clean\"")
@@ -221,29 +230,29 @@ fn definition_is_recalled_after_ten_model_turns() {
     assert!(requests[10].context.contains("(define git/status"));
 }
 
-#[test]
-fn malformed_model_output_is_recorded_for_self_correction() {
+#[tokio::test]
+async fn malformed_model_output_is_recorded_for_self_correction() {
     let (scheduler, model) = scheduler(&["```lisp\nnil\n```", "nil"]);
     let mut kernel = Kernel::new();
-    let first = scheduler.run_turn(&mut kernel).unwrap();
+    let first = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(
         matches!(first, TurnOutcome::Evaluated { ref result, .. } if result.contains("raw Lisp"))
     );
-    scheduler.run_turn(&mut kernel).unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
     let requests = model.requests.lock().unwrap();
     assert!(requests[1].context.contains("```lisp"));
     assert!(requests[1].context.contains("raw Lisp"));
 }
 
-#[test]
-fn pending_human_message_survives_until_valid_reply() {
+#[tokio::test]
+async fn pending_human_message_survives_until_valid_reply() {
     let mut kernel = Kernel::new();
     let id = kernel.human_message("do not lose me").unwrap();
     let reply = format!(r#"(message/reply "{}" "done")"#, id);
     let (scheduler, _) = scheduler(&["nil", &reply]);
-    scheduler.run_turn(&mut kernel).unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(kernel.has_pending_message(&id));
-    scheduler.run_turn(&mut kernel).unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(!kernel.has_pending_message(&id));
 }
 
@@ -292,4 +301,82 @@ fn wake_timer_delivers_to_its_original_frame() {
             .iter()
             .any(|message| message.text == "wake-root")
     );
+}
+
+#[derive(Clone)]
+struct PendingFirstModel {
+    calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+}
+
+struct ActiveCall(Arc<AtomicUsize>);
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl ModelClient for PendingFirstModel {
+    async fn complete(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<String, ModelError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        let _active_call = ActiveCall(Arc::clone(&self.active));
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.started.notify_one();
+            std::future::pending().await
+        } else {
+            Ok("nil".into())
+        }
+    }
+}
+
+#[tokio::test]
+async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
+    let model = PendingFirstModel {
+        calls: Arc::new(AtomicUsize::new(0)),
+        active: Arc::new(AtomicUsize::new(0)),
+        max_active: Arc::new(AtomicUsize::new(0)),
+        started: Arc::new(tokio::sync::Notify::new()),
+    };
+    let executor = Executor::new(ExecutorConfig::rooted(temp_root("model-cancel"))).unwrap();
+    let scheduler = Scheduler::new(model.clone(), executor);
+    let interrupt = scheduler.model_interrupt_handle();
+    let mut kernel = Kernel::new();
+
+    let first = scheduler.run_turn(&mut kernel);
+    let cancel = async {
+        model.started.notified().await;
+        assert!(interrupt.request_interrupt());
+    };
+    let (first_result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::join!(first, cancel)
+    })
+    .await
+    .expect("cancelled generation did not stop");
+    assert_eq!(
+        first_result.unwrap_err(),
+        "model request interrupted by human input"
+    );
+    assert_eq!(model.active.load(Ordering::SeqCst), 0);
+    assert!(!interrupt.request_interrupt());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        scheduler.run_turn(&mut kernel),
+    )
+    .await
+    .expect("next generation did not start")
+    .unwrap();
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(model.max_active.load(Ordering::SeqCst), 1);
+    assert_eq!(model.active.load(Ordering::SeqCst), 0);
 }

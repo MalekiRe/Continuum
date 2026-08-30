@@ -1,12 +1,11 @@
 use crate::executor::{ExecutionResult, Executor};
 use crate::kernel::{FrameStatus, Kernel, TranscriptEntry, VmTrap};
 use crate::vm::reader;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, mpsc};
-
-static MODEL_HTTP: LazyLock<reqwest::blocking::Client> =
-    LazyLock::new(reqwest::blocking::Client::new);
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
@@ -14,8 +13,40 @@ pub struct ModelRequest {
     pub context: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    #[error("model request interrupted by human input")]
+    Cancelled,
+    #[error("OPENROUTER_API_KEY is not set")]
+    MissingApiKey,
+    #[error("model request: {0}")]
+    Request(#[source] reqwest::Error),
+    #[error("model response body: {0}")]
+    ResponseBody(#[source] reqwest::Error),
+    #[error("model HTTP {status} returned invalid JSON: {source}")]
+    InvalidJson {
+        status: reqwest::StatusCode,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("model HTTP {status}: {message}")]
+    Http {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+    #[error("model response contained no content")]
+    MissingContent,
+    #[error("{0}")]
+    Client(String),
+}
+
+#[async_trait]
 pub trait ModelClient: Send + Sync {
-    fn complete(&self, request: ModelRequest) -> Result<String, String>;
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String, ModelError>;
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +54,7 @@ pub struct OpenRouterModel {
     pub model: String,
     pub max_tokens: u32,
     pub timeout: std::time::Duration,
+    client: reqwest::Client,
 }
 
 impl Default for OpenRouterModel {
@@ -32,87 +64,148 @@ impl Default for OpenRouterModel {
                 .unwrap_or_else(|_| "deepseek/deepseek-v4-flash".into()),
             max_tokens: 600,
             timeout: std::time::Duration::from_secs(60),
+            client: reqwest::Client::new(),
         }
     }
 }
 
-static MODEL_RUNNING: AtomicBool = AtomicBool::new(false);
-static MODEL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-pub fn request_model_interrupt() -> bool {
-    MODEL_RUNNING.load(Ordering::Acquire) && !MODEL_INTERRUPTED.swap(true, Ordering::AcqRel)
-}
-
-fn openrouter_request(
-    model: String,
-    max_tokens: u32,
-    timeout: std::time::Duration,
-    api_key: String,
-    request: ModelRequest,
-) -> Result<String, String> {
-    let response = MODEL_HTTP
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .timeout(timeout)
-        .bearer_auth(api_key)
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.context}
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.4
-        }))
-        .send()
-        .map_err(|error| format!("model request: {}", error))?;
-    let status = response.status();
-    let raw = response
-        .text()
-        .map_err(|error| format!("model response body: {}", error))?;
-    let body: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("model HTTP {} returned invalid JSON: {}", status, error))?;
-    if !status.is_success() {
-        let message = body
-            .pointer("/error/message")
+impl OpenRouterModel {
+    async fn openrouter_request(
+        &self,
+        api_key: String,
+        request: ModelRequest,
+    ) -> Result<String, ModelError> {
+        let response = self
+            .client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .timeout(self.timeout)
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": request.system},
+                    {"role": "user", "content": request.context}
+                ],
+                "max_tokens": self.max_tokens,
+                "temperature": 0.4
+            }))
+            .send()
+            .await
+            .map_err(ModelError::Request)?;
+        let status = response.status();
+        let raw = response.text().await.map_err(ModelError::ResponseBody)?;
+        let body: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|source| ModelError::InvalidJson { status, source })?;
+        if !status.is_success() {
+            let message = body
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(ModelError::Http { status, message });
+        }
+        body.pointer("/choices/0/message/content")
             .and_then(|value| value.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("model HTTP {}: {}", status, message));
+            .map(str::to_owned)
+            .ok_or(ModelError::MissingContent)
     }
-    body.pointer("/choices/0/message/content")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| "model response contained no content".into())
 }
 
+#[async_trait]
 impl ModelClient for OpenRouterModel {
-    fn complete(&self, request: ModelRequest) -> Result<String, String> {
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .map_err(|_| "OPENROUTER_API_KEY is not set".to_string())?;
-        MODEL_INTERRUPTED.store(false, Ordering::Release);
-        MODEL_RUNNING.store(true, Ordering::Release);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let (model, max_tokens, timeout) = (self.model.clone(), self.max_tokens, self.timeout);
-        std::thread::spawn(move || {
-            let _ = sender.send(openrouter_request(
-                model, max_tokens, timeout, api_key, request,
-            ));
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String, ModelError> {
+        if cancellation.is_cancelled() {
+            return Err(ModelError::Cancelled);
+        }
+        let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| ModelError::MissingApiKey)?;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ModelError::Cancelled),
+            result = self.openrouter_request(api_key, request) => result,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ModelInterruptHandle {
+    active: Arc<Mutex<Option<ActiveModelRequest>>>,
+}
+
+impl ModelInterruptHandle {
+    /// Cancels the request currently owned by this scheduler, if any.
+    pub fn request_interrupt(&self) -> bool {
+        let active = self.active.lock().unwrap();
+        let Some(active) = active.as_ref() else {
+            return false;
+        };
+        if active.cancellation.is_cancelled() {
+            false
+        } else {
+            active.cancellation.cancel();
+            true
+        }
+    }
+}
+
+struct ActiveModelRequest {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+struct ModelRuntime {
+    gate: tokio::sync::Mutex<()>,
+    active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    next_generation: AtomicU64,
+}
+
+impl ModelRuntime {
+    fn new() -> Self {
+        Self {
+            gate: tokio::sync::Mutex::new(()),
+            active: Arc::new(Mutex::new(None)),
+            next_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn interrupt_handle(&self) -> ModelInterruptHandle {
+        ModelInterruptHandle {
+            active: Arc::clone(&self.active),
+        }
+    }
+
+    fn activate(&self) -> ActiveRequestGuard {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let cancellation = CancellationToken::new();
+        *self.active.lock().unwrap() = Some(ActiveModelRequest {
+            generation,
+            cancellation: cancellation.clone(),
         });
-        loop {
-            if MODEL_INTERRUPTED.swap(false, Ordering::AcqRel) {
-                MODEL_RUNNING.store(false, Ordering::Release);
-                return Err("model request interrupted by human input".into());
-            }
-            match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(result) => {
-                    MODEL_RUNNING.store(false, Ordering::Release);
-                    return result;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    MODEL_RUNNING.store(false, Ordering::Release);
-                    return Err("model request worker stopped unexpectedly".into());
-                }
-            }
+        ActiveRequestGuard {
+            active: Arc::clone(&self.active),
+            generation,
+            cancellation,
+        }
+    }
+}
+
+struct ActiveRequestGuard {
+    active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|request| request.generation == self.generation)
+        {
+            *active = None;
         }
     }
 }
@@ -145,7 +238,8 @@ pub enum TurnOutcome {
 }
 
 pub struct Scheduler<M: ModelClient> {
-    pub model: M,
+    model: M,
+    model_runtime: ModelRuntime,
     pub executor: Executor,
     pub transcript_limit: usize,
     pub compact_batch: usize,
@@ -155,13 +249,29 @@ impl<M: ModelClient> Scheduler<M> {
     pub fn new(model: M, executor: Executor) -> Self {
         Self {
             model,
+            model_runtime: ModelRuntime::new(),
             executor,
             transcript_limit: 20,
             compact_batch: 20,
         }
     }
 
-    pub fn run_turn(&self, kernel: &mut Kernel) -> Result<TurnOutcome, String> {
+    pub fn model_interrupt_handle(&self) -> ModelInterruptHandle {
+        self.model_runtime.interrupt_handle()
+    }
+
+    async fn complete_model(&self, request: ModelRequest) -> Result<String, ModelError> {
+        let _generation_gate = self.model_runtime.gate.lock().await;
+        let active = self.model_runtime.activate();
+        let cancellation = active.cancellation.clone();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ModelError::Cancelled),
+            result = self.model.complete(request, cancellation.clone()) => result,
+        }
+    }
+
+    pub async fn run_turn(&self, kernel: &mut Kernel) -> Result<TurnOutcome, String> {
         let Some(frame) = kernel.frames.last() else {
             return Ok(TurnOutcome::Idle);
         };
@@ -176,7 +286,9 @@ impl<M: ModelClient> Scheduler<M> {
                 kernel.clear_trap();
                 kernel.frames.last_mut().unwrap().status = FrameStatus::Running;
             } else {
-                return self.handle_trap(kernel, frame_id, pending, ":resumed".into());
+                return self
+                    .handle_trap(kernel, frame_id, pending, ":resumed".into())
+                    .await;
             }
         }
         if kernel
@@ -188,7 +300,10 @@ impl<M: ModelClient> Scheduler<M> {
         }
 
         self.compact_current_frame(kernel);
-        let raw = self.model.complete(self.build_request(kernel))?;
+        let raw = self
+            .complete_model(self.build_request(kernel))
+            .await
+            .map_err(|error| error.to_string())?;
         let source = match normalize_one_form(&raw) {
             Ok(source) => source,
             Err(error) => {
@@ -210,7 +325,7 @@ impl<M: ModelClient> Scheduler<M> {
         }
 
         if let Some(pending) = kernel.pending_trap() {
-            return self.handle_trap(kernel, frame_id, pending, displayed);
+            return self.handle_trap(kernel, frame_id, pending, displayed).await;
         }
         kernel.append_transcript_to(&frame_id, &source, &displayed);
         Ok(TurnOutcome::Evaluated {
@@ -220,7 +335,7 @@ impl<M: ModelClient> Scheduler<M> {
         })
     }
 
-    fn handle_trap(
+    async fn handle_trap(
         &self,
         kernel: &mut Kernel,
         frame_id: String,
@@ -245,11 +360,11 @@ impl<M: ModelClient> Scheduler<M> {
             }
             VmTrap::CallModel { prompt } => {
                 let result = self
-                    .model
-                    .complete(ModelRequest {
+                    .complete_model(ModelRequest {
                         system: "Return a concise string result for the calling Lisp agent.".into(),
                         context: prompt,
                     })
+                    .await
                     .unwrap_or_else(|error| format!("error: {}", error));
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);

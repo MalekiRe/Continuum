@@ -1,7 +1,7 @@
 //! Continuum: a model inhabiting a persistent Lisp world.
 
 use persistent_lisp_harness::{
-    Executor, ExecutorConfig, Kernel, OpenRouterModel, Scheduler, TurnOutcome,
+    Executor, ExecutorConfig, Kernel, ModelInterruptHandle, OpenRouterModel, Scheduler, TurnOutcome,
 };
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
@@ -90,7 +90,11 @@ fn deliver_human(kernel: &mut Kernel, text: String) {
     }
 }
 
-fn start_input_thread(tx: mpsc::Sender<String>, executor: Executor) {
+fn start_input_thread(
+    tx: mpsc::Sender<String>,
+    executor: Executor,
+    model_interrupt: ModelInterruptHandle,
+) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
             let line = line.trim().to_string();
@@ -99,7 +103,7 @@ fn start_input_thread(tx: mpsc::Sender<String>, executor: Executor) {
             }
             // Any human intervention cancels an in-flight shell process group.
             persistent_lisp_harness::vm::eval::request_interrupt();
-            persistent_lisp_harness::scheduler::request_model_interrupt();
+            model_interrupt.request_interrupt();
             executor.cancel();
             if tx.send(line).is_err() {
                 break;
@@ -138,7 +142,7 @@ fn chat_html() -> String {
         .collect()
 }
 
-fn start_http(tx: mpsc::Sender<String>, executor: Executor) {
+fn start_http(tx: mpsc::Sender<String>, executor: Executor, model_interrupt: ModelInterruptHandle) {
     let logs = LOG_BUF.clone();
     thread::spawn(move || {
         let server = tiny_http::Server::http("0.0.0.0:8080").expect("HTTP listen failed");
@@ -185,7 +189,7 @@ fn start_http(tx: mpsc::Sender<String>, executor: Executor) {
                         .into_owned();
                     if !message.is_empty() {
                         persistent_lisp_harness::vm::eval::request_interrupt();
-                        persistent_lisp_harness::scheduler::request_model_interrupt();
+                        model_interrupt.request_interrupt();
                         executor.cancel();
                         let _ = tx.send(message);
                     }
@@ -202,7 +206,8 @@ fn start_http(tx: mpsc::Sender<String>, executor: Executor) {
     });
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let _ = dotenvy::dotenv();
     slog("Continuum v0.2 — persistent context → model Lisp action → result");
     let mut kernel = load_kernel().unwrap_or_else(|error| {
@@ -226,9 +231,10 @@ fn main() {
         std::process::exit(2);
     });
     let scheduler = Scheduler::new(OpenRouterModel::default(), executor.clone());
+    let model_interrupt = scheduler.model_interrupt_handle();
     let (tx, rx) = mpsc::channel();
-    start_input_thread(tx.clone(), executor.clone());
-    start_http(tx, executor);
+    start_input_thread(tx.clone(), executor.clone(), model_interrupt.clone());
+    start_http(tx, executor, model_interrupt);
 
     let mut snapshot_timer = Instant::now();
     loop {
@@ -249,7 +255,7 @@ fn main() {
             snapshot_timer = Instant::now();
         }
 
-        match scheduler.run_turn(&mut kernel) {
+        match scheduler.run_turn(&mut kernel).await {
             Ok(TurnOutcome::Evaluated { source, result, .. }) => {
                 slog(format!("[lisp] {} => {}", source, result));
             }
@@ -266,10 +272,10 @@ fn main() {
                 add_chat("agent", text.clone());
                 slog(format!("[agent] {}", text));
             }
-            Ok(TurnOutcome::Idle) => thread::sleep(Duration::from_millis(50)),
+            Ok(TurnOutcome::Idle) => tokio::time::sleep(Duration::from_millis(50)).await,
             Err(error) => {
                 slog(format!("[turn] {}", error));
-                thread::sleep(Duration::from_secs(1));
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }

@@ -11,4 +11,7 @@ pub use vm::{
     env::EnvRef, eval::EvalError, reader::ReadError, value::Function, value::Macro, value::Value,
 };
 
-pub use scheduler::{ModelClient, ModelRequest, OpenRouterModel, Scheduler, TurnOutcome};
+pub use scheduler::{
+    ModelClient, ModelError, ModelInterruptHandle, ModelRequest, OpenRouterModel, Scheduler,
+    TurnOutcome,
+};
