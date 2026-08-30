@@ -244,7 +244,7 @@ fn main() {
         (define (agent/cognize msg)
           (let ((response (model/chat msg)))
             (println response)
-            msg))
+            response))
     "#;
 
     // Route all Lisp output through the log buffer
