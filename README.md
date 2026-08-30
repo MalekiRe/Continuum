@@ -1,109 +1,89 @@
 # Continuum
 
-Continuum is a persistent Lisp world driven by a model-owned action loop:
+A **continuously existing agent** whose computer is a persistent Lisp world.
 
-```text
-persistent frame context
-  → model emits exactly one Lisp form
-  → kernel evaluates it transactionally
-  → form and result enter the same frame transcript
-  → next model turn
+```
+Model/AI
+  ↕
+Lisp environment (continuum)
+  ↕
+bash — the universal tool interface
+  ↕
+Files, processes, network, everything else
 ```
 
-The model is not called by `agent/step`. Rust's scheduler owns model invocation, context assembly, tool traps, child-frame scheduling, transcript compaction, and snapshots.
+The kernel is the Lisp VM. It provides 52 native functions — arithmetic, list operations, type predicates, I/O, persistence, inspection, model operations, and `bash`. File I/O, web requests, git, package management, and other computer interaction go through `bash`; Rust's scheduler owns model inference and external suspension. The agent defines its own tools in Lisp.
 
-## Quick start
+## Language
+
+A Scheme-like Lisp with:
+
+| Special forms | `define`, `lambda`, `if`, `begin`, `let`, `let*`, `letrec`, `set!`, `quote`, `quasiquote`, `undefine` |
+|---|---|
+| Macros | `define-syntax` with `syntax-rules` (including `...` ellipsis for variable-length patterns) |
+| Data types | `define-data` for tagged value families with automatic constructor functions |
+| Pattern matching | `match` with constructor pattern destructuring |
+| Tagged values | `(Ok value)`, `(Err problem)`, `(Cancelled reason)`, `(Indeterminate problem)` |
+
+## Design
+
+**Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — human input sets it while Lisp is running, and evaluation terminates at the next safepoint.
+
+**Scheduling.** Rust owns the continuous model → Lisp → evaluation loop. Each model response must be exactly one raw Lisp form. Forms and results enter the active frame's bounded transcript, which is included in the next model context. External suspension operations such as `bash`, `model/call`, and `agent/call` must be top-level.
+
+**Tail call optimization.** Calls in actual tail position reuse the evaluator trampoline instead of growing the Rust stack, enabling unbounded tail recursion while preserving non-tail callers.
+
+**Closures only capture frames, not namespaces.** Closures retain stable IDs into a serializable lexical heap. Namespaces are shared by reference at call time, avoiding O(n) serialization cost per closure.
+
+**Subagents.** Top-level `(agent/call "name" "request")` pushes a child frame with its own model context, transcript, memory, and messages. A top-level `(agent/return value)` pops the child and delivers the result to its parent. Only one evaluation runs at a time.
+
+**Human interaction.** Messages are persisted in frame context and interrupt active model, Lisp, or shell work. A message remains pending until the agent explicitly answers it with `(message/reply "message-id" "answer")`.
+
+**Snapshots.** Every snapshot serializes the full kernel state to a checksummed JSON envelope. Recovery tries snapshots newest-first, falls back across corrupt files, and never replays execution. Writes use a synced temporary file and atomic rename, and the newest 48 snapshots are retained. After recovery, every active frame receives a restart notice. Existing v2 snapshots remain readable.
+
+**Wake timers.** `(wake ms action)` schedules `action` to be delivered to the originating frame as context after `ms` milliseconds. Timers are checked once per cognition loop iteration.
+
+## Quick Start
 
 ```bash
 export OPENROUTER_API_KEY=...
 cargo run
 ```
 
-Optional configuration:
-
-```bash
-export CONTINUUM_MODEL=deepseek/deepseek-v4-flash
-export CONTINUUM_AGENT_ROOT=$PWD/data/workspace
-```
-
-The HTTP UI listens on `http://localhost:8080`.
-
-## Turn model
-
-Each active frame persists:
-
-- immutable-ish agent instructions;
-- its own recent Lisp transcript;
-- chronological compacted context;
-- pending human/task messages;
-- selected key/value memory;
-- context hooks;
-- retained definition source;
-- pending top-level suspension traps.
-
-Model output must parse as exactly one Lisp form. Multiple operations can be grouped with `(begin ...)` only when none needs external suspension.
-
-Human messages are injected into the active frame context and answered explicitly with:
+Starts a continuous agent and an HTTP UI at `http://localhost:8080`. The agent lives until `!!exit`. Type a message in the terminal or web UI; the model responds by emitting exactly one Lisp form at a time. The Lisp language includes:
 
 ```lisp
-(message/reply "message-id" "answer")
+(+ 1 2) ; => 3
+(bash "echo hello")
+(define-data result/Result (Ok value) (Err problem))
+(match (user/result/Result/Ok 42)
+  ((result/Result/Ok n) (+ n 1))
+  ((result/Result/Err msg) -1)) ; => 43
 ```
 
-## External operations
+Snapshots happen automatically. Recover from a crash with `cargo run` — it auto-detects the latest valid snapshot. If snapshot files exist but none is valid, startup stops with a continuity error instead of silently starting over.
 
-These forms must be top-level until the VM has a fully general serializable continuation stack:
+## Principles
 
-```lisp
-(bash "git status")
-(model/call "focused model subtask")
-(agent/call "researcher" "inspect the build")
-(agent/return value)
-(message/reply "message-id" "text")
-```
+1. **Kernel is minimal.** Only what the VM needs to function. Everything else is Lisp.
+2. **`bash` is the universal computer interface.** File I/O, web requests, network calls — all go through shell commands. There are no built-in Lisp HTTP, file, or JSON APIs; the Rust scheduler separately handles model and suspension operations. The configured working directory is not an OS-level filesystem sandbox.
+3. **Definitions persist.** Every `define` creates a new version. `undefine` removes the current binding without erasing the bounded history.
+4. **Snapshots are atomic.** The kernel is never saved mid-evaluation. Recovery restores a consistent top-level state, including frame transcripts, messages, closures, and pending external operations.
 
-The scheduler handles the resulting trap and puts the external result in the frame transcript. The next model turn sees that result.
+## Native Functions
 
-`bash` uses actual Bash with a fixed working directory, one owned process group, bounded concurrently-drained output, live progress, a timeout, and external cancellation. Concurrent runs are rejected and background descendants are killed and reaped. Human input can interrupt an active Lisp evaluation, model request, or shell command.
-
-The working directory is an execution root, not a filesystem sandbox: commands can still address absolute host paths. Use an OS/container sandbox when running untrusted agents.
-
-## Lisp VM guarantees
-
-- Top-level evaluation is transactional across namespaces, frames, wake timers, and lexical-heap allocation.
-- Tail calls are optimized only in actual tail position; caller lexical frames are restored after the trampoline completes.
-- Closures store stable lexical-heap IDs rather than serialized JSON environments.
-- Maps have deterministic insertion/evaluation order and order-independent canonical hashing.
-- `system`, `control`, `inspect`, and `kernel` namespaces are protected by exact identity.
-- Definition source is retained in the namespace and exposed by `source/get`.
-
-## Subagents
-
-A top-level `agent/call` marks the parent Waiting and pushes a child frame with independent instructions, messages, transcript, compaction, and selected memory. The scheduler runs the child until top-level `agent/return`, then pops it, records the result in the parent transcript, and wakes the parent.
-
-## Memory and context
-
-```lisp
-(memory/remember "project" "Continuum")
-(memory/forget "project")
-(memory/list)
-(context/add-hook "Prefer tests before edits")
-(context/clear-hooks)
-(transcript/recent 10)
-```
-
-Transcript compaction is chronological and bounded. There is deliberately no end-to-end event log.
-
-## Snapshots
-
-Snapshots use one strict versioned envelope with an embedded SHA-256 checksum. They are written through a synced temporary file, atomic rename, and directory sync. Recovery tries snapshots newest-first, verifies checksums, falls back across corrupt/truncated files, restores transcripts/frame stacks/closure heap/pending traps, and re-registers native functions without polluting binding history. The writer retains the newest 48 snapshots; recovery remains compatible with v2 full/incremental envelopes.
-
-If snapshot files exist and none is valid, startup exits with a continuity violation instead of silently creating a fresh kernel.
-
-## Tests
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
-
-Behavioral coverage includes the model→Lisp feedback loop with a fake model, human replies, subagent scheduling, source rollback, transcript compaction, shell timeout/cancellation/process groups/output bounds, real snapshot recovery/fallback/checksums, closure recovery, map hash contracts, tail-call correctness, and transactional evaluation.
+| Category | Functions |
+|---|---|
+| Arithmetic | `+` `-` `*` `/` `<` `=` `>` |
+| Lists | `cons` `car` `cdr` `list` `append` `nth` `length` |
+| I/O | `display` `println` `read` |
+| Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
+| System | `system/clock` `system/version` |
+| Model and messages | `model/call` `human/wait` `message/reply` |
+| Persistence and context | `memory/remember` `memory/forget` `memory/list` `context/add-hook` `context/clear-hooks` `transcript/recent` |
+| Source and inspection | `source/get` `source/list` `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/history` |
+| Subagents | `agent/call` `agent/return` |
+| Shell | `bash` |
+| Scheduling | `sleep` `wake` |
+| Strings | `string-append` `string-search` `substring` |
+| Utilities | `map/get` `vector/get` `kernel/error` |
