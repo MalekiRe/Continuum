@@ -121,12 +121,12 @@ pub struct SupervisionConfig {
 impl Default for SupervisionConfig {
     fn default() -> Self {
         SupervisionConfig {
-            window_seconds: 60,
+            window_seconds: 1800,
             min_tokens_per_sec: 2,
-            min_elapsed_seconds: 30,
+            min_elapsed_seconds: 120,
             max_eval_seconds: 900,
             expected_tokens_per_sec: 10,
-            timeout_multiplier: 4,
+            timeout_multiplier: 6,
         }
     }
 }

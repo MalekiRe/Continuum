@@ -29,9 +29,9 @@ A Scheme-like Lisp with:
 
 **Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
 
-**Supervision.** Every cognition loop iteration checks two timeouts:
-- **Absolute timeout** (default 900s): if a top-level eval runs too long, it's interrupted unconditionally.
-- **Rolling-window token check**: Lisp reports token usage via `(system/report-tokens N)` after model calls. Reports are tracked in a 60-second sliding window. If the effective token rate drops below 2 tok/s and the eval has been running for at least 30s, the supervisor interrupts. This catches agents stuck in blocking `bash` calls — even if they reported tokens minutes ago. All thresholds are configurable via `SupervisionConfig` on the kernel.
+**Supervision.** Every cognition loop iteration checks:
+- **Absolute timeout** (default 900s): if a top-level eval runs too long, it's interrupted unconditionally. Catches truly stuck agents.
+- **Efficiency check** (configurable, starts after 120s): token reports from Lisp (`(system/report-tokens N)`) are tracked in a 30-minute sliding window. If elapsed time exceeds 6x the expected time at 10 tok/s, the supervisor delivers a `system/SupervisorNotice` to the agent suggesting it optimize its approach. This is an advisory, not an interrupt — the agent can choose to continue or adjust its strategy. If zero tokens have been reported for 5+ minutes, a notice suggests the agent may be stuck in a blocking tool call.
 
 **Tail call optimization.** Single-expression function bodies reuse the current frame instead of pushing a new one, enabling unbounded recursion without stack growth.
 

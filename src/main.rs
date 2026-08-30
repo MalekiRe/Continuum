@@ -106,7 +106,7 @@ fn check_supervision(kernel: &mut Kernel) {
     let elapsed = (now - started_at).num_seconds() as u64;
     let cfg = &kernel.supervision;
 
-    // 1. Absolute timeout — unconditional
+    // 1. Absolute timeout — hard interrupt, agent is stuck
     if elapsed >= cfg.max_eval_seconds {
         println!("[supervisor] eval ran for {}s — interrupting (max {})", 
             elapsed, cfg.max_eval_seconds);
@@ -114,7 +114,7 @@ fn check_supervision(kernel: &mut Kernel) {
         return;
     }
 
-    // 2. Rolling window check — only after min_elapsed_seconds
+    // 2. Efficiency check — only after min_elapsed_seconds
     if elapsed < cfg.min_elapsed_seconds {
         return;
     }
@@ -131,28 +131,39 @@ fn check_supervision(kernel: &mut Kernel) {
 
     // Sum tokens in the window
     let window_tokens: u64 = kernel.token_reports.iter().map(|(_, n)| n).sum();
-    let effective_tok_per_sec = if cfg.window_seconds > 0 {
-        window_tokens / cfg.window_seconds
+
+    // Expected seconds based on tokens at expected_tokens_per_sec
+    let expected_secs = if cfg.expected_tokens_per_sec > 0 {
+        window_tokens / cfg.expected_tokens_per_sec
     } else {
         0
     };
+    let actual_elapsed = elapsed - cfg.min_elapsed_seconds;
 
-    // If below min_tokens_per_sec, we might be stuck in a blocking call
-    if effective_tok_per_sec < cfg.min_tokens_per_sec {
-        // Double-check with lifetime rate: if lifetime rate is also low, we're stuck
-        let lifetime_expected_secs = window_tokens / cfg.expected_tokens_per_sec;
-        if lifetime_expected_secs > 0 && elapsed > lifetime_expected_secs * cfg.timeout_multiplier {
-            println!("[supervisor] {}s elapsed, {}/s rolling tok rate (min {}), {} lifetime tokens — interrupting",
-                elapsed, effective_tok_per_sec, cfg.min_tokens_per_sec, window_tokens);
-            persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-        } else if window_tokens == 0 && elapsed >= cfg.min_elapsed_seconds * 2 {
-            // No tokens at all for a long time — definitely stuck
-            println!("[supervisor] {}s elapsed with zero tokens reported — interrupting", elapsed);
-            persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // If elapsed >> expected, agent is spending disproportionate time on tool calls
+    // vs. thinking. This doesn't mean stuck — it means inefficient.
+    // We deliver an advisory message suggesting optimization.
+    if expected_secs > 0 && actual_elapsed > expected_secs * cfg.timeout_multiplier {
+        println!("[supervisor] {}s elapsed, {} tokens in window (expected ~{}s at {} tok/s)",
+            elapsed, window_tokens, expected_secs, cfg.expected_tokens_per_sec);
+        println!("[supervisor] token rate is low — agent may benefit from optimizing tool usage");
+        if let Some(frame) = kernel.frames.last_mut() {
+            frame.message_queue.push(
+                r#"(system/SupervisorNotice "Token rate is low. Consider optimizing your approach — batch bash calls, reduce unnecessary testing, or iterate more efficiently.")"#.into()
+            );
+        }
+    }
+
+    // No tokens at all for a long time — probably stuck in a blocking call
+    if window_tokens == 0 && actual_elapsed >= 300 {
+        println!("[supervisor] {}s elapsed with zero tokens reported — may be stuck", elapsed);
+        if let Some(frame) = kernel.frames.last_mut() {
+            frame.message_queue.push(
+                r#"(system/SupervisorNotice "No tokens have been reported for a long time. If you are waiting on a tool call, consider whether it has hung.")"#.into()
+            );
         }
     }
 }
-
 /// Run one cognition turn for the agent.
 fn run_cognition_turn(kernel: &mut Kernel) {
     let has_pending = kernel
