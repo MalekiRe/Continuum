@@ -1,6 +1,6 @@
 
 
-use persistent_lisp_harness::{Kernel, EnvRef};
+use persistent_lisp_harness::Kernel;
 
 use persistent_lisp_harness::Value;
 
@@ -12,11 +12,11 @@ use std::time::Instant;
 
 /// Create a kernel with all tools registered.
 
-fn make_kernel() -> (&'static mut Kernel, EnvRef) {
+fn make_kernel() -> &'static mut Kernel {
 
-    let (k, env) = Kernel::new();
+    let k = Kernel::new();
 
-    (Box::leak(Box::new(k)), env)
+    Box::leak(Box::new(k))
 
 }
 
@@ -24,13 +24,13 @@ fn make_kernel() -> (&'static mut Kernel, EnvRef) {
 
 fn stress_tail_recursion_deep() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
-    k.eval(r#"(define (count n) (if (= n 0) "done" (count (- n 1))))"#, &mut env).unwrap();
+    k.eval(r#"(define (count n) (if (= n 0) "done" (count (- n 1))))"#).unwrap();
 
     let start = Instant::now();
 
-    let r = k.eval("(count 500)", &mut env);
+    let r = k.eval("(count 500)");
 
     let elapsed = start.elapsed();
 
@@ -46,7 +46,7 @@ fn stress_tail_recursion_deep() {
 
 fn stress_many_definitions() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
@@ -54,7 +54,7 @@ fn stress_many_definitions() {
 
         let expr = format!("(define (fn{0} x) (+ x {0}))", i);
 
-        k.eval(&expr, &mut env).unwrap();
+        k.eval(&expr).unwrap();
 
     }
 
@@ -66,7 +66,7 @@ fn stress_many_definitions() {
 
     // Verify a few mid-range
 
-    let r = k.eval("(fn25 10)", &mut env);
+    let r = k.eval("(fn25 10)");
 
     assert!(r.is_ok());
 
@@ -84,13 +84,13 @@ fn stress_many_snapshots() {
 
     // and measuring the overhead
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
     for i in 0..20 {
 
-        k.eval(&format!("(+ {} 1)", i), &mut env).unwrap();
+        k.eval(&format!("(+ {} 1)", i)).unwrap();
 
     }
 
@@ -108,7 +108,7 @@ fn stress_many_snapshots() {
 
 fn stress_big_closure_env() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
 
 
@@ -116,7 +116,7 @@ fn stress_big_closure_env() {
 
     for i in 0..20 {
 
-        k.eval(&format!("(define (g{} x) (+ x {}))", i, i), &mut env).unwrap();
+        k.eval(&format!("(define (g{} x) (+ x {}))", i, i)).unwrap();
 
     }
 
@@ -124,7 +124,7 @@ fn stress_big_closure_env() {
 
     // Now define a simple closure and call it
 
-    k.eval("(define (identity x) x)", &mut env).unwrap();
+    k.eval("(define (identity x) x)").unwrap();
 
 
 
@@ -132,7 +132,7 @@ fn stress_big_closure_env() {
 
     for _ in 0..20 {
 
-        k.eval("(identity 42)", &mut env).unwrap();
+        k.eval("(identity 42)").unwrap();
 
     }
 
@@ -150,7 +150,7 @@ fn stress_big_closure_env() {
 
 fn stress_mutual_tail_recursion() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     k.eval(r#"
 
@@ -162,7 +162,7 @@ fn stress_mutual_tail_recursion() {
 
           (if (= n 0) #f (even? (- n 1))))
 
-    "#, &mut env).unwrap();
+    "#).unwrap();
 
 
 
@@ -170,7 +170,7 @@ fn stress_mutual_tail_recursion() {
 
     let start = Instant::now();
 
-    let r = k.eval("(even? 500)", &mut env);
+    let r = k.eval("(even? 500)");
 
     let elapsed = start.elapsed();
 
@@ -188,7 +188,7 @@ fn stress_mutual_tail_recursion() {
 
 fn stress_deep_let_nesting() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
@@ -208,7 +208,7 @@ fn stress_deep_let_nesting() {
 
 
 
-    let r = k.eval(&expr, &mut env);
+    let r = k.eval(&expr);
 
     let elapsed = start.elapsed();
 
@@ -228,7 +228,7 @@ fn stress_deep_let_nesting() {
 
 fn stress_human_messages() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
@@ -258,7 +258,7 @@ fn stress_human_messages() {
 
 fn stress_eval_errors_recover() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
@@ -270,13 +270,13 @@ fn stress_eval_errors_recover() {
 
         if i % 2 == 0 {
 
-            let r = k.eval("(+ 1 2)", &mut env);
+            let r = k.eval("(+ 1 2)");
 
             assert!(r.is_ok());
 
         } else {
 
-            let r = k.eval("(undefined-symbol)", &mut env);
+            let r = k.eval("(undefined-symbol)");
 
             if r.is_err() {
 
@@ -300,7 +300,7 @@ fn stress_eval_errors_recover() {
 
 fn stress_wake_timers() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     
 
@@ -310,7 +310,7 @@ fn stress_wake_timers() {
 
     for i in 0..20 {
 
-        k.eval(&format!("(wake 10000 '(bash \"echo hello\"))"), &mut env).unwrap();
+        k.eval(&format!("(wake 10000 '(bash \"echo hello\"))")).unwrap();
 
     }
 
@@ -338,7 +338,7 @@ fn stress_wake_timers() {
 
 fn stress_snapshot_then_continue() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
 
 
@@ -346,11 +346,11 @@ fn stress_snapshot_then_continue() {
 
     for i in 0..20 {
 
-        k.eval(&format!("(define x{} {})", i, i), &mut env).unwrap();
+        k.eval(&format!("(define x{} {})", i, i)).unwrap();
 
     }
 
-    let snap = k.snapshot(kernel::SnapshotKind::Incremental, &env);
+    let snap = k.snapshot(kernel::SnapshotKind::Incremental);
 
     println!("✅ Snapshot after 100 defs: id={}", snap.id);
 
@@ -360,13 +360,13 @@ fn stress_snapshot_then_continue() {
 
     for i in 100..200 {
 
-        k.eval(&format!("(define x{} {})", i, i), &mut env).unwrap();
+        k.eval(&format!("(define x{} {})", i, i)).unwrap();
 
     }
 
 
 
-    let r = k.eval("x150", &mut env);
+    let r = k.eval("x150");
 
     assert!(r.is_ok());
 
@@ -382,7 +382,7 @@ fn stress_snapshot_then_continue() {
 
 fn stress_namespace_growth() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
@@ -392,7 +392,7 @@ fn stress_namespace_growth() {
 
     for i in 0..50 {
 
-        k.eval(&format!("(define (user/fn{} x) (+ x {}))", i, i), &mut env).unwrap();
+        k.eval(&format!("(define (user/fn{} x) (+ x {}))", i, i)).unwrap();
 
     }
 
@@ -404,7 +404,7 @@ fn stress_namespace_growth() {
 
     // Verify lookup
 
-    let r = k.eval("(user/fn25 10)", &mut env);
+    let r = k.eval("(user/fn25 10)");
 
     assert!(r.is_ok());
 
@@ -418,7 +418,7 @@ fn stress_namespace_growth() {
 
 fn stress_define_data_large() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
     let start = Instant::now();
 
@@ -436,7 +436,7 @@ fn stress_define_data_large() {
 
     def.push_str(")");
 
-    k.eval(&def, &mut env).unwrap();
+    k.eval(&def).unwrap();
 
     let elapsed = start.elapsed();
 
@@ -446,7 +446,7 @@ fn stress_define_data_large() {
 
     // Use a constructor
 
-    let r = k.eval("(user/many/Status/Variant0 1 2)", &mut env);
+    let r = k.eval("(user/many/Status/Variant0 1 2)");
 
     assert!(r.is_ok(), "constructor: {:?}", r.err());
 
@@ -464,7 +464,7 @@ fn stress_define_data_large() {
 
 fn stress_continuous_cognition() {
 
-    let (k, mut env) = make_kernel();
+    let k = make_kernel();
 
 
 
@@ -480,7 +480,7 @@ fn stress_continuous_cognition() {
 
             (cognize (- n 1))))
 
-    "#, &mut env).unwrap();
+    "#).unwrap();
 
 
 
@@ -488,7 +488,7 @@ fn stress_continuous_cognition() {
 
     let start = Instant::now();
 
-    let r = k.eval("(cognize 500)", &mut env);
+    let r = k.eval("(cognize 500)");
 
     let elapsed = start.elapsed();
 

@@ -68,21 +68,21 @@ impl std::fmt::Display for EvalError {
 impl std::error::Error for EvalError {}
 
 /// Evaluate one step, converting TailCall to StepResult.
-fn eval_step(val: Value, kernel: &mut Kernel, env: &mut EnvRef) -> Result<StepResult, EvalError> {
-    match eval_value(val, kernel, env) {
+fn eval_step(val: Value, kernel: &mut Kernel) -> Result<StepResult, EvalError> {
+    match eval_value(val, kernel) {
         Ok(v) => Ok(StepResult::Done(v)),
         Err(EvalError::TailCall(expr)) => Ok(StepResult::Step(expr)),
         Err(e) => Err(e),
     }
 }
 
-pub fn eval(input: &str, kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
     let exprs = reader::read_all(input).map_err(|e| EvalError::SyntaxError(e.to_string()))?;
     let mut result = Value::Nil;
     for expr in exprs {
         let mut current = expr;
         loop {
-            match eval_step(current, kernel, env) {
+            match eval_step(current, kernel) {
                 Ok(StepResult::Done(v)) => { result = v; break; }
                 Ok(StepResult::Step(next)) => { current = next; continue; }
                 Err(e) => return Err(e),
@@ -92,12 +92,12 @@ pub fn eval(input: &str, kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value,
     Ok(result)
 }
 
-pub fn eval_value(val: Value, kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+pub fn eval_value(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
     // Safepoint: check if kernel wants to interrupt
     check_safepoint()?;
     match val {
         Value::Symbol(ref name) => {
-            env.lookup(name).cloned().ok_or_else(|| EvalError::UndefinedSymbol(name.clone()))
+            kernel.env.lookup(name).cloned().ok_or_else(|| EvalError::UndefinedSymbol(name.clone()))
         }
         Value::List(ref items) if items.is_empty() => {
             Ok(Value::Nil)
@@ -108,49 +108,49 @@ pub fn eval_value(val: Value, kernel: &mut Kernel, env: &mut EnvRef) -> Result<V
             match head {
                 Value::Symbol(s) => {
                     match s.as_str() {
-                        "define"  => eval_define(args, kernel, env),
-                        "undefine" => eval_undefine(args, env),
-                        "lambda"  => eval_lambda(args, env),
-                        "if"      => eval_if(args, kernel, env),
-                        "begin"   => eval_begin(args, kernel, env),
-                        "let"     => eval_let(args, kernel, env),
-                        "let*"    => eval_let_star(args, kernel, env),
-                        "letrec"  => eval_letrec(args, kernel, env),
-                        "set!"    => eval_set(args, kernel, env),
+                        "define"  => eval_define(args, kernel),
+                        "undefine" => eval_undefine(args, kernel),
+                        "lambda"  => eval_lambda(args, kernel),
+                        "if"      => eval_if(args, kernel),
+                        "begin"   => eval_begin(args, kernel),
+                        "let"     => eval_let(args, kernel),
+                        "let*"    => eval_let_star(args, kernel),
+                        "letrec"  => eval_letrec(args, kernel),
+                        "set!"    => eval_set(args, kernel),
                         "quote"   => eval_quote(args),
-                        "quasiquote" => eval_quasiquote(args, kernel, env),
-                        "define-syntax" => eval_define_syntax(args, env),
-                        "define-data" => eval_define_data(args, env),
-                        "match"   => eval_match(args, kernel, env),
+                        "quasiquote" => eval_quasiquote(args, kernel),
+                        "define-syntax" => eval_define_syntax(args, kernel),
+                        "define-data" => eval_define_data(args, kernel),
+                        "match"   => eval_match(args, kernel),
                         _ => {
                             // Check if this symbol is a macro
-                            let expanded = try_expand_macro(s, args, env)?;
+                            let expanded = try_expand_macro(s, args, &kernel.env)?;
                             if let Some(expanded) = expanded {
-                                eval_value(expanded, kernel, env)
+                                eval_value(expanded, kernel)
                             } else {
-                                let fun = eval_value(Value::Symbol(s.clone()), kernel, env)?;
-                                apply(fun, eval_args(args, kernel, env)?, kernel, env)
+                                let fun = eval_value(Value::Symbol(s.clone()), kernel)?;
+                                apply(fun, eval_args(args, kernel)?, kernel)
                             }
                         }
                     }
                 }
                 _ => {
-                    let fun = eval_value(head.clone(), kernel, env)?;
-                    apply(fun, eval_args(args, kernel, env)?, kernel, env)
+                    let fun = eval_value(head.clone(), kernel)?;
+                    apply(fun, eval_args(args, kernel)?, kernel)
                 }
             }
         }
         Value::Vector(items) => {
             let mut evaled = Vec::with_capacity(items.len());
             for item in items {
-                evaled.push(eval_value(item, kernel, env)?);
+                evaled.push(eval_value(item, kernel)?);
             }
             Ok(Value::Vector(evaled))
         }
         Value::Map(map) => {
             let mut evaled = HashMap::new();
             for (k, v) in map {
-                evaled.insert(eval_value(k, kernel, env)?, eval_value(v, kernel, env)?);
+                evaled.insert(eval_value(k, kernel)?, eval_value(v, kernel)?);
             }
             Ok(Value::Map(evaled))
         }
@@ -160,7 +160,7 @@ pub fn eval_value(val: Value, kernel: &mut Kernel, env: &mut EnvRef) -> Result<V
 
 // ---- Special forms ----
 
-fn eval_define(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("define requires arguments".into()));
     }
@@ -170,11 +170,11 @@ fn eval_define(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
             if args.len() != 2 {
                 return Err(EvalError::InvalidForm(format!("define: expected (define name value), got {} args", args.len())));
             }
-            let val = eval_value(args[1].clone(), kernel, env)?;
+            let val = eval_value(args[1].clone(), kernel)?;
             if !name.contains('/') {
-                env.define(&format!("user/{}", name), val).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(&format!("user/{}", name), val).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
-                env.define(name, val).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(name, val).map_err(|e| EvalError::SyntaxError(e))?;
             }
             Ok(Value::Symbol(name.clone()))
         }
@@ -194,12 +194,12 @@ fn eval_define(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
             }).collect();
             let body: Vec<Value> = args[1..].to_vec();
             // Create the lambda FIRST (captures current env without the name)
-            let lambda = eval_lambda_simple(param_names, body, env)?;
+            let lambda = eval_lambda_simple(param_names, body, kernel)?;
             // Then define the name — the lambda can find itself via the fallback
             if !name.contains('/') {
-                env.define(&format!("user/{}", name), lambda).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(&format!("user/{}", name), lambda).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
-                env.define(&name, lambda).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(&name, lambda).map_err(|e| EvalError::SyntaxError(e))?;
             }
             Ok(Value::Symbol(name))
         }
@@ -207,7 +207,7 @@ fn eval_define(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
     }
 }
 
-fn eval_undefine(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_undefine(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::InvalidForm("undefine requires exactly one symbol argument".into()));
     }
@@ -218,19 +218,19 @@ fn eval_undefine(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
 
     // Check if this is a data family — if so, remove all constructors atomically
     // The family name is the full path (e.g., "my/Foo" not just "Foo")
-    if env.is_data_family(&name) {
+    if kernel.env.is_data_family(&name) {
         // Undefine the data family, removing all constructors atomically
-        env.undefine_data_family(&name).map_err(|e| EvalError::SyntaxError(e))?;
+        kernel.env.undefine_data_family(&name).map_err(|e| EvalError::SyntaxError(e))?;
         return Ok(Value::Symbol(name));
     }
 
     // Regular undefine
     let qualified = if name.contains('/') { name } else { format!("user/{}", name) };
-    env.undefine(&qualified).map_err(|e| EvalError::SyntaxError(e))?;
+    kernel.env.undefine(&qualified).map_err(|e| EvalError::SyntaxError(e))?;
     Ok(Value::Nil)
 }
 
-fn eval_lambda(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_lambda(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("lambda requires parameters and body".into()));
     }
@@ -253,7 +253,7 @@ fn eval_lambda(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
     };
 
     // Serialize only lexical frames (namespaces come from fallback at call time)
-    let frames_json = serde_json::to_string(&env.frames).unwrap_or_default();
+    let frames_json = serde_json::to_string(&kernel.env.frames).unwrap_or_default();
     Ok(Value::Function(Function::Interpreted {
         params: param_names,
         body,
@@ -261,10 +261,10 @@ fn eval_lambda(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
     }))
 }
 
-fn eval_lambda_simple(params: Vec<String>, body: Vec<Value>, env: &EnvRef) -> Result<Value, EvalError> {
+fn eval_lambda_simple(params: Vec<String>, body: Vec<Value>, kernel: &mut Kernel) -> Result<Value, EvalError> {
     // Serialize only the lexical frames — namespaces are provided by the fallback
     // at call time. This avoids O(n) serialization of every binding in every namespace.
-    let frames_json = serde_json::to_string(&env.frames).unwrap_or_default();
+    let frames_json = serde_json::to_string(&kernel.env.frames).unwrap_or_default();
     Ok(Value::Function(Function::Interpreted {
         params,
         body,
@@ -272,29 +272,29 @@ fn eval_lambda_simple(params: Vec<String>, body: Vec<Value>, env: &EnvRef) -> Re
     }))
 }
 
-fn eval_if(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_if(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::InvalidForm("if expects 2 or 3 arguments".into()));
     }
-    let cond = eval_value(args[0].clone(), kernel, env)?;
+    let cond = eval_value(args[0].clone(), kernel)?;
     if cond.is_truthy() {
-        eval_value(args[1].clone(), kernel, env)
+        eval_value(args[1].clone(), kernel)
     } else if args.len() == 3 {
-        eval_value(args[2].clone(), kernel, env)
+        eval_value(args[2].clone(), kernel)
     } else {
         Ok(Value::Nil)
     }
 }
 
-fn eval_begin(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_begin(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for arg in args {
-        result = eval_value(arg.clone(), kernel, env)?;
+        result = eval_value(arg.clone(), kernel)?;
     }
     Ok(result)
 }
 
-fn eval_let(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_let(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("let requires bindings and body".into()));
     }
@@ -304,7 +304,7 @@ fn eval_let(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Val
         _ => return Err(EvalError::InvalidForm("let: expected binding list".into())),
     };
 
-    env.push_frame();
+    kernel.env.push_frame();
     for binding in bindings {
         match binding {
             Value::List(items) if items.len() == 2 => {
@@ -312,20 +312,20 @@ fn eval_let(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Val
                     Value::Symbol(s) => s.clone(),
                     other => return Err(EvalError::InvalidForm(format!("let: expected symbol, got {}", other))),
                 };
-                let val = eval_value(items[1].clone(), kernel, env)?;
-                env.set_lexical(&name, val);
+                let val = eval_value(items[1].clone(), kernel)?;
+                kernel.env.set_lexical(&name, val);
             }
             other => return Err(EvalError::InvalidForm(format!("let: expected (name value) pair, got {}", other))),
         }
     }
 
     let body: Vec<Value> = args[1..].to_vec();
-    let result = eval_begin(&body, kernel, env);
-    env.pop_frame();
+    let result = eval_begin(&body, kernel);
+    kernel.env.pop_frame();
     result
 }
 
-fn eval_let_star(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_let_star(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("let* requires bindings and body".into()));
     }
@@ -335,7 +335,7 @@ fn eval_let_star(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Resul
         _ => return Err(EvalError::InvalidForm("let*: expected binding list".into())),
     };
 
-    env.push_frame();
+    kernel.env.push_frame();
     for binding in bindings {
         match binding {
             Value::List(items) if items.len() == 2 => {
@@ -343,20 +343,20 @@ fn eval_let_star(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Resul
                     Value::Symbol(s) => s.clone(),
                     other => return Err(EvalError::InvalidForm(format!("let*: expected symbol, got {}", other))),
                 };
-                let val = eval_value(items[1].clone(), kernel, env)?;
-                env.set_lexical(&name, val);
+                let val = eval_value(items[1].clone(), kernel)?;
+                kernel.env.set_lexical(&name, val);
             }
             other => return Err(EvalError::InvalidForm(format!("let*: expected (name value) pair, got {}", other))),
         }
     }
 
     let body: Vec<Value> = args[1..].to_vec();
-    let result = eval_begin(&body, kernel, env);
-    env.pop_frame();
+    let result = eval_begin(&body, kernel);
+    kernel.env.pop_frame();
     result
 }
 
-fn eval_letrec(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_letrec(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("letrec requires bindings and body".into()));
     }
@@ -366,7 +366,7 @@ fn eval_letrec(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
         _ => return Err(EvalError::InvalidForm("letrec: expected binding list".into())),
     };
 
-    env.push_frame();
+    kernel.env.push_frame();
     for binding in bindings {
         match binding {
             Value::List(items) if items.len() == 2 => {
@@ -374,7 +374,7 @@ fn eval_letrec(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
                     Value::Symbol(s) => s.clone(),
                     other => return Err(EvalError::InvalidForm(format!("letrec: expected symbol, got {}", other))),
                 };
-                env.set_lexical(&name, Value::Nil);
+                kernel.env.set_lexical(&name, Value::Nil);
             }
             other => return Err(EvalError::InvalidForm(format!("letrec: expected (name value) pair, got {}", other))),
         }
@@ -386,20 +386,20 @@ fn eval_letrec(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
                     Value::Symbol(s) => s.clone(),
                     other => return Err(EvalError::InvalidForm(format!("letrec: expected symbol, got {}", other))),
                 };
-                let val = eval_value(items[1].clone(), kernel, env)?;
-                env.set_lexical(&name, val);
+                let val = eval_value(items[1].clone(), kernel)?;
+                kernel.env.set_lexical(&name, val);
             }
             _ => unreachable!(),
         }
     }
 
     let body: Vec<Value> = args[1..].to_vec();
-    let result = eval_begin(&body, kernel, env);
-    env.pop_frame();
+    let result = eval_begin(&body, kernel);
+    kernel.env.pop_frame();
     result
 }
 
-fn eval_set(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::InvalidForm("set! expects 2 arguments".into()));
     }
@@ -407,10 +407,10 @@ fn eval_set(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Val
         Value::Symbol(s) => s.clone(),
         other => return Err(EvalError::InvalidForm(format!("set!: expected symbol, got {}", other))),
     };
-    let val = eval_value(args[1].clone(), kernel, env)?;
+    let val = eval_value(args[1].clone(), kernel)?;
 
     // Check lexical frames first
-    for frame in env.frames.iter_mut().rev() {
+    for frame in kernel.env.frames.iter_mut().rev() {
         if frame.contains_key(&name) {
             frame.insert(name.clone(), val);
             return Ok(Value::Nil);
@@ -419,14 +419,14 @@ fn eval_set(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Val
 
     // Check namespaces
     if name.contains('/') {
-        if env.lookup(&name).is_some() {
-            env.define(&name, val).map_err(|e| EvalError::SyntaxError(e))?;
+        if kernel.env.lookup(&name).is_some() {
+            kernel.env.define(&name, val).map_err(|e| EvalError::SyntaxError(e))?;
             return Ok(Value::Nil);
         }
     } else {
         let qualified = format!("user/{}", name);
-        if env.lookup(&qualified).is_some() {
-            env.define(&qualified, val).map_err(|e| EvalError::SyntaxError(e))?;
+        if kernel.env.lookup(&qualified).is_some() {
+            kernel.env.define(&qualified, val).map_err(|e| EvalError::SyntaxError(e))?;
             return Ok(Value::Nil);
         }
     }
@@ -441,14 +441,14 @@ fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
     Ok(args[0].clone())
 }
 
-fn eval_quasiquote(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_quasiquote(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("quasiquote requires an argument".into()));
     }
-    expand_quasiquote(&args[0], kernel, env)
+    expand_quasiquote(&args[0], kernel)
 }
 
-fn expand_quasiquote(val: &Value, kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn expand_quasiquote(val: &Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
     match val {
         Value::List(items) if !items.is_empty() => {
             let head = &items[0];
@@ -457,17 +457,17 @@ fn expand_quasiquote(val: &Value, kernel: &mut Kernel, env: &mut EnvRef) -> Resu
                     if items.len() != 2 {
                         return Err(EvalError::InvalidForm("unquote expects 1 argument".into()));
                     }
-                    return eval_value(items[1].clone(), kernel, env);
+                    return eval_value(items[1].clone(), kernel);
                 }
             }
-            expand_quasiquote_seq(items, kernel, env, |v| Value::List(v))
+            expand_quasiquote_seq(items, kernel, |v| Value::List(v))
         }
-        Value::Vector(items) => expand_quasiquote_seq(items, kernel, env, |v| Value::Vector(v)),
+        Value::Vector(items) => expand_quasiquote_seq(items, kernel, |v| Value::Vector(v)),
         _ => Ok(val.clone()),
     }
 }
 
-fn expand_quasiquote_seq(items: &[Value], kernel: &mut Kernel, env: &mut EnvRef, wrap: fn(Vec<Value>) -> Value) -> Result<Value, EvalError> {
+fn expand_quasiquote_seq(items: &[Value], kernel: &mut Kernel, wrap: fn(Vec<Value>) -> Value) -> Result<Value, EvalError> {
     let mut result = Vec::new();
     for item in items {
         match item {
@@ -477,7 +477,7 @@ fn expand_quasiquote_seq(items: &[Value], kernel: &mut Kernel, env: &mut EnvRef,
                         if sub.len() != 2 {
                             return Err(EvalError::InvalidForm("unquote-splicing expects 1 argument".into()));
                         }
-                        let spliced = eval_value(sub[1].clone(), kernel, env)?;
+                        let spliced = eval_value(sub[1].clone(), kernel)?;
                         match spliced {
                             Value::List(v) => result.extend(v),
                             Value::Vector(v) => result.extend(v),
@@ -486,10 +486,10 @@ fn expand_quasiquote_seq(items: &[Value], kernel: &mut Kernel, env: &mut EnvRef,
                         continue;
                     }
                 }
-                result.push(expand_quasiquote(item, kernel, env)?);
+                result.push(expand_quasiquote(item, kernel)?);
             }
             other => {
-                result.push(expand_quasiquote(other, kernel, env)?);
+                result.push(expand_quasiquote(other, kernel)?);
             }
         }
     }
@@ -498,7 +498,7 @@ fn expand_quasiquote_seq(items: &[Value], kernel: &mut Kernel, env: &mut EnvRef,
 
 // ---- define-syntax (simple) ----
 
-fn eval_define_syntax(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_define_syntax(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::InvalidForm("define-syntax requires name and transformer".into()));
     }
@@ -531,7 +531,7 @@ fn eval_define_syntax(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalErr
                 }
             }
 
-            let serialized = serde_json::to_string(env).unwrap_or_default();
+            let serialized = serde_json::to_string(&kernel.env).unwrap_or_default();
             let m = Value::Macro(Macro::SyntaxRules {
                 literals,
                 rules,
@@ -539,9 +539,9 @@ fn eval_define_syntax(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalErr
             });
 
             if !name.contains('/') {
-                env.define(&format!("user/{}", name), m).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(&format!("user/{}", name), m).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
-                env.define(&name, m).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(&name, m).map_err(|e| EvalError::SyntaxError(e))?;
             }
             Ok(Value::Symbol(name))
         }
@@ -551,7 +551,7 @@ fn eval_define_syntax(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalErr
 
 // ---- define-data ----
 
-fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.is_empty() {
         return Err(EvalError::InvalidForm("define-data requires a family name and variants".into()));
     }
@@ -588,7 +588,7 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
                     arity,
                 });
 
-                env.define(&constructor_name, constructor).map_err(|e| EvalError::SyntaxError(e))?;
+                kernel.env.define(&constructor_name, constructor).map_err(|e| EvalError::SyntaxError(e))?;
 
                 variants.push(DataVariant {
                     name: variant_name,
@@ -601,7 +601,7 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
 
     // Store data family definition
     let fam_name = family_name.clone();
-    env.set_data_family(&fam_name, DataFamily {
+    kernel.env.set_data_family(&fam_name, DataFamily {
         name: fam_name.clone(),
         variants,
     });
@@ -611,12 +611,12 @@ fn eval_define_data(args: &[Value], env: &mut EnvRef) -> Result<Value, EvalError
 
 // ---- match ----
 
-fn eval_match(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn eval_match(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::InvalidForm("match requires a value and at least one clause".into()));
     }
 
-    let value = eval_value(args[0].clone(), kernel, env)?;
+    let value = eval_value(args[0].clone(), kernel)?;
 
     for clause in &args[1..] {
         match clause {
@@ -625,12 +625,12 @@ fn eval_match(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<V
                 let body = &items[1..];
                 let mut bindings = HashMap::new();
                 if match_pattern(&value, pattern, &mut bindings) {
-                    env.push_frame();
+                    kernel.env.push_frame();
                     for (k, v) in &bindings {
-                        env.set_lexical(k, v.clone());
+                        kernel.env.set_lexical(k, v.clone());
                     }
-                    let result = eval_begin(body, kernel, env);
-                    env.pop_frame();
+                    let result = eval_begin(body, kernel);
+                    kernel.env.pop_frame();
                     return result;
                 }
             }
@@ -853,13 +853,13 @@ fn apply_template(template: &Value, bindings: &HashMap<String, Value>) -> Result
 
 // ---- Application ----
 
-fn apply(fun: Value, args: Vec<Value>, kernel: &mut Kernel, env: &mut EnvRef) -> Result<Value, EvalError> {
+fn apply(fun: Value, args: Vec<Value>, kernel: &mut Kernel) -> Result<Value, EvalError> {
     match fun {
         Value::Function(Function::Native { name, arity, func, .. }) => {
             if arity > 0 && args.len() as u32 != arity {
                 return Err(EvalError::ArityMismatch { name, expected: arity, got: args.len() });
             }
-            (func)(kernel, env, args).map_err(|e| EvalError::UserError(e))
+            (func)(kernel, args).map_err(|e| EvalError::UserError(e))
         }
         Value::Function(Function::Constructor { family, variant, arity }) => {
             if arity > 0 && args.len() as u32 != arity {
@@ -882,16 +882,16 @@ fn apply(fun: Value, args: Vec<Value>, kernel: &mut Kernel, env: &mut EnvRef) ->
             // We save the current frames, swap in the closure's, evaluate,
             // then swap back. For tail calls, we return the env with the
             // closure's frames (TailCall replaces the current frame).
-            let saved_frames = std::mem::take(&mut env.frames);
+            let saved_frames = std::mem::take(&mut kernel.env.frames);
             if let Ok(frames) = serde_json::from_str::<Vec<HashMap<String, Value>>>(&env_serialized) {
-                env.frames = frames;
+                kernel.env.frames = frames;
             }
 
             // Tail call optimization: for single-expression bodies, bind params
             // into the current frame (reusing it) instead of pushing a new one.
             if body.len() == 1 {
                 for (p, a) in params.iter().zip(args.into_iter()) {
-                    env.set_lexical(p, a);
+                    kernel.env.set_lexical(p, a);
                 }
                 let next_expr = body.into_iter().next().unwrap();
                 // Return TailCall without env — the trampoline continues with the
@@ -901,14 +901,14 @@ fn apply(fun: Value, args: Vec<Value>, kernel: &mut Kernel, env: &mut EnvRef) ->
             }
 
             // Multi-expression body: push a new frame for lexical scoping
-            env.push_frame();
+            kernel.env.push_frame();
             for (p, a) in params.iter().zip(args.into_iter()) {
-                env.set_lexical(p, a);
+                kernel.env.set_lexical(p, a);
             }
-            let result = eval_begin(&body, kernel, env);
-            env.pop_frame();
+            let result = eval_begin(&body, kernel);
+            kernel.env.pop_frame();
             // Restore the saved frames (undo the closure frame swap)
-            env.frames = saved_frames;
+            kernel.env.frames = saved_frames;
             result
         }
         Value::Macro(Macro::Native { name: _, func, .. }) => {
@@ -918,6 +918,6 @@ fn apply(fun: Value, args: Vec<Value>, kernel: &mut Kernel, env: &mut EnvRef) ->
     }
 }
 
-fn eval_args(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<Vec<Value>, EvalError> {
-    args.iter().map(|a| eval_value(a.clone(), kernel, env)).collect()
+fn eval_args(args: &[Value], kernel: &mut Kernel) -> Result<Vec<Value>, EvalError> {
+    args.iter().map(|a| eval_value(a.clone(), kernel)).collect()
 }
