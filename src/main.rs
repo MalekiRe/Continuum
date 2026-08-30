@@ -106,15 +106,18 @@ fn check_supervision(kernel: &mut Kernel) {
     let elapsed = (now - started_at).num_seconds() as u64;
     let cfg = &kernel.supervision;
 
-    // Hard circuit breaker — only triggers if something is truly broken (1 hour)
-    if elapsed >= cfg.max_eval_seconds {
-        println!("[supervisor] eval ran for {}s — force interrupting (max {})", 
-            elapsed, cfg.max_eval_seconds);
-        persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Advisory: long-running eval — check if agent is making progress
+    if elapsed >= cfg.advisory_after_seconds && elapsed % 300 == 0 {
+        println!("[supervisor] eval has been running for {}s", elapsed);
+        if let Some(frame) = kernel.frames.last_mut() {
+            frame.message_queue.push(
+                r#"(system/SupervisorNotice "You have been working on this task for a while. Consider whether your current approach is making progress or could be optimized.")"#.into()
+            );
+        }
         return;
     }
 
-    // Skip checks if not enough time has passed
+    // Skip remaining checks if not enough time has passed
     if elapsed < cfg.min_elapsed_seconds {
         return;
     }
@@ -137,7 +140,7 @@ fn check_supervision(kernel: &mut Kernel) {
     };
     let actual_elapsed = elapsed - cfg.min_elapsed_seconds;
 
-    // Advisory 1: low token rate — agent may want to optimize
+    // Advisory: low token rate — agent may want to optimize
     if expected_secs > 0 && actual_elapsed > expected_secs * cfg.timeout_multiplier {
         println!("[supervisor] {}s elapsed, {} tokens in window (expected ~{}s at {} tok/s)",
             elapsed, window_tokens, expected_secs, cfg.expected_tokens_per_sec);
@@ -148,7 +151,7 @@ fn check_supervision(kernel: &mut Kernel) {
         }
     }
 
-    // Advisory 2: no tokens for a long time — might be stuck in a blocking call
+    // Advisory: no tokens for a long time — might be stuck in a blocking call
     if window_tokens == 0 && actual_elapsed >= 300 {
         println!("[supervisor] {}s with no tokens reported — may be waiting on a blocking call", elapsed);
         if let Some(frame) = kernel.frames.last_mut() {

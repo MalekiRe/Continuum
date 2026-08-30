@@ -24,7 +24,7 @@ pub struct Kernel {
     pub next_frame_id: u64,
     pub version: String,
     pub supervision: SupervisionConfig,
-        pub wake_timers: Vec<WakeEntry>,
+    pub wake_timers: Vec<WakeEntry>,
     pub eval_started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip)]
     pub token_reports: VecDeque<(chrono::DateTime<chrono::Utc>, u64)>,
@@ -110,11 +110,11 @@ pub struct SupervisionConfig {
     pub min_tokens_per_sec: u64,
     /// Don't check rolling rate until eval has been running at least this long.
     pub min_elapsed_seconds: u64,
-    /// Absolute eval timeout in seconds (unconditional).
-    pub max_eval_seconds: u64,
+    /// Eval duration before sending advisory about progress (seconds).
+    pub advisory_after_seconds: u64,
     /// Expected token generation rate for time-vs-tokens comparison.
     pub expected_tokens_per_sec: u64,
-    /// Multiplier: if elapsed > expected_tokens_per_sec * multiplier * seconds, interrupt.
+    /// Multiplier: if elapsed > expected_tokens_per_sec * multiplier * seconds, deliver notice.
     pub timeout_multiplier: u64,
 }
 
@@ -124,7 +124,7 @@ impl Default for SupervisionConfig {
             window_seconds: 1800,
             min_tokens_per_sec: 2,
             min_elapsed_seconds: 120,
-            max_eval_seconds: 3600,
+            advisory_after_seconds: 900,
             expected_tokens_per_sec: 10,
             timeout_multiplier: 6,
         }
