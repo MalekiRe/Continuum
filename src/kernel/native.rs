@@ -403,7 +403,18 @@ impl Kernel {
             vec.get(idx).cloned().ok_or_else(|| format!("vector/get: index {} out of bounds (len {})", idx, vec.len()))
         });
 
-        self.define_native("kernel/error", 1, |_kernel, args| {
+        
+        self.define_native("append", 0, |_kernel, args| {
+            let mut result = Vec::new();
+            for arg in args {
+                match arg {
+                    Value::List(items) => result.extend(items),
+                    other => result.push(other),
+                }
+            }
+            Ok(Value::List(result))
+        });
+self.define_native("kernel/error", 1, |_kernel, args| {
             let msg = format!("{}", args[0]);
             Err(msg)
         });

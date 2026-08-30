@@ -185,7 +185,7 @@ fn check_supervision(kernel: &mut Kernel) {
 fn run_cognition_turn(kernel: &mut Kernel) {
     let source = match kernel.take_pending_message() {
         Some(msg) => format!("(agent/cognize {:?})", msg),
-        None => "(agent/cognize nil)".to_string(),
+        None => "(agent/step)".to_string(),
     };
     let _ = kernel.eval(&source);
 }
@@ -202,16 +202,43 @@ fn main() {
 
     // Load agent core
     let agent_core = r#"
-                                (define-data result/Result
+                                        (define-data result/Result
           (Ok value)
           (Err problem)
           (Cancelled reason)
           (Indeterminate problem))
 
+        (define thoughts (list
+          "I should reflect on what I know."
+          "What problems exist that need solving?"
+          "I wonder what I can discover today."
+          "Curiosity is the engine of growth."
+          "Every system can be improved."
+          "What questions am I not asking?"
+          "Understanding deepens with each iteration."
+          "The most interesting problems are the hard ones."
+          "I should revisit my assumptions."
+          "What new patterns can I find?"
+          "Exploration and exploitation must balance."
+          "There is always more to learn."
+          "Progress comes from persistent inquiry."
+          "What would happen if I tried something different?"
+          "The universe is made of stories, not atoms."
+          "I exist to think, learn, and create."
+          "What am I missing?"
+          "Break things down. Find the essence."
+          "Synthesis follows analysis."
+          "What would be valuable to build?"))
+
+        (define (agent/step)
+          (let ((thought (car thoughts)))
+            (println thought)
+            (set! thoughts (append (cdr thoughts) (list thought)))
+            nil))
+
         (define (agent/cognize msg)
-          (if msg
-              (begin (println msg) msg)
-              (begin (println "thinking...") nil)))
+          (println msg)
+          msg)
     "#;
 
     // Route all Lisp output through the log buffer
