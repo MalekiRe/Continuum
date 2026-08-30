@@ -7,29 +7,54 @@
 
 use persistent_lisp_harness::kernel::{self, SnapshotKind, FrameStatus};
 use persistent_lisp_harness::Kernel;
+use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+
+/// Shared log buffer — last 1000 lines, used by /thoughts endpoint.
+static LOG_BUF: std::sync::LazyLock<Arc<Mutex<VecDeque<String>>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(1000))));
+
+/// Push a log line to stdout and the shared buffer.
+fn slog(msg: impl AsRef<str>) {
+    let msg = msg.as_ref();
+    println!("{msg}");
+    let mut buf = LOG_BUF.lock().unwrap();
+    if buf.len() >= 1000 {
+        buf.pop_front();
+    }
+    buf.push_back(msg.to_string());
+}
+
+/// Chat message for /chat endpoint.
+#[derive(Clone, serde::Serialize)]
+struct ChatEntry {
+    role: String,
+    message: String,
+    timestamp: String,
+}
 
 fn load_or_create_kernel() -> &'static mut Kernel {
     if Path::new("snapshots").exists() {
         match Kernel::recover_from_latest() {
             Ok(k) => {
                 let ptr = Box::leak(Box::new(k));
-                println!("[kernel] recovered from snapshot");
+                slog("[kernel] recovered from snapshot");
                 return ptr;
             }
             Err(e) => {
-                println!("[kernel] recovery failed: {} — starting fresh", e);
+                slog(&format!("[kernel] recovery failed: {} — starting fresh", e));
             }
         }
     }
     let k = Kernel::new();
     let _ = std::fs::create_dir_all("data");
     let ptr = Box::leak(Box::new(k));
-    println!("[kernel] fresh start — version {}", ptr.version);
+    slog(&format!("[kernel] fresh start — version {}", ptr.version));
     ptr
 }
 
@@ -39,11 +64,11 @@ fn handle_human_input(kernel: &mut Kernel, rx: &mpsc::Receiver<String>) -> bool 
     if let Some(msg) = human_msg {
         if msg == "!!exit" || msg == "!!quit" {
             kernel.snapshot(SnapshotKind::Full);
-            println!("[kernel] goodbye!");
+            slog("[kernel] goodbye!");
             return true;
         }
         kernel.human_message(&msg);
-        println!("[human] delivered to agent frame");
+        slog("[human] delivered to agent frame");
     }
     false
 }
@@ -61,7 +86,7 @@ fn maybe_restart_agent(kernel: &mut Kernel) -> bool {
     if kernel.frames.is_empty()
         || kernel.frames.iter().all(|f| f.status == FrameStatus::Completed)
     {
-        println!("[agent] all frames completed. Restarting...");
+        slog("[agent] all frames completed. Restarting...");
         kernel.eval("(agent/loop \"Initial context\")").ok();
         true
     } else {
@@ -72,7 +97,7 @@ fn maybe_restart_agent(kernel: &mut Kernel) -> bool {
 /// Check for a pending subagent result and deliver it to the agent.
 fn handle_subagent_result(kernel: &mut Kernel) {
     if let Some(result) = kernel.take_subagent_result() {
-        println!("[agent] subagent returned: {}", result);
+        slog(&format!("[agent] subagent returned: {}", result));
     }
 }
 
@@ -97,7 +122,7 @@ fn handle_waiting_frame(kernel: &mut Kernel) -> bool {
     }
 }
 
-/// The agent stays in control — only a 1-hour circuit breaker force-interrupts.
+/// Supervision checks — all advisory, agent stays in control.
 fn check_supervision(kernel: &mut Kernel) {
     let Some(started_at) = kernel.eval_started_at else {
         return;
@@ -106,9 +131,8 @@ fn check_supervision(kernel: &mut Kernel) {
     let elapsed = (now - started_at).num_seconds() as u64;
     let cfg = &kernel.supervision;
 
-    // Advisory: long-running eval — check if agent is making progress
     if elapsed >= cfg.advisory_after_seconds && elapsed % 300 == 0 {
-        println!("[supervisor] eval has been running for {}s", elapsed);
+        slog(&format!("eval has been running for {}s", elapsed));
         if let Some(frame) = kernel.frames.last_mut() {
             frame.message_queue.push(
                 r#"(system/SupervisorNotice "You have been working on this task for a while. Consider whether your current approach is making progress or could be optimized.")"#.into()
@@ -117,12 +141,10 @@ fn check_supervision(kernel: &mut Kernel) {
         return;
     }
 
-    // Skip remaining checks if not enough time has passed
     if elapsed < cfg.min_elapsed_seconds {
         return;
     }
 
-    // Drain old entries
     let cutoff = now - chrono::Duration::seconds(cfg.window_seconds as i64);
     while let Some(front) = kernel.token_reports.front() {
         if front.0 < cutoff {
@@ -140,10 +162,9 @@ fn check_supervision(kernel: &mut Kernel) {
     };
     let actual_elapsed = elapsed - cfg.min_elapsed_seconds;
 
-    // Advisory: low token rate — agent may want to optimize
     if expected_secs > 0 && actual_elapsed > expected_secs * cfg.timeout_multiplier {
-        println!("[supervisor] {}s elapsed, {} tokens in window (expected ~{}s at {} tok/s)",
-            elapsed, window_tokens, expected_secs, cfg.expected_tokens_per_sec);
+        slog(&format!("{}s elapsed, {} tokens in window (expected ~{}s at {} tok/s)",
+            elapsed, window_tokens, expected_secs, cfg.expected_tokens_per_sec));
         if let Some(frame) = kernel.frames.last_mut() {
             frame.message_queue.push(
                 r#"(system/SupervisorNotice "Token rate is low — consider optimizing your approach. Batch operations, reduce redundant testing, or streamline your workflow.")"#.into()
@@ -151,9 +172,8 @@ fn check_supervision(kernel: &mut Kernel) {
         }
     }
 
-    // Advisory: no tokens for a long time — might be stuck in a blocking call
     if window_tokens == 0 && actual_elapsed >= 300 {
-        println!("[supervisor] {}s with no tokens reported — may be waiting on a blocking call", elapsed);
+        slog(&format!("{}s with no tokens reported — may be waiting on a blocking call", elapsed));
         if let Some(frame) = kernel.frames.last_mut() {
             frame.message_queue.push(
                 r#"(system/SupervisorNotice "No tokens reported in 5+ minutes. If waiting on a tool call, consider whether it has hung or if you should try a different approach.")"#.into()
@@ -161,7 +181,6 @@ fn check_supervision(kernel: &mut Kernel) {
         }
     }
 }
-
 /// Run one cognition turn for the agent.
 fn run_cognition_turn(kernel: &mut Kernel) {
     let has_pending = kernel
@@ -185,19 +204,19 @@ fn run_cognition_turn(kernel: &mut Kernel) {
             // Continue immediately — no backoff
         }
         Err(e) => {
-            println!("[agent] error: {}", e);
+            slog(&format!("[agent] error: {}", e));
             kernel.snapshot(SnapshotKind::Incremental);
         }
     }
 }
 
 fn main() {
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║  Persistent Agent Lisp Harness v0.1.0       ║");
-    println!("║  Continuous autonomous agent.                ║");
-    println!("║  Type a message + Enter to interact.         ║");
-    println!("║  Type '!!exit' to quit.                     ║");
-    println!("╚══════════════════════════════════════════════╝");
+    slog("╔══════════════════════════════════════════════╗");
+    slog("║  Persistent Agent Lisp Harness v0.1.0       ║");
+    slog("║  Continuous autonomous agent.                ║");
+    slog("║  Type a message + Enter to interact.         ║");
+    slog("║  Type '!!exit' to quit.                     ║");
+    slog("╚══════════════════════════════════════════════╝");
 
     let kernel = load_or_create_kernel();
 
@@ -218,8 +237,8 @@ fn main() {
     "#;
 
     match kernel.eval(agent_core) {
-        Ok(_) => println!("[agent] core loaded"),
-        Err(e) => println!("[agent] core: {}", e),
+        Ok(_) => slog("[agent] core loaded"),
+        Err(e) => slog(&format!("[agent] core: {}", e)),
     }
 
     // Human input channel
@@ -237,6 +256,108 @@ fn main() {
                 Err(_) => break,
             }
         }
+
+    // ---- HTTP server for /thoughts and /chat ----
+    let log_buf = LOG_BUF.clone();
+    let chat_history: Arc<Mutex<Vec<ChatEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let chat_tx = tx.clone();
+
+    thread::spawn(move || {
+        let server = tiny_http::Server::http("0.0.0.0:8080").unwrap();
+        slog(&format!("[http] listening on http://0.0.0.0:8080"));
+        loop {
+            match server.recv() {
+                Ok(mut req) => {
+                    let url = req.url().to_string();
+                    let method = req.method().as_str().to_string();
+
+                    match (method.as_str(), url.as_str()) {
+                        ("GET", "/thoughts") => {
+                            // SSE: stream log buffer
+                            let resp = format!(
+                                "data: {}\n\n",
+                                serde_json::to_string(&*log_buf.lock().unwrap()).unwrap()
+                            );
+                            let _ = req.respond(tiny_http::Response::from_string(resp)
+                                .with_header(
+                                    "Content-Type: text/event-stream".parse::<tiny_http::Header>().unwrap()
+                                )
+                                .with_header(
+                                    "Cache-Control: no-cache".parse::<tiny_http::Header>().unwrap()
+                                )
+                                .with_header(
+                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
+                                )
+                            );
+                        }
+                        ("GET", "/chat") => {
+                            // Return chat history as JSON
+                            let history = &*chat_history.lock().unwrap();
+                            let json = serde_json::to_string(history).unwrap();
+                            let _ = req.respond(tiny_http::Response::from_string(json)
+                                .with_header(
+                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
+                                )
+                                .with_header(
+                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
+                                )
+                            );
+                        }
+                        ("POST", "/chat") => {
+                            // Read the request body
+                            let mut body = String::new();
+                            req.as_reader().read_to_string(&mut body).unwrap_or_default();
+                            // Parse JSON: {"message": "..."}
+                            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                            let msg = parsed["message"].as_str().unwrap_or("").to_string();
+
+                            if !msg.is_empty() {
+                                let entry = ChatEntry {
+                                    role: "user".into(),
+                                    message: msg.clone(),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                };
+                                chat_history.lock().unwrap().push(entry);
+
+                                // Send to the agent's human message queue
+                                let _ = chat_tx.send(msg);
+                            }
+
+                            let _ = req.respond(tiny_http::Response::from_string(r#"{"ok":true}"#)
+                                .with_header(
+                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
+                                )
+                                .with_header(
+                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
+                                )
+                            );
+                        }
+                        ("OPTIONS", _) => {
+                            // CORS preflight
+                            let _ = req.respond(tiny_http::Response::from_string("")
+                                .with_header(
+                                    "Access-Control-Allow-Origin: *".parse::<tiny_http::Header>().unwrap()
+                                )
+                                .with_header(
+                                    "Access-Control-Allow-Methods: GET, POST, OPTIONS".parse::<tiny_http::Header>().unwrap()
+                                )
+                                .with_header(
+                                    "Access-Control-Allow-Headers: Content-Type".parse::<tiny_http::Header>().unwrap()
+                                )
+                            );
+                        }
+                        _ => {
+                            let _ = req.respond(tiny_http::Response::from_string("not found")
+                                .with_status_code(404));
+                        }
+                    }
+                }
+                Err(e) => {
+                    slog(&format!("[http] error: {e}"));
+                }
+            }
+        }
+    });
     });
 
     // Continuous cognition loop
@@ -246,7 +367,6 @@ fn main() {
         if handle_human_input(kernel, &rx) {
             break;
         }
-        check_supervision(kernel);
         check_supervision(kernel);
         check_hourly_snapshot(kernel, &mut hourly_timer);
         kernel.check_wake_timers();
