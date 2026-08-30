@@ -1,4 +1,4 @@
-use persistent_lisp_harness::{Executor, ExecutorConfig};
+use persistent_lisp_harness::{ExecutionOutcome, Executor, ExecutorConfig, ExecutorError};
 use std::time::{Duration, Instant};
 
 fn executor(label: &str, timeout: Duration, output_limit: usize) -> (Executor, std::path::PathBuf) {
@@ -7,7 +7,7 @@ fn executor(label: &str, timeout: Duration, output_limit: usize) -> (Executor, s
         label,
         uuid::Uuid::new_v4()
     ));
-    let mut config = ExecutorConfig::rooted(&root);
+    let mut config = ExecutorConfig::with_working_directory(&root);
     config.timeout = timeout;
     config.output_limit = output_limit;
     (Executor::new(config).unwrap(), root)
@@ -27,7 +27,7 @@ fn timeout_kills_process_group_and_prevents_delayed_side_effect() {
     let marker = root.join("marker");
     let started = Instant::now();
     let result = executor.run("(sleep 2; touch marker) & wait").unwrap();
-    assert!(result.timed_out);
+    assert!(result.outcome == ExecutionOutcome::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(1));
     std::thread::sleep(Duration::from_millis(300));
     assert!(
@@ -46,21 +46,21 @@ fn external_cancel_returns_promptly() {
     let status = executor.active_status().expect("running status");
     assert!(status.elapsed < Duration::from_secs(2));
     assert!(status.process_group > 0);
-    assert!(executor.cancel());
+    assert!(executor.cancel().unwrap());
     let result = handle.join().unwrap();
-    assert!(result.cancelled);
+    assert!(result.outcome == ExecutionOutcome::Cancelled);
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
 fn idle_cancel_does_not_cancel_the_next_run() {
     let (executor, root) = executor("idle-cancel", Duration::from_secs(2), 1024);
-    assert!(!executor.cancel());
+    assert!(!executor.cancel().unwrap());
     let result = executor.run("touch did-run; printf ok").unwrap();
-    assert!(!result.cancelled);
-    assert!(!result.timed_out);
+    assert!(result.outcome != ExecutionOutcome::Cancelled);
+    assert!(result.outcome != ExecutionOutcome::TimedOut);
     assert_eq!(result.exit_code, 0);
-    assert_eq!(result.stdout, "ok");
+    assert_eq!(result.output.stdout, "ok");
     assert!(root.join("did-run").exists());
 }
 
@@ -74,14 +74,11 @@ fn concurrent_run_is_rejected_without_disturbing_active_run() {
     let error = executor
         .run("touch concurrent-should-not-run")
         .expect_err("a second run must be rejected");
-    assert!(
-        error.contains("already running"),
-        "unexpected error: {error}"
-    );
+    assert!(matches!(error, ExecutorError::AlreadyRunning));
     assert!(!root.join("concurrent-should-not-run").exists());
 
-    assert!(executor.cancel());
-    assert!(handle.join().unwrap().cancelled);
+    assert!(executor.cancel().unwrap());
+    assert!(handle.join().unwrap().outcome == ExecutionOutcome::Cancelled);
 }
 
 #[test]
@@ -93,8 +90,8 @@ fn background_descendant_and_its_output_pipe_do_not_outlive_completion() {
         .unwrap();
 
     assert_eq!(result.exit_code, 0);
-    assert!(result.stdout.contains("leader-finished"));
-    assert!(!result.stdout.contains("late"));
+    assert!(result.output.stdout.contains("leader-finished"));
+    assert!(!result.output.stdout.contains("late"));
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "inherited output pipe kept execution alive"
@@ -111,8 +108,8 @@ fn timeout_closes_output_from_term_ignoring_background_descendant() {
         .run("(trap '' TERM; while :; do printf x; sleep 0.01; done) & wait")
         .unwrap();
 
-    assert!(result.timed_out);
-    assert!(result.truncated || !result.stdout.is_empty());
+    assert!(result.outcome == ExecutionOutcome::TimedOut);
+    assert!(result.output.truncated || !result.output.stdout.is_empty());
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "background descendant kept its output pipe open after timeout"
@@ -124,8 +121,23 @@ fn output_is_bounded_but_fully_drained() {
     let (executor, _) = executor("bounded", Duration::from_secs(2), 128);
     let result = executor.run("yes x | head -c 100000").unwrap();
     assert_eq!(result.exit_code, 0);
-    assert!(result.truncated);
-    assert!(result.stdout.len() <= 128);
+    assert!(result.output.truncated);
+    assert!(result.output.stdout.len() <= 128);
+}
+
+#[test]
+fn spawn_failure_releases_active_reservation() {
+    let (executor, root) = executor("spawn-failure", Duration::from_secs(2), 1024);
+    std::fs::remove_dir(&root).unwrap();
+
+    let error = executor.run("printf unreachable").unwrap_err();
+    assert!(matches!(error, ExecutorError::Spawn(_)));
+    assert!(!executor.is_running());
+
+    std::fs::create_dir(&root).unwrap();
+    let result = executor.run("printf recovered").unwrap();
+    assert_eq!(result.outcome, ExecutionOutcome::Exited);
+    assert_eq!(result.output.stdout, "recovered");
 }
 
 #[test]
@@ -133,7 +145,7 @@ fn command_runs_in_fixed_root() {
     let (executor, root) = executor("root", Duration::from_secs(2), 1024);
     let result = executor.run("pwd").unwrap();
     assert_eq!(
-        result.stdout.trim(),
+        result.output.stdout.trim(),
         std::fs::canonicalize(root).unwrap().to_string_lossy()
     );
 }
@@ -161,6 +173,6 @@ fn running_status_reports_output_progress() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(executor.cancel());
-    assert!(handle.join().unwrap().cancelled);
+    assert!(executor.cancel().unwrap());
+    assert!(handle.join().unwrap().outcome == ExecutionOutcome::Cancelled);
 }

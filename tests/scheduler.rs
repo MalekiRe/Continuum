@@ -47,7 +47,10 @@ fn temp_root(label: &str) -> std::path::PathBuf {
 
 fn scheduler(replies: &[&str]) -> (Scheduler<FakeModel>, FakeModel) {
     let model = FakeModel::new(replies);
-    let executor = Executor::new(ExecutorConfig::rooted(temp_root("scheduler"))).unwrap();
+    let executor = Executor::new(ExecutorConfig::with_working_directory(temp_root(
+        "scheduler",
+    )))
+    .unwrap();
     (Scheduler::new(model.clone(), executor), model)
 }
 

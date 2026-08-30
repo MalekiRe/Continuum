@@ -1,41 +1,164 @@
-use serde::{Deserialize, Serialize};
-use std::io::Read;
+mod unix;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 
 const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
-const TERMINATION_GRACE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Error)]
+pub enum ExecutorError {
+    #[error("cannot {operation} executor working directory {path}: {source}")]
+    WorkingDirectory {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to enable child subreaping: {0}")]
+    Subreaper(#[source] io::Error),
+    #[error("executor is already running a command")]
+    AlreadyRunning,
+    #[error("failed to spawn bash: {0}")]
+    Spawn(#[source] io::Error),
+    #[error("missing child {0}")]
+    MissingPipe(&'static str),
+    #[error("failed to signal process group {process_group} with signal {signal}: {source}")]
+    Signal {
+        process_group: i32,
+        signal: i32,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to {operation} bash: {source}")]
+    Process {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read child {stream}: {source}")]
+    OutputRead {
+        stream: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{0} reader panicked")]
+    ReaderPanicked(&'static str),
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-    pub root: PathBuf,
+    pub working_directory: PathBuf,
     pub timeout: Duration,
     pub output_limit: usize,
 }
 
 impl ExecutorConfig {
-    pub fn rooted(root: impl Into<PathBuf>) -> Self {
+    pub fn with_working_directory(working_directory: impl Into<PathBuf>) -> Self {
         Self {
-            root: root.into(),
+            working_directory: working_directory.into(),
             timeout: Duration::from_secs(60),
             output_limit: DEFAULT_OUTPUT_LIMIT,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionResult {
-    pub exit_code: i32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionOutcome {
+    Exited,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedOutput {
     pub stdout: String,
     pub stderr: String,
-    pub timed_out: bool,
-    pub cancelled: bool,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionResult {
+    pub exit_code: i32,
+    pub outcome: ExecutionOutcome,
+    pub output: CapturedOutput,
     pub elapsed_ms: u128,
+}
+
+// The executor's Rust API uses typed outcome/output fields, while the tool wire
+// format deliberately remains compatible with existing transcripts and clients.
+#[derive(Serialize)]
+struct ExecutionResultWireRef<'a> {
+    exit_code: i32,
+    stdout: &'a str,
+    stderr: &'a str,
+    timed_out: bool,
+    cancelled: bool,
+    truncated: bool,
+    elapsed_ms: u128,
+}
+
+#[derive(Deserialize)]
+struct ExecutionResultWire {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+    cancelled: bool,
+    truncated: bool,
+    elapsed_ms: u128,
+}
+
+impl Serialize for ExecutionResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ExecutionResultWireRef {
+            exit_code: self.exit_code,
+            stdout: &self.output.stdout,
+            stderr: &self.output.stderr,
+            timed_out: self.outcome == ExecutionOutcome::TimedOut,
+            cancelled: self.outcome == ExecutionOutcome::Cancelled,
+            truncated: self.output.truncated,
+            elapsed_ms: self.elapsed_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExecutionResultWire::deserialize(deserializer)?;
+        // Old results could represent both flags at once. Cancellation takes
+        // precedence when migrating that invalid state into the typed model.
+        let outcome = if wire.cancelled {
+            ExecutionOutcome::Cancelled
+        } else if wire.timed_out {
+            ExecutionOutcome::TimedOut
+        } else {
+            ExecutionOutcome::Exited
+        };
+        Ok(Self {
+            exit_code: wire.exit_code,
+            outcome,
+            output: CapturedOutput {
+                stdout: wire.stdout,
+                stderr: wire.stderr,
+                truncated: wire.truncated,
+            },
+            elapsed_ms: wire.elapsed_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,12 +171,8 @@ pub struct ExecutorStatus {
 
 #[derive(Debug, Clone, Copy)]
 enum ActivePhase {
-    // This phase is only visible to the thread holding the state lock while it
-    // spawns. It lets that thread reserve the executor before a PID exists.
     Starting,
     Running { process_group: i32 },
-    // Keep the run reserved while its pipe readers finish, but discard the
-    // PGID as soon as the group is gone so it can never refer to a reused PID.
     Draining,
 }
 
@@ -78,24 +197,28 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new(config: ExecutorConfig) -> Result<Self, String> {
-        std::fs::create_dir_all(&config.root).map_err(|e| {
-            format!(
-                "cannot create executor root {}: {}",
-                config.root.display(),
-                e
-            )
+    pub fn new(config: ExecutorConfig) -> Result<Self, ExecutorError> {
+        std::fs::create_dir_all(&config.working_directory).map_err(|source| {
+            ExecutorError::WorkingDirectory {
+                operation: "create",
+                path: config.working_directory.clone(),
+                source,
+            }
         })?;
-        let root = std::fs::canonicalize(&config.root).map_err(|e| {
-            format!(
-                "cannot canonicalize executor root {}: {}",
-                config.root.display(),
-                e
-            )
-        })?;
-        enable_child_subreaping()?;
+        let working_directory =
+            std::fs::canonicalize(&config.working_directory).map_err(|source| {
+                ExecutorError::WorkingDirectory {
+                    operation: "canonicalize",
+                    path: config.working_directory.clone(),
+                    source,
+                }
+            })?;
+        unix::enable_child_subreaping().map_err(ExecutorError::Subreaper)?;
         Ok(Self {
-            config: ExecutorConfig { root, ..config },
+            config: ExecutorConfig {
+                working_directory,
+                ..config
+            },
             state: Arc::new(Mutex::new(ExecutorState::default())),
         })
     }
@@ -118,23 +241,27 @@ impl Executor {
         })
     }
 
-    pub fn cancel(&self) -> bool {
+    pub fn cancel(&self) -> Result<bool, ExecutorError> {
         let mut state = self.lock_state();
         let Some(active) = state.active.as_mut() else {
-            // Cancellation belongs to a particular active run. In particular,
-            // an idle cancellation must not be remembered by the next run.
-            return false;
+            return Ok(false);
         };
         active.cancelled = true;
         if let ActivePhase::Running { process_group } = active.phase {
-            // The state lock keeps cleanup from discarding this PGID (and thus
-            // allowing it to be reused) until after this signal is sent.
-            signal_group(process_group, libc::SIGTERM);
+            // Holding the state lock ensures cleanup cannot retire this PGID
+            // before the signal attempt. ESRCH means it already exited.
+            unix::signal_group(process_group, libc::SIGTERM).map_err(|source| {
+                ExecutorError::Signal {
+                    process_group,
+                    signal: libc::SIGTERM,
+                    source,
+                }
+            })?;
         }
-        true
+        Ok(true)
     }
 
-    pub fn run(&self, command: &str) -> Result<ExecutionResult, String> {
+    pub fn run(&self, command: &str) -> Result<ExecutionResult, ExecutorError> {
         self.run_with_timeout(command, self.config.timeout)
     }
 
@@ -142,18 +269,18 @@ impl Executor {
         &self,
         command: &str,
         timeout: Duration,
-    ) -> Result<ExecutionResult, String> {
-        use std::os::unix::process::CommandExt;
-
+    ) -> Result<ExecutionResult, ExecutorError> {
         let started = Instant::now();
         let stdout_progress = Arc::new(AtomicU64::new(0));
         let stderr_progress = Arc::new(AtomicU64::new(0));
+        // Declared before the mutex guard so unwinding drops the mutex guard
+        // first. Once armed, this guard releases the reservation and, after a
+        // successful spawn, owns process-group cleanup on every exit path.
+        let mut run_guard = RunGuard::new(self);
 
-        // Reserve the one execution slot and retain the lock through spawn.
-        // cancel() can therefore never observe a half-installed PID/PGID.
         let mut state = self.lock_state();
         if state.active.is_some() {
-            return Err("executor is already running a command".into());
+            return Err(ExecutorError::AlreadyRunning);
         }
         state.active = Some(ActiveRun {
             started,
@@ -162,108 +289,82 @@ impl Executor {
             stdout_bytes: stdout_progress.clone(),
             stderr_bytes: stderr_progress.clone(),
         });
+        run_guard.arm();
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
             .arg(command)
-            .current_dir(&self.config.root)
+            .current_dir(&self.config.working_directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let spawn_result = cmd.spawn();
-        let mut child = match spawn_result {
+        unix::configure_process_session(&mut cmd);
+        let child = match cmd.spawn() {
             Ok(child) => child,
-            Err(error) => {
-                state.active = None;
-                return Err(format!("failed to spawn bash: {error}"));
+            Err(source) => {
+                drop(state);
+                return Err(ExecutorError::Spawn(source));
             }
         };
         let process_group = child.id() as i32;
         state.active.as_mut().expect("reserved active run").phase =
             ActivePhase::Running { process_group };
+        run_guard.install_process(child, process_group);
         drop(state);
 
-        // These are guaranteed by Stdio::piped(). If that invariant is ever
-        // broken, clean up the child/group before releasing the run slot.
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => return self.fail_after_spawn(child, process_group, "missing child stdout"),
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => return self.fail_after_spawn(child, process_group, "missing child stderr"),
-        };
+        let stdout = run_guard
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or(ExecutorError::MissingPipe("stdout"))?;
+        let stderr = run_guard
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or(ExecutorError::MissingPipe("stderr"))?;
         let limit = self.config.output_limit;
         let out_reader = thread::spawn(move || read_bounded(stdout, limit, stdout_progress));
         let err_reader = thread::spawn(move || read_bounded(stderr, limit, stderr_progress));
 
-        let mut timed_out = false;
         let mut status: Option<ExitStatus> = None;
-        let mut poll_error = None;
-        loop {
-            let cancelled = self.active_cancelled();
-            if cancelled {
-                break;
+        let outcome = loop {
+            if self.active_cancelled() {
+                break ExecutionOutcome::Cancelled;
             }
             if started.elapsed() >= timeout {
-                timed_out = true;
-                break;
+                break ExecutionOutcome::TimedOut;
             }
-            match child.try_wait() {
+            match run_guard.child_mut().try_wait() {
                 Ok(Some(exit)) => {
                     status = Some(exit);
-                    break;
+                    break ExecutionOutcome::Exited;
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(error) => {
-                    poll_error = Some(format!("failed to poll bash: {error}"));
-                    break;
+                Err(source) => {
+                    return Err(ExecutorError::Process {
+                        operation: "poll",
+                        source,
+                    });
                 }
             }
-        }
+        };
 
-        // Even a successful/early-exiting bash can leave background members
-        // holding its output pipes. Always retire the *whole* process group
-        // before joining readers or declaring the run complete.
-        let cleanup_result = retire_process_group(&mut child, process_group, status);
-        {
-            let mut state = self.lock_state();
-            if let Some(active) = state.active.as_mut() {
-                active.phase = ActivePhase::Draining;
-            }
-        }
-
-        let out_result = out_reader
-            .join()
-            .map_err(|_| "stdout reader panicked".to_string());
-        let err_result = err_reader
-            .join()
-            .map_err(|_| "stderr reader panicked".to_string());
-
-        let cancelled = self.active_cancelled();
-        self.lock_state().active = None;
-
-        if let Some(error) = poll_error {
-            return Err(error);
-        }
-        let status = cleanup_result?;
+        // Always retire the whole group. A successful shell may leave a
+        // background descendant holding an output pipe.
+        let exit = run_guard.retire(status)?;
+        let out_result = join_reader(out_reader, "stdout");
+        let err_result = join_reader(err_reader, "stderr");
         let (stdout_bytes, out_truncated) = out_result?;
         let (stderr_bytes, err_truncated) = err_result?;
+
         Ok(ExecutionResult {
-            exit_code: status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-            timed_out,
-            cancelled,
-            truncated: out_truncated || err_truncated,
+            exit_code: exit.code().unwrap_or(-1),
+            outcome,
+            output: CapturedOutput {
+                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+                truncated: out_truncated || err_truncated,
+            },
             elapsed_ms: started.elapsed().as_millis(),
         })
     }
@@ -280,128 +381,190 @@ impl Executor {
             .as_ref()
             .is_some_and(|active| active.cancelled)
     }
-
-    fn fail_after_spawn(
-        &self,
-        mut child: Child,
-        process_group: i32,
-        message: &str,
-    ) -> Result<ExecutionResult, String> {
-        let _ = retire_process_group(&mut child, process_group, None);
-        self.lock_state().active = None;
-        Err(message.into())
-    }
 }
 
-fn signal_group(process_group: i32, signal: i32) {
-    unsafe {
-        libc::kill(-process_group, signal);
-    }
+struct RunGuard<'a> {
+    executor: &'a Executor,
+    armed: bool,
+    process: Option<(Child, i32)>,
 }
 
-fn process_group_exists(process_group: i32) -> bool {
-    let result = unsafe { libc::kill(-process_group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-fn retire_process_group(
-    child: &mut Child,
-    process_group: i32,
-    mut status: Option<ExitStatus>,
-) -> Result<ExitStatus, String> {
-    // TERM gives shells a brief chance to run their normal signal cleanup.
-    // It is also sent after a normal leader exit: other members can still own
-    // stdout/stderr and would otherwise make reader joins wait indefinitely.
-    signal_group(process_group, libc::SIGTERM);
-    let deadline = Instant::now() + TERMINATION_GRACE;
-    while Instant::now() < deadline {
-        if status.is_none() {
-            status = child
-                .try_wait()
-                .map_err(|e| format!("failed to poll bash during cleanup: {e}"))?;
+impl<'a> RunGuard<'a> {
+    fn new(executor: &'a Executor) -> Self {
+        Self {
+            executor,
+            armed: false,
+            process: None,
         }
-        if !process_group_exists(process_group) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
     }
 
-    // Once SIGKILL has been delivered no live group member can fork or retain
-    // an output descriptor. Reap our direct child before returning.
-    signal_group(process_group, libc::SIGKILL);
-    let status = if let Some(status) = status {
-        status
-    } else {
-        child
-            .wait()
-            .map_err(|e| format!("failed to reap bash: {e}"))?
-    };
-    reap_group_children(process_group)?;
-    Ok(status)
-}
+    fn arm(&mut self) {
+        self.armed = true;
+    }
 
-#[cfg(target_os = "linux")]
-fn enable_child_subreaping() -> Result<(), String> {
-    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    if result == -1 {
-        Err(format!(
-            "failed to make executor a child subreaper: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(())
+    fn install_process(&mut self, child: Child, process_group: i32) {
+        self.process = Some((child, process_group));
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.process.as_mut().expect("spawned process guard").0
+    }
+
+    fn begin_draining(&self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(active) = self.executor.lock_state().active.as_mut() {
+            active.phase = ActivePhase::Draining;
+        }
+    }
+
+    fn retire(&mut self, status: Option<ExitStatus>) -> Result<ExitStatus, ExecutorError> {
+        self.begin_draining();
+        let (child, process_group) = self.process.as_mut().expect("spawned process guard");
+        let exit = unix::retire_process_group(child, *process_group, status)
+            .map_err(|failure| failure.into_executor_error(*process_group))?;
+        self.process = None;
+        Ok(exit)
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn enable_child_subreaping() -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn reap_group_children(process_group: i32) -> Result<(), String> {
-    loop {
-        let mut status = 0;
-        let waited = unsafe { libc::waitpid(-process_group, &mut status, 0) };
-        if waited > 0 {
-            continue;
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.begin_draining();
+        if let Some((child, process_group)) = self.process.as_mut()
+            && let Err(failure) = unix::retire_process_group(child, *process_group, None)
+        {
+            eprintln!(
+                "executor cleanup failed: {}",
+                failure.into_executor_error(*process_group)
+            );
         }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            Some(libc::ECHILD) => return Ok(()),
-            _ => return Err(format!("failed to reap process-group descendant: {error}")),
+        if self.armed {
+            self.executor.lock_state().active = None;
         }
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn reap_group_children(_process_group: i32) -> Result<(), String> {
-    Ok(())
+fn join_reader(
+    reader: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+    stream: &'static str,
+) -> Result<(Vec<u8>, bool), ExecutorError> {
+    reader
+        .join()
+        .map_err(|_| ExecutorError::ReaderPanicked(stream))?
+        .map_err(|source| ExecutorError::OutputRead { stream, source })
 }
 
 fn read_bounded(
     mut reader: impl Read,
     limit: usize,
     byte_count: Arc<AtomicU64>,
-) -> (Vec<u8>, bool) {
+) -> io::Result<(Vec<u8>, bool)> {
     let mut kept = Vec::with_capacity(limit.min(8192));
-    let mut buf = [0u8; 8192];
+    let mut buf = [0_u8; 8192];
     let mut truncated = false;
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                byte_count.fetch_add(n as u64, Ordering::Relaxed);
-                let room = limit.saturating_sub(kept.len());
-                if room > 0 {
-                    kept.extend_from_slice(&buf[..n.min(room)]);
-                }
-                if n > room {
-                    truncated = true;
-                }
-            }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        byte_count.fetch_add(n as u64, Ordering::Relaxed);
+        let room = limit.saturating_sub(kept.len());
+        if room > 0 {
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        if n > room {
+            truncated = true;
         }
     }
-    (kept, truncated)
+    Ok((kept, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingReader(bool);
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.0 {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.0 = true;
+            buffer[..3].copy_from_slice(b"abc");
+            Ok(3)
+        }
+    }
+
+    #[test]
+    fn reservation_guard_releases_during_unwind() {
+        let executor = Executor {
+            config: ExecutorConfig::with_working_directory("unused"),
+            state: Arc::new(Mutex::new(ExecutorState::default())),
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = RunGuard::new(&executor);
+            executor.lock_state().active = Some(ActiveRun {
+                started: Instant::now(),
+                phase: ActivePhase::Starting,
+                cancelled: false,
+                stdout_bytes: Arc::new(AtomicU64::new(0)),
+                stderr_bytes: Arc::new(AtomicU64::new(0)),
+            });
+            guard.arm();
+            panic!("injected panic");
+        }));
+        assert!(!executor.is_running());
+    }
+
+    #[test]
+    fn bounded_reader_propagates_read_errors() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let error = read_bounded(FailingReader(false), 10, progress.clone()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(progress.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn result_wire_format_remains_flat_and_boolean_compatible() {
+        let result = ExecutionResult {
+            exit_code: -1,
+            outcome: ExecutionOutcome::TimedOut,
+            output: CapturedOutput {
+                stdout: "out".into(),
+                stderr: "err".into(),
+                truncated: true,
+            },
+            elapsed_ms: 12,
+        };
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({
+                "exit_code": -1,
+                "stdout": "out",
+                "stderr": "err",
+                "timed_out": true,
+                "cancelled": false,
+                "truncated": true,
+                "elapsed_ms": 12
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_overlapping_flags_deserialize_to_one_outcome() {
+        let result: ExecutionResult = serde_json::from_value(serde_json::json!({
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": true,
+            "cancelled": true,
+            "truncated": false,
+            "elapsed_ms": 1
+        }))
+        .unwrap();
+        assert_eq!(result.outcome, ExecutionOutcome::Cancelled);
+    }
 }

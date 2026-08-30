@@ -104,7 +104,9 @@ fn start_input_thread(
             // Any human intervention cancels an in-flight shell process group.
             persistent_lisp_harness::vm::eval::request_interrupt();
             model_interrupt.request_interrupt();
-            executor.cancel();
+            if let Err(error) = executor.cancel() {
+                slog(format!("[executor] cancellation failed: {error}"));
+            }
             if tx.send(line).is_err() {
                 break;
             }
@@ -190,7 +192,9 @@ fn start_http(tx: mpsc::Sender<String>, executor: Executor, model_interrupt: Mod
                     if !message.is_empty() {
                         persistent_lisp_harness::vm::eval::request_interrupt();
                         model_interrupt.request_interrupt();
-                        executor.cancel();
+                        if let Err(error) = executor.cancel() {
+                            slog(format!("[executor] cancellation failed: {error}"));
+                        }
                         let _ = tx.send(message);
                     }
                     tiny_http::Response::from_string(chat_html()).with_header(
@@ -226,10 +230,11 @@ async fn main() {
     let workspace = std::env::var_os("CONTINUUM_AGENT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("data/workspace").to_path_buf());
-    let executor = Executor::new(ExecutorConfig::rooted(workspace)).unwrap_or_else(|error| {
-        eprintln!("[executor] {}", error);
-        std::process::exit(2);
-    });
+    let executor =
+        Executor::new(ExecutorConfig::with_working_directory(workspace)).unwrap_or_else(|error| {
+            eprintln!("[executor] {}", error);
+            std::process::exit(2);
+        });
     let scheduler = Scheduler::new(OpenRouterModel::default(), executor.clone());
     let model_interrupt = scheduler.model_interrupt_handle();
     let (tx, rx) = mpsc::channel();

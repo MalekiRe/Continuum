@@ -3,7 +3,10 @@ pub mod kernel;
 pub mod scheduler;
 pub mod vm;
 
-pub use executor::{ExecutionResult, Executor, ExecutorConfig, ExecutorStatus};
+pub use executor::{
+    CapturedOutput, ExecutionOutcome, ExecutionResult, Executor, ExecutorConfig, ExecutorError,
+    ExecutorStatus,
+};
 pub use kernel::{
     FrameStatus, Kernel, PendingMessage, PendingTrap, SnapshotInfo, TranscriptEntry, VmTrap,
 };
