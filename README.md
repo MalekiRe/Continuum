@@ -31,9 +31,9 @@ A Scheme-like Lisp with:
 
 **Safepoint interrupts.** The kernel can interrupt Lisp evaluation from another thread. A global atomic flag is checked every 1,000 expressions — when set, evaluation terminates at the next safepoint. Lisp code can set and clear this flag with `system/interrupt` and `system/clear-interrupt`.
 
-**Supervision.** Every cognition loop iteration checks two conditions:
-- **15-minute absolute timeout**: if a top-level eval has been running for 15+ minutes, it's interrupted.
-- **Token-aware timeout**: if elapsed time exceeds 4× the expected time for the reported token count (at a configurable baseline of 10 tok/s), the agent may be stuck in a blocking tool call (e.g., `bash`). Lisp code reports token usage with `(system/report-tokens N)` after model calls, enabling the supervisor to distinguish "thinking" from "stuck".
+**Supervision.** Every cognition loop iteration checks two timeouts:
+- **Absolute timeout** (default 900s): if a top-level eval has been running too long, it's unconditionally interrupted.
+- **Rolling-window token-aware timeout**: token reports from Lisp (`(system/report-tokens N)`) are tracked in a sliding window (default 60s). If the effective token rate drops below the minimum (default 2 tok/s) and the eval has been running long enough (30s), the supervisor interrupts. This catches agents stuck in blocking `bash` calls — even if they reported tokens minutes ago. All thresholds are configurable via `SupervisionConfig` on the kernel.
 
 **Human interaction.** Human messages are queued as interrupts to every active frame. Current work is suspended at the next safepoint, the interaction runs, and the agent returns `control/Continue` or `(control/CancelCurrent ...)`.
 

@@ -5,6 +5,7 @@ use crate::vm::env::EnvRef;
 use crate::vm::eval;
 use crate::vm::value::Value;
 use crate::vm::value::Function;
+use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,9 +23,11 @@ pub struct Kernel {
     pub event_counter: u64,
     pub next_frame_id: u64,
     pub version: String,
+    pub supervision: SupervisionConfig,
         pub wake_timers: Vec<WakeEntry>,
     pub eval_started_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub total_tokens: u64,
+    #[serde(skip)]
+    pub token_reports: VecDeque<(chrono::DateTime<chrono::Utc>, u64)>,
 }
 
 /// An agent frame.
@@ -99,6 +102,35 @@ pub enum SnapshotKind {
     Incremental,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisionConfig {
+    /// Window in seconds for rolling token rate calculation.
+    pub window_seconds: u64,
+    /// Minimum token rate (tok/s) within the window to consider the agent productive.
+    pub min_tokens_per_sec: u64,
+    /// Don't check rolling rate until eval has been running at least this long.
+    pub min_elapsed_seconds: u64,
+    /// Absolute eval timeout in seconds (unconditional).
+    pub max_eval_seconds: u64,
+    /// Expected token generation rate for time-vs-tokens comparison.
+    pub expected_tokens_per_sec: u64,
+    /// Multiplier: if elapsed > expected_tokens_per_sec * multiplier * seconds, interrupt.
+    pub timeout_multiplier: u64,
+}
+
+impl Default for SupervisionConfig {
+    fn default() -> Self {
+        SupervisionConfig {
+            window_seconds: 60,
+            min_tokens_per_sec: 2,
+            min_elapsed_seconds: 30,
+            max_eval_seconds: 900,
+            expected_tokens_per_sec: 10,
+            timeout_multiplier: 4,
+        }
+    }
+}
+
 impl Kernel {
     pub fn new() -> Self {
         let mut kernel = Kernel {
@@ -106,11 +138,12 @@ impl Kernel {
             frames: Vec::new(),
                         wake_timers: Vec::new(),
             eval_started_at: None,
-            total_tokens: 0,
+            token_reports: VecDeque::new(),
             storage: SnapshotConfig::default(),
             event_counter: 0,
             next_frame_id: 1,
             version: "0.1.0".into(),
+            supervision: SupervisionConfig::default(),
 
         };
 

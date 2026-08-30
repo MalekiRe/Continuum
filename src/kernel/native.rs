@@ -194,7 +194,9 @@ impl Kernel {
                 Value::Float(f) => *f as i64,
                 _ => return Err("system/report-tokens: expected integer".into()),
             };
-            _kernel.total_tokens += count as u64;
+            if count > 0 {
+                _kernel.token_reports.push_back((chrono::Utc::now(), count as u64));
+            }
             Ok(Value::keyword("ok"))
         });
         self.define_native("system/snapshot", 0, |_kernel, _args| {

@@ -102,22 +102,54 @@ fn check_supervision(kernel: &mut Kernel) {
     let Some(started_at) = kernel.eval_started_at else {
         return;
     };
-    let elapsed = (chrono::Utc::now() - started_at).num_seconds() as u64;
+    let now = chrono::Utc::now();
+    let elapsed = (now - started_at).num_seconds() as u64;
+    let cfg = &kernel.supervision;
 
-    // Absolute timeout: 15 minutes
-    if elapsed >= 900 {
-        println!("[supervisor] eval ran for {}s — interrupting", elapsed);
+    // 1. Absolute timeout — unconditional
+    if elapsed >= cfg.max_eval_seconds {
+        println!("[supervisor] eval ran for {}s — interrupting (max {})", 
+            elapsed, cfg.max_eval_seconds);
         persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
         return;
     }
 
-    // Token-aware timeout: if time > 4x expected at 10 tok/s, agent may be stuck in bash
-    let tokens = kernel.total_tokens;
-    let expected_secs = tokens / 10;
-    if expected_secs > 0 && elapsed > expected_secs * 4 {
-        println!("[supervisor] {}s elapsed with only {} tokens (expected ~{}s) — interrupting", 
-            elapsed, tokens, expected_secs);
-        persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // 2. Rolling window check — only after min_elapsed_seconds
+    if elapsed < cfg.min_elapsed_seconds {
+        return;
+    }
+
+    // Drain entries older than the window
+    let cutoff = now - chrono::Duration::seconds(cfg.window_seconds as i64);
+    while let Some(front) = kernel.token_reports.front() {
+        if front.0 < cutoff {
+            kernel.token_reports.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    // Sum tokens in the window
+    let window_tokens: u64 = kernel.token_reports.iter().map(|(_, n)| n).sum();
+    let effective_tok_per_sec = if cfg.window_seconds > 0 {
+        window_tokens / cfg.window_seconds
+    } else {
+        0
+    };
+
+    // If below min_tokens_per_sec, we might be stuck in a blocking call
+    if effective_tok_per_sec < cfg.min_tokens_per_sec {
+        // Double-check with lifetime rate: if lifetime rate is also low, we're stuck
+        let lifetime_expected_secs = window_tokens / cfg.expected_tokens_per_sec;
+        if lifetime_expected_secs > 0 && elapsed > lifetime_expected_secs * cfg.timeout_multiplier {
+            println!("[supervisor] {}s elapsed, {}/s rolling tok rate (min {}), {} lifetime tokens — interrupting",
+                elapsed, effective_tok_per_sec, cfg.min_tokens_per_sec, window_tokens);
+            persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if window_tokens == 0 && elapsed >= cfg.min_elapsed_seconds * 2 {
+            // No tokens at all for a long time — definitely stuck
+            println!("[supervisor] {}s elapsed with zero tokens reported — interrupting", elapsed);
+            persistent_lisp_harness::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
