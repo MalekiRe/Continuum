@@ -24,7 +24,7 @@ pub struct Kernel {
     pub event_counter: u64,
     pub next_frame_id: u64,
     pub version: String,
-pub wake_timers: Vec<WakeEntry>,
+    pub wake_timers: Vec<WakeEntry>,
 }
 
 /// An agent frame.
@@ -429,14 +429,11 @@ impl Kernel {
         let bytes = std::fs::read(&latest_path)
             .map_err(|e| format!("cannot read snapshot: {}", e))?;
 
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+        let Snapshot { kernel: kernel_raw, env: env_raw, .. } = serde_json::from_slice(&bytes)
             .map_err(|e| format!("cannot deserialize snapshot: {}", e))?;
 
-        let mut kernel: Kernel = serde_json::from_value(parsed["kernel"].clone())
-            .map_err(|e| format!("cannot deserialize kernel: {}", e))?;
-
-        let mut env: EnvRef = serde_json::from_value(parsed["env"].clone())
-            .map_err(|e| format!("cannot deserialize env: {}", e))?;
+        let mut kernel = kernel_raw;
+        let mut env = env_raw;
 
         // Re-register native function pointers (they can't survive serialization)
         kernel.register_tools(&mut env);

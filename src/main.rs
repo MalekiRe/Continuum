@@ -144,7 +144,7 @@ fn run_cognition_turn(kernel: &mut Kernel, env: &mut EnvRef) {
         }
         Err(e) => {
             println!("[agent] error: {}", e);
-        kernel.snapshot(SnapshotKind::Incremental, env);
+            kernel.snapshot(SnapshotKind::Incremental, env);
         }
     }
 }

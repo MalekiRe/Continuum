@@ -172,9 +172,9 @@ fn eval_define(args: &[Value], kernel: &mut Kernel, env: &mut EnvRef) -> Result<
             }
             let val = eval_value(args[1].clone(), kernel, env)?;
             if !name.contains('/') {
-                env.define(&format!("user/{}", name), val.clone()).map_err(|e| EvalError::SyntaxError(e))?;
+                env.define(&format!("user/{}", name), val).map_err(|e| EvalError::SyntaxError(e))?;
             } else {
-                env.define(name, val.clone()).map_err(|e| EvalError::SyntaxError(e))?;
+                env.define(name, val).map_err(|e| EvalError::SyntaxError(e))?;
             }
             Ok(Value::Symbol(name.clone()))
         }

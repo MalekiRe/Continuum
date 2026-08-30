@@ -268,73 +268,25 @@ impl EnvRef {
     }
 
     /// Undefine a data family, removing all its constructors atomically.
+        /// Undefine a data family, removing all its constructors atomically.
     pub fn undefine_data_family(&mut self, family_name: &str) -> Result<(), String> {
-        // The family name can be either "Foo" or "my/Foo"
-        // Constructors are stored as "user/{family}/{variant}" in the user namespace
-        // The key in the user namespace is "{family}/{variant}"
+        let leaf = family_name.split('/').last().unwrap_or(family_name).to_string();
 
-        // Normalize the family name
-        let name = if family_name.contains('/') {
-            family_name.to_string()
-        } else {
-            family_name.to_string()
-        };
-
-        // Collect all constructor names to remove from the user namespace
-        // They are stored as "{family}/{variant}" in the user namespace bindings
-        let mut found = false;
-        let mut to_remove = Vec::new();
-
-        // Check all namespaces for the data family definition
-        for ns in self.namespaces.values() {
-            for (fam_name, family) in &ns.data_families {
-                // Match if fam_name == name or fam_name is the last component of name
-                let matches = fam_name == &name || name.ends_with(fam_name);
-                if matches {
-                    found = true;
-                    for variant in &family.variants {
-                        // Constructor stored as user/{full-family}/{variant}
-                        // So the key in user namespace is {full-family}/{variant}
-                        // Use the full family name from the binding (fam_name might be just "Foo" 
-                        // but the actual key in user namespace is "my/Foo/Bar")
-                        // Store the full family name for accurate removal
-                        let ctor_key = format!("{}/{}", fam_name, variant.name);
-                        // Also try to find the constructor by scanning the user namespace
-                        // for keys matching */{variant} where * ends with fam_name
-                        // This handles the case where the full family path is different
-                        to_remove.push(ctor_key);
-                    }
-                }
-            }
+        // Check if this family exists in any namespace
+        let exists = self.namespaces.values().any(|ns| ns.data_families.contains_key(&leaf));
+        if !exists {
+            return Err(format!("data family '{}' not found", family_name));
         }
 
-        if !found {
-            return Err(format!("data family '{}' not found", name));
-        }
-
-        // Remove constructors from the user namespace
-        if let Some(user_ns) = Arc::make_mut(&mut self.namespaces).get_mut("user") {
-            for ctor_key in &to_remove {
-                // Try exact match first
-                if user_ns.bindings.remove(ctor_key).is_none() {
-                    // Try scanning for keys that end with this variant
-                    let keys_to_remove: Vec<String> = user_ns.bindings.keys()
-                        .filter(|k| k.ends_with(ctor_key) || k.ends_with(&format!("/{}", ctor_key)))
-                        .cloned()
-                        .collect();
-                    for k in keys_to_remove {
-                        user_ns.bindings.remove(&k);
-                    }
-                }
-            }
+        // Remove constructors from user namespace by prefix
+        if let Some(user) = Arc::make_mut(&mut self.namespaces).get_mut("user") {
+            let prefix = format!("{}/", leaf);
+            user.bindings.retain(|k, _| !k.starts_with(&prefix));
         }
 
         // Remove the family metadata from all namespaces
         for ns in Arc::make_mut(&mut self.namespaces).values_mut() {
-            ns.data_families.retain(|k, _| {
-                let retain = k != &name && !name.ends_with(k);
-                retain
-            });
+            ns.data_families.retain(|k, _| k != &leaf);
         }
 
         Ok(())
