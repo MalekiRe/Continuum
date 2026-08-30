@@ -4,8 +4,13 @@ use crate::vm::env::{EnvRef, DataVariant, DataFamily};
 use crate::vm::reader;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
+use std::sync::Mutex;
 /// Global interrupt flag — set by kernel to request interruption of Lisp evaluation.
 pub static EVAL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Global print hook — set by main.rs to capture all output.
+pub static PRINT_HOOK: std::sync::LazyLock<Mutex<Option<fn(&str)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Turn counter — incremented on every evaluated expression for safepoint checks.
 pub static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);

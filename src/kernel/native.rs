@@ -115,12 +115,22 @@ impl Kernel {
         });
 
         self.define_native("kernel/display", 1, |_kernel, args| {
-            print!("{}", args[0]);
+            let msg = format!("{}", args[0]);
+            if let Some(hook) = *crate::vm::eval::PRINT_HOOK.lock().unwrap() {
+                hook(&msg);
+            } else {
+                print!("{}", msg);
+            }
             Ok(args[0].clone())
         });
 
         self.define_native("kernel/println", 1, |_kernel, args| {
-            println!("{}", args[0]);
+            let msg = format!("{}", args[0]);
+            if let Some(hook) = *crate::vm::eval::PRINT_HOOK.lock().unwrap() {
+                hook(&msg);
+            } else {
+                println!("{}", msg);
+            }
             Ok(args[0].clone())
         });
 
@@ -281,6 +291,17 @@ impl Kernel {
         });
 
         
+
+        self.define_native("sleep", 1, |_kernel, args| {
+            let ms = match &args[0] {
+                Value::Int(n) => *n,
+                Value::Float(f) => *f as i64,
+                _ => return Err("sleep: expected integer milliseconds".into()),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+            Ok(Value::keyword("awake"))
+        });
+
         self.define_native("wake", 2, |_kernel, args| {
             let duration_ms = match &args[0] {
                 Value::Int(ms) => *ms,

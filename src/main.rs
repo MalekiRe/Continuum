@@ -86,8 +86,8 @@ fn maybe_restart_agent(kernel: &mut Kernel) -> bool {
     if kernel.frames.is_empty()
         || kernel.frames.iter().all(|f| f.status == FrameStatus::Completed)
     {
-        slog("[agent] all frames completed. Restarting...");
-        kernel.eval("(agent/loop \"Initial context\")").ok();
+        slog("[agent] all frames completed. Starting fresh...");
+        kernel.eval("(println \"Agent ready\")").ok();
         true
     } else {
         false
@@ -183,26 +183,13 @@ fn check_supervision(kernel: &mut Kernel) {
 }
 /// Run one cognition turn for the agent.
 fn run_cognition_turn(kernel: &mut Kernel) {
-    let has_pending = kernel
-        .frames
-        .last()
-        .map(|f| !f.message_queue.is_empty())
-        .unwrap_or(false);
-
-    let source = if has_pending {
-        if let Some(msg) = kernel.take_pending_message() {
-            format!("(agent/cognize \"Human message: {}\")", msg)
-        } else {
-            "(agent/loop nil)".to_string()
-        }
-    } else {
-        "(agent/loop nil)".to_string()
+    let Some(msg) = kernel.take_pending_message() else {
+        return;
     };
+    let source = format!("(agent/cognize \"{}\")", msg);
 
     match kernel.eval(&source) {
-        Ok(_) => {
-            // Continue immediately — no backoff
-        }
+        Ok(_) => {}
         Err(e) => {
             slog(&format!("[agent] error: {}", e));
             kernel.snapshot(SnapshotKind::Incremental);
@@ -229,12 +216,12 @@ fn main() {
           (Indeterminate problem))
 
         (define (agent/cognize context)
-          (println "[agent] context:" context)
+          (println context)
           context)
-
-        (define (agent/loop context)
-          (agent/loop (agent/cognize context)))
     "#;
+
+    // Route all Lisp output through the log buffer
+    *persistent_lisp_harness::vm::eval::PRINT_HOOK.lock().unwrap() = Some(|msg| slog(msg));
 
     match kernel.eval(agent_core) {
         Ok(_) => slog("[agent] core loaded"),
@@ -358,6 +345,8 @@ fn main() {
             continue;
         }
 
+        // Check for pending messages and cognize
         run_cognition_turn(kernel);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
