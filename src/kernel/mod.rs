@@ -140,25 +140,12 @@ impl Kernel {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, eval::EvalError> {
-        // Record event
-
         let result = eval::eval(source, self);
 
         result
     }
 
-    /// Interrupt the currently running Lisp evaluation (safepoint mechanism).
-    pub fn interrupt_eval(&self) {
-        crate::vm::eval::EVAL_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Reset the interrupt flag after handling.
-    pub fn clear_interrupt(&self) {
-        crate::vm::eval::EVAL_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
-        crate::vm::eval::TURN_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Evaluate Lisp in a read-eval-print loop, returning the result as a display string.
+/// Evaluate Lisp in a read-eval-print loop, returning the result as a display string.
     /// Checks that the source hasn't been cancelled before executing.
     pub fn eval_repl(&mut self, source: &str) -> String {
         // Check if this source matches a cancelled call
@@ -192,11 +179,7 @@ impl Kernel {
 
     
 
-    pub fn current_frame_id(&self) -> Option<String> {
-        self.frames.last().map(|f| f.id.clone())
-    }
-
-    /// Create a child frame for a subagent call.
+/// Create a child frame for a subagent call.
     /// Returns the child's frame ID.
     pub fn spawn_subagent(&mut self, name: &str, request: &str) -> Result<String, String> {
         let id = format!("frame-{}", self.next_frame_id);
@@ -228,8 +211,6 @@ impl Kernel {
         // Push child frame, evaluate the request setup
         self.frames.push(frame);
         let _ = self.eval(&child_source);
-
-        // Record event
 
         Ok(id)
     }

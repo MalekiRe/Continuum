@@ -243,17 +243,6 @@ impl EnvRef {
         ns.data_families.insert(name, family);
     }
 
-    pub fn get_data_family(&self, family_name: &str) -> Option<&DataFamily> {
-        for ns in self.namespaces.values() {
-            for (fam_name, family) in &ns.data_families {
-                if fam_name == family_name || family_name.ends_with(fam_name) || fam_name.ends_with(family_name) {
-                    return Some(family);
-                }
-            }
-        }
-        None
-    }
-
     pub fn is_data_family(&self, name: &str) -> bool {
         // Check if any namespace has a data family matching this name
         // name can be "Foo" or "my/Foo"

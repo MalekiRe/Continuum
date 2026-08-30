@@ -41,9 +41,7 @@ pub enum EvalError {
     SyntaxError(String),
     UserError(String),
     KernelError(String),
-    NotADataFamily(String),
     InvalidPattern(String),
-    AuthorityDenied(String),
     TailCall(Value),
 }
 
@@ -57,9 +55,7 @@ impl std::fmt::Display for EvalError {
             EvalError::SyntaxError(s) => write!(f, "syntax error: {}", s),
             EvalError::UserError(s) => write!(f, "error: {}", s),
             EvalError::KernelError(s) => write!(f, "kernel error: {}", s),
-            EvalError::NotADataFamily(s) => write!(f, "not a data family: {}", s),
             EvalError::InvalidPattern(s) => write!(f, "invalid pattern: {}", s),
-            EvalError::AuthorityDenied(s) => write!(f, "authority denied: {}", s),
             EvalError::TailCall(_) => write!(f, "tail call"),
         }
     }

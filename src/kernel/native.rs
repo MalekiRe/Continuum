@@ -191,13 +191,7 @@ impl Kernel {
                 let snap = _kernel.snapshot(SnapshotKind::Incremental);
                 Ok(Value::string(&format!("snapshot saved: {}", snap.id)))
         });
-        self.define_native("system/event-log", 0, |_kernel, _args| {
-                Ok(Value::string(&format!(
-                    "{} events recorded (latest id: {})",
-                    _kernel.event_counter, _kernel.event_counter
-                )))
-        });
-        self.define_native("inspect/namespaces", 0, |_kernel, _args| {
+                self.define_native("inspect/namespaces", 0, |_kernel, _args| {
                 let names: Vec<Value> = _kernel.env.namespace_names().iter().map(|n| {
                     let count = _kernel.env.namespaces.get(n)
                         .map(|ns| ns.list_bindings().len())

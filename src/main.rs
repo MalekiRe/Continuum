@@ -206,6 +206,7 @@ fn main() {
         }
         check_hourly_snapshot(kernel, &mut hourly_timer);
         check_supervision(kernel, &mut supervision_timer);
+        kernel.check_wake_timers();
 
 
         if maybe_restart_agent(kernel) {

@@ -84,7 +84,7 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 | Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
 | Control | `control/Continue` `control/CancelCurrent` `control/Error` |
 | System | `system/clock` `system/version` `system/interrupt` `system/clear-interrupt` |
-| Persistence | `system/snapshot` `system/event-log` |
+| Persistence | `system/snapshot` |
 | Inspection | `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/source` `inspect/history` |
 | Subagents | `agent/call` |
 | Shell | `bash` |
