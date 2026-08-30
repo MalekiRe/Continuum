@@ -3,6 +3,7 @@ use crate::kernel::{FrameStatus, Kernel, TranscriptEntry, VmTrap};
 use crate::vm::reader;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -11,6 +12,41 @@ use tokio_util::sync::CancellationToken;
 pub struct ModelRequest {
     pub system: String,
     pub context: String,
+}
+
+const MODEL_CONTEXT_LIMIT: usize = 62_000;
+
+struct ContextBuilder {
+    text: String,
+    remaining: usize,
+}
+
+impl ContextBuilder {
+    fn new(limit: usize) -> Self {
+        Self { text: String::with_capacity(limit), remaining: limit }
+    }
+
+    fn section(&mut self, heading: &str, body: &str, budget: usize) {
+        if body.is_empty() || self.remaining == 0 { return; }
+        let prefix = format!("\n# {heading}\n");
+        if prefix.len() >= self.remaining { return; }
+        self.text.push_str(&prefix);
+        self.remaining -= prefix.len();
+        let allowed = budget.min(self.remaining);
+        let rendered = truncate(body, allowed);
+        self.text.push_str(&rendered);
+        self.remaining -= rendered.len();
+        if self.remaining > 0 && !self.text.ends_with('\n') {
+            self.text.push('\n');
+            self.remaining -= 1;
+        }
+    }
+
+    fn finish(mut self, directive: &str) -> String {
+        let rendered = truncate(directive, self.remaining);
+        self.text.push_str(&rendered);
+        self.text
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -415,137 +451,70 @@ impl<M: ModelClient> Scheduler<M> {
     }
 
     pub fn build_request(&self, kernel: &Kernel) -> ModelRequest {
-        let frame = kernel
-            .frames
-            .last()
-            .expect("build_request requires a frame");
-        let mut context = String::from(
-            "# Active frame stack
-",
-        );
-        for active in &kernel.frames {
-            context.push_str(&format!(
-                "- {} [{}] {:?}
-",
-                active.name, active.id, active.status
-            ));
-        }
-        context.push_str(
-            "
-# Current task and notices
-",
-        );
+        let frame = kernel.frames.last().expect("build_request requires a frame");
+        let directive = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be top-level forms.\n";
+        let mut context = ContextBuilder::new(MODEL_CONTEXT_LIMIT - directive.len());
+
+        let mut notices = String::new();
         for message in &frame.messages {
             match &message.id {
-                Some(id) => context.push_str(&format!(
-                    "- Human message [{}]: {}
-",
-                    id,
-                    truncate(&message.text, 2_000)
-                )),
-                None => context.push_str(&format!(
-                    "- {}
-",
-                    truncate(&message.text, 2_000)
-                )),
+                Some(id) => {
+                    let _ = writeln!(notices, "- Human message [{}]: {}", id, truncate(&message.text, 2_000));
+                }
+                None => {
+                    let _ = writeln!(notices, "- {}", truncate(&message.text, 2_000));
+                }
             }
         }
-        if !frame.state.compacted_context.is_empty() {
-            context.push_str(
-                "
-# Earlier compacted context
-",
-            );
-            context.push_str(&truncate(&frame.state.compacted_context, 16_000));
-            context.push('\n');
-        }
-        context.push_str(
-            "
-# Recent Lisp actions and results
-",
-        );
-        for entry in &frame.state.transcript {
-            context.push_str(&format!(
-                "> {}
-{}
-",
-                truncate(&entry.source, 600),
-                truncate(&entry.result, 1_200),
-            ));
-        }
+        context.section("Current human messages and notices", &notices, 12_000);
 
-        let mut visible = String::new();
+        let mut stack = String::new();
+        for active in &kernel.frames {
+            let _ = writeln!(stack, "- {} [{}] {:?}", active.name, active.id, active.status);
+        }
+        context.section("Active frame stack", &stack, 4_000);
+
+        let mut guidance = String::new();
+        for hook in &frame.state.context_hooks {
+            let _ = writeln!(guidance, "Hook: {}", truncate(hook, 2_000));
+        }
+        for entry in &frame.state.memory {
+            let _ = writeln!(guidance, "{}: {}", truncate(&entry.key, 200), truncate(&entry.value, 1_000));
+        }
+        context.section("Context hooks and selected memory", &guidance, 12_000);
+
+        let mut recent = String::new();
+        for entry in &frame.state.transcript {
+            let _ = writeln!(recent, "> {}\n{}", truncate(&entry.source, 600), truncate(&entry.result, 1_200));
+        }
+        context.section("Recent Lisp actions and results", &recent, 24_000);
+        context.section("Earlier compacted context", &frame.state.compacted_context, 6_000);
+
+        let mut library = String::new();
         for name in kernel.env.namespace_names() {
             let bindings = kernel.inspect_namespace(&name).unwrap_or_default();
-            visible.push_str(&format!(
-                "{}: {}
-",
-                name,
-                bindings.join(", ")
-            ));
+            let _ = writeln!(library, "{}: {}", name, bindings.join(", "));
         }
-        context.push_str(
-            "
-# Visible namespaces and bindings
-",
-        );
-        context.push_str(&truncate(&visible, 8_000));
-
-        let mut definitions = String::new();
-        for (namespace, values) in kernel.env.namespaces.iter() {
+        let _ = writeln!(library, "\nDefinitions with retained source:");
+        for (namespace, values) in &kernel.env.namespaces {
             let mut names: Vec<_> = values.sources.keys().collect();
             names.sort();
             for name in names {
-                definitions.push_str(&format!(
-                    "- {}/{}
-",
-                    namespace, name
-                ));
+                let _ = writeln!(library, "- {}/{}", namespace, name);
             }
         }
-        context.push_str(
-            "
-# Definitions with retained source
-",
-        );
-        context.push_str(&truncate(&definitions, 4_000));
+        context.section("Library discovery", &library, 4_000);
 
-        if !frame.state.memory.is_empty() {
-            context.push_str(
-                "
-# Selected persistent memory
-",
-            );
-            for entry in &frame.state.memory {
-                context.push_str(&format!(
-                    "{}: {}
-",
-                    truncate(&entry.key, 200),
-                    truncate(&entry.value, 1_000)
-                ));
-            }
-        }
-        for hook in &frame.state.context_hooks {
-            context.push_str(
-                "
-# Context hook
-",
-            );
-            context.push_str(&truncate(hook, 2_000));
-        }
-        context = truncate(&context, 62_000);
-        context.push_str("
-Emit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be top-level forms.
-");
         ModelRequest {
             system: if frame.state.instructions.is_empty() {
                 "You are Continuum, a persistent agent inhabiting a Lisp world. Choose one useful Lisp action.".into()
             } else {
-                frame.state.instructions.clone()
+                truncate(&frame.state.instructions, 16_000)
             },
-            context,
+            context: context.finish(directive),
         }
     }
+
 
     fn compact_current_frame(&self, kernel: &mut Kernel) {
         let Some(frame) = kernel.frames.last_mut() else {
