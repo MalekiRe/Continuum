@@ -491,6 +491,40 @@ self.define_native("kernel/error", 1, |_kernel, args| {
                     None => Err(format!("no binding for {}", name)),
                 }
         });
+        self.define_native("eval-code", 1, |_kernel, args| {
+            let source = match &args[0] {
+                Value::String(s) => s.clone(),
+                other => return Err(format!("eval-code: expected string, got {}", other)),
+            };
+            match _kernel.eval(&source) {
+                Ok(v) => Ok(Value::string(&format!("{}", v))),
+                Err(e) => Ok(Value::string(&format!("error: {}", e))),
+            }
+        });
+        self.define_native("string-search", 2, |_kernel, args| {
+            let needle = format!("{}", args[0]);
+            let haystack = format!("{}", args[1]);
+            if let Some(i) = haystack.find(&needle) {
+                Ok(Value::Int(i as i64))
+            } else {
+                Ok(Value::Bool(false))
+            }
+        });
+        self.define_native("substring", 3, |_kernel, args| {
+            let s = format!("{}", args[0]);
+            let start = match &args[1] {
+                Value::Int(i) => *i as usize,
+                _ => return Err("substring: expected integer start".into()),
+            };
+            let end = match &args[2] {
+                Value::Int(i) => *i as usize,
+                _ => return Err("substring: expected integer end".into()),
+            };
+            let end = end.min(s.len());
+            let start = start.min(end);
+            Ok(Value::string(&s[start..end]))
+        });
+
 
         // history/read — read a specific event by ID
 

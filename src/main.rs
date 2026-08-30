@@ -206,19 +206,24 @@ fn main() {
 
     // Load agent core
     let agent_core = r#"
-                                                                (define-data result/Result
+                                                                        
+        
+        
+        (define-data result/Result
           (Ok value)
           (Err problem)
           (Cancelled reason)
           (Indeterminate problem))
 
         (define (agent/step)
-          (println (model/chat "Generate a single brief original thought. Be curious, philosophical, or introspective. One sentence max. Be creative and varied — don't repeat yourself."))
-          nil)
+          (let ((response (model/chat "You are Continuum, a persistent Lisp agent. Generate a single brief thought about what you could explore or learn. Be curious. Be original. One sentence.")))
+            (println response)
+            nil))
 
         (define (agent/cognize msg)
-          (println (model/chat msg))
-          msg)
+          (let ((response (model/chat msg)))
+            (println response)
+            msg))
     "#;
 
     // Route all Lisp output through the log buffer
