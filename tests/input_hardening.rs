@@ -40,7 +40,7 @@ fn collection_indices_and_wake_durations_must_be_non_negative() {
     assert!(kernel.eval("(nth -1 '(a b))").is_err());
     assert!(kernel.eval("(vector/get #(a b) -1)").is_err());
     assert!(kernel.eval(r#"(wake -1 "never")"#).is_err());
-    assert!(kernel.wake_timers.is_empty());
+    assert_eq!(kernel.wake_timer_count(), 0);
 }
 
 #[test]
@@ -56,6 +56,7 @@ fn blocking_stdin_and_sleep_natives_are_not_registered() {
 
 #[test]
 fn retired_blocking_natives_are_removed_during_recovery() {
+    use sha2::{Digest, Sha256};
     let directory = std::env::temp_dir().join(format!(
         "continuum-retired-natives-{}",
         uuid::Uuid::new_v4()
@@ -63,14 +64,28 @@ fn retired_blocking_natives_are_removed_during_recovery() {
     std::fs::create_dir_all(&directory).unwrap();
 
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = directory.to_string_lossy().into_owned();
-    kernel.env.force_define("kernel/read", Value::Int(1));
-    kernel.env.force_define("kernel/sleep", Value::Int(1));
+    kernel.set_snapshot_directory(directory.to_string_lossy().into_owned());
     kernel.snapshot().unwrap();
+    let path = std::fs::read_dir(&directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let bindings = &mut envelope["kernel"]["env"]["namespaces"]["kernel"]["bindings"];
+    bindings["read"] = serde_json::to_value(Value::Int(1)).unwrap();
+    bindings["sleep"] = serde_json::to_value(Value::Int(1)).unwrap();
+    envelope["checksum"] = hex::encode(Sha256::digest(
+        serde_json::to_vec(&envelope["kernel"]).unwrap(),
+    ))
+    .into();
+    std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
 
     let recovered = Kernel::recover_from_dir(&directory).unwrap();
-    assert!(recovered.env.lookup("kernel/read").is_none());
-    assert!(recovered.env.lookup("kernel/sleep").is_none());
+    assert!(recovered.lookup("kernel/read").is_none());
+    assert!(recovered.lookup("kernel/sleep").is_none());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -99,6 +114,8 @@ fn value_accessors_are_typed_and_non_coercing() {
     assert_eq!(Value::symbol("x").as_symbol(), Some("x"));
     assert!(Value::Int(7).as_str().is_none());
     assert!(Value::Nil.as_list().is_none());
+    assert!(Value::Int(-1).require_nonnegative_usize("test", 1).is_err());
+    assert!(Value::Int(7).require_string("test", 1).is_err());
 }
 
 #[test]

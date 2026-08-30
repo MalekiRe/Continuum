@@ -1,6 +1,7 @@
-use crate::executor::{ExecutionResult, Executor};
-use crate::kernel::{FrameStatus, Kernel, TranscriptEntry, VmTrap};
-use crate::vm::reader;
+use crate::executor::{ExecutionResult, Executor, ExecutorError};
+use crate::ids::{FrameId, MessageId};
+use crate::kernel::{FrameStatus, Kernel, MessageError, TranscriptEntry, VmTrap};
+use crate::vm::reader::{self, ReadError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -38,20 +39,19 @@ impl ContextBuilder {
             return;
         }
         self.text.push_str(&prefix);
-        self.remaining -= prefix.len();
+        self.remaining = self.remaining.saturating_sub(prefix.len());
         let allowed = budget.min(self.remaining);
         let rendered = truncate(body, allowed);
         self.text.push_str(&rendered);
-        self.remaining -= rendered.len();
+        self.remaining = self.remaining.saturating_sub(rendered.len());
         if self.remaining > 0 && !self.text.ends_with('\n') {
             self.text.push('\n');
-            self.remaining -= 1;
+            self.remaining = self.remaining.saturating_sub(1);
         }
     }
 
     fn finish(mut self, directive: &str) -> String {
-        let rendered = truncate(directive, self.remaining);
-        self.text.push_str(&rendered);
+        self.text.push_str(directive);
         self.text
     }
 }
@@ -81,6 +81,29 @@ pub enum ModelError {
     MissingContent,
     #[error("{0}")]
     Client(String),
+}
+#[derive(Debug, thiserror::Error)]
+pub enum SchedulerError {
+    #[error(transparent)]
+    Model(#[from] ModelError),
+    #[error(transparent)]
+    Executor(#[from] ExecutorError),
+    #[error(transparent)]
+    Message(#[from] MessageError),
+    #[error("Lisp evaluation interrupted by human input")]
+    EvaluationInterrupted,
+    #[error("scheduler invariant violated: {0}")]
+    Invariant(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NormalizeError {
+    #[error("model output must be raw Lisp without Markdown or tags")]
+    Wrapped,
+    #[error("model emitted invalid Lisp: {0}")]
+    Read(#[from] ReadError),
+    #[error("model must emit exactly one Lisp form, got {0}")]
+    FormCount(usize),
 }
 
 #[async_trait]
@@ -176,20 +199,24 @@ impl ModelClient for OpenRouterModel {
 #[derive(Clone)]
 pub struct ModelInterruptHandle {
     active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ModelInterruptHandle {
-    /// Cancels the request currently owned by this scheduler, if any.
+    /// Records an intervention and cancels this scheduler's active request.
     pub fn request_interrupt(&self) -> bool {
         let active = self.active.lock().unwrap();
-        let Some(active) = active.as_ref() else {
-            return false;
-        };
-        if active.cancellation.is_cancelled() {
-            false
-        } else {
+        let newly_pending = !self.pending.swap(true, Ordering::AcqRel);
+        if let Some(active) = active.as_ref() {
             active.cancellation.cancel();
-            true
+        }
+        newly_pending
+    }
+
+    pub fn clear_pending(&self) {
+        let active = self.active.lock().unwrap();
+        if active.is_none() {
+            self.pending.store(false, Ordering::Release);
         }
     }
 }
@@ -202,6 +229,7 @@ struct ActiveModelRequest {
 struct ModelRuntime {
     gate: tokio::sync::Mutex<()>,
     active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
     next_generation: AtomicU64,
 }
 
@@ -210,6 +238,7 @@ impl ModelRuntime {
         Self {
             gate: tokio::sync::Mutex::new(()),
             active: Arc::new(Mutex::new(None)),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_generation: AtomicU64::new(0),
         }
     }
@@ -217,32 +246,70 @@ impl ModelRuntime {
     fn interrupt_handle(&self) -> ModelInterruptHandle {
         ModelInterruptHandle {
             active: Arc::clone(&self.active),
+            pending: Arc::clone(&self.pending),
         }
     }
 
     fn activate(&self) -> ActiveRequestGuard {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
-        *self.active.lock().unwrap() = Some(ActiveModelRequest {
+        let mut active = self.active.lock().unwrap();
+        if self.pending.load(Ordering::Acquire) {
+            cancellation.cancel();
+        }
+        *active = Some(ActiveModelRequest {
             generation,
             cancellation: cancellation.clone(),
         });
+        drop(active);
         ActiveRequestGuard {
             active: Arc::clone(&self.active),
+            pending: Arc::clone(&self.pending),
             generation,
             cancellation,
+            finished: false,
         }
+    }
+
+    fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
     }
 }
 
 struct ActiveRequestGuard {
     active: Arc<Mutex<Option<ActiveModelRequest>>>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
     generation: u64,
     cancellation: CancellationToken,
+    finished: bool,
+}
+
+impl ActiveRequestGuard {
+    fn finish<T>(mut self, result: Result<T, ModelError>) -> Result<T, ModelError> {
+        let mut active = self.active.lock().unwrap();
+        let owns_slot = active
+            .as_ref()
+            .is_some_and(|request| request.generation == self.generation);
+        let interrupted = self.pending.load(Ordering::Acquire) || self.cancellation.is_cancelled();
+        if owns_slot {
+            *active = None;
+        }
+        self.finished = true;
+        drop(active);
+        if interrupted {
+            self.pending.store(false, Ordering::Release);
+            Err(ModelError::Cancelled)
+        } else {
+            result
+        }
+    }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
         let mut active = self.active.lock().unwrap();
         if active
             .as_ref()
@@ -256,25 +323,25 @@ impl Drop for ActiveRequestGuard {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TurnOutcome {
     Evaluated {
-        frame_id: String,
+        frame_id: FrameId,
         source: String,
         result: String,
     },
     ToolCompleted {
-        frame_id: String,
+        frame_id: FrameId,
         source: String,
         result: String,
     },
     Spawned {
-        parent_id: String,
-        child_id: String,
+        parent_id: FrameId,
+        child_id: FrameId,
     },
     Returned {
-        parent_id: String,
+        parent_id: FrameId,
         result: String,
     },
     Replied {
-        message_id: String,
+        message_id: MessageId,
         text: String,
     },
     Idle,
@@ -283,9 +350,7 @@ pub enum TurnOutcome {
 pub struct Scheduler<M: ModelClient> {
     model: M,
     model_runtime: ModelRuntime,
-    pub executor: Executor,
-    pub transcript_limit: usize,
-    pub compact_batch: usize,
+    executor: Executor,
 }
 
 impl<M: ModelClient> Scheduler<M> {
@@ -294,8 +359,6 @@ impl<M: ModelClient> Scheduler<M> {
             model,
             model_runtime: ModelRuntime::new(),
             executor,
-            transcript_limit: 20,
-            compact_batch: 20,
         }
     }
 
@@ -307,23 +370,24 @@ impl<M: ModelClient> Scheduler<M> {
         let _generation_gate = self.model_runtime.gate.lock().await;
         let active = self.model_runtime.activate();
         let cancellation = active.cancellation.clone();
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(ModelError::Cancelled),
             result = self.model.complete(request, cancellation.clone()) => result,
-        }
+        };
+        active.finish(result)
     }
 
-    pub async fn run_turn(&self, kernel: &mut Kernel) -> Result<TurnOutcome, String> {
+    pub async fn run_turn(&self, kernel: &mut Kernel) -> Result<TurnOutcome, SchedulerError> {
         let Some(frame) = kernel.frames.last() else {
             return Ok(TurnOutcome::Idle);
         };
         let frame_id = frame.id.clone();
 
-        // Resume a snapshotted top-level operation before asking for a new action.
+        // Complete an in-memory top-level suspension before asking for a new action.
         if let Some(pending) = kernel.pending_trap() {
             if pending.operation == VmTrap::AwaitHuman {
-                if frame.messages.is_empty() {
+                if kernel.notices_for_frame(&frame_id).is_empty() {
                     return Ok(TurnOutcome::Idle);
                 }
                 kernel.clear_trap();
@@ -343,10 +407,11 @@ impl<M: ModelClient> Scheduler<M> {
         }
 
         self.compact_current_frame(kernel);
-        let raw = self
-            .complete_model(self.build_request(kernel))
-            .await
-            .map_err(|error| error.to_string())?;
+        let (request, notice_watermark) = self.build_request_with_notices(kernel);
+        let raw = self.complete_model(request).await?;
+        if let Some(watermark) = notice_watermark {
+            kernel.mark_notices_seen_through(&frame_id, watermark);
+        }
         let source = match normalize_one_form(&raw) {
             Ok(source) => source,
             Err(error) => {
@@ -359,14 +424,16 @@ impl<M: ModelClient> Scheduler<M> {
                 });
             }
         };
+        if self.model_runtime.take_pending() {
+            return Err(ModelError::Cancelled.into());
+        }
         let displayed = match kernel.eval(&source) {
             Ok(value) => format!("{}", value),
+            Err(crate::vm::eval::EvalError::Interrupted) => {
+                return Err(SchedulerError::EvaluationInterrupted);
+            }
             Err(error) => format!("error: {}", error),
         };
-        if let Some(frame) = kernel.frames.last_mut() {
-            frame.messages.retain(|message| message.id.is_some());
-        }
-
         if let Some(pending) = kernel.pending_trap() {
             return self.handle_trap(kernel, frame_id, pending, displayed).await;
         }
@@ -381,18 +448,22 @@ impl<M: ModelClient> Scheduler<M> {
     async fn handle_trap(
         &self,
         kernel: &mut Kernel,
-        frame_id: String,
+        frame_id: FrameId,
         pending: crate::kernel::PendingTrap,
         scheduled: String,
-    ) -> Result<TurnOutcome, String> {
+    ) -> Result<TurnOutcome, SchedulerError> {
         let source = pending.source;
         match pending.operation {
             VmTrap::RunBash { command } => {
-                let result = self
-                    .executor
-                    .run(&command)
-                    .map(|execution| format_execution(&execution))
-                    .unwrap_or_else(|error| format!("error: {}", error));
+                let execution = match self.executor.run(&command) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        kernel.clear_trap();
+                        kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
+                        return Err(error.into());
+                    }
+                };
+                let result = format_execution(&execution);
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 Ok(TurnOutcome::ToolCompleted {
@@ -402,13 +473,20 @@ impl<M: ModelClient> Scheduler<M> {
                 })
             }
             VmTrap::CallModel { prompt } => {
-                let result = self
+                let result = match self
                     .complete_model(ModelRequest {
                         system: "Return a concise string result for the calling Lisp agent.".into(),
                         context: prompt,
                     })
                     .await
-                    .unwrap_or_else(|error| format!("error: {}", error));
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        kernel.clear_trap();
+                        kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
+                        return Err(error.into());
+                    }
+                };
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 Ok(TurnOutcome::ToolCompleted {
@@ -435,18 +513,21 @@ impl<M: ModelClient> Scheduler<M> {
                     .frames
                     .last()
                     .map(|frame| frame.id.clone())
-                    .ok_or_else(|| "agent returned without a parent".to_string())?;
+                    .ok_or(SchedulerError::Invariant("agent returned without a parent"))?;
                 kernel.append_transcript_to(&parent_id, "(agent/result)", &result);
                 Ok(TurnOutcome::Returned { parent_id, result })
             }
             VmTrap::Reply { message_id, text } => {
+                kernel.complete_message(&message_id)?;
                 kernel.clear_trap();
-                kernel.complete_message(&message_id);
                 kernel.append_transcript_to(&frame_id, &source, &text);
                 Ok(TurnOutcome::Replied { message_id, text })
             }
             VmTrap::AwaitHuman => {
-                kernel.frames.last_mut().unwrap().status = FrameStatus::Waiting;
+                let frame = kernel.frames.last_mut().ok_or(SchedulerError::Invariant(
+                    "human wait without an active frame",
+                ))?;
+                frame.status = FrameStatus::Waiting;
                 kernel.append_transcript_to(&frame_id, &source, "waiting for human input");
                 Ok(TurnOutcome::ToolCompleted {
                     frame_id,
@@ -458,28 +539,45 @@ impl<M: ModelClient> Scheduler<M> {
     }
 
     pub fn build_request(&self, kernel: &Kernel) -> ModelRequest {
+        self.build_request_with_notices(kernel).0
+    }
+
+    fn build_request_with_notices(&self, kernel: &Kernel) -> (ModelRequest, Option<u64>) {
         let frame = kernel
             .frames
             .last()
             .expect("build_request requires a frame");
         let directive = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be top-level forms.\n";
-        let mut context = ContextBuilder::new(MODEL_CONTEXT_LIMIT - directive.len());
+        let system = if frame.state.instructions.is_empty() {
+            "You are Continuum, a persistent agent inhabiting a Lisp world. Choose one useful Lisp action.".into()
+        } else {
+            truncate(&frame.state.instructions, 16_000)
+        };
+        let body_budget = MODEL_CONTEXT_LIMIT.saturating_sub(system.len() + directive.len());
+        let mut context = ContextBuilder::new(body_budget);
 
+        let visible_notices = kernel.notices_for_frame(&frame.id);
         let mut notices = String::new();
-        for message in &frame.messages {
-            match &message.id {
-                Some(id) => {
-                    let _ = writeln!(
-                        notices,
-                        "- Human message [{}]: {}",
-                        id,
-                        truncate(&message.text, 2_000)
-                    );
-                }
-                None => {
-                    let _ = writeln!(notices, "- {}", truncate(&message.text, 2_000));
-                }
-            }
+        let mut notice_watermark = None;
+        for (index, message) in visible_notices.iter().enumerate() {
+            let slots = visible_notices.len() - index;
+            let allowance = (12_000usize.saturating_sub(notices.len()) / slots).max(1);
+            let heading = match (&message.id, message.handled) {
+                (Some(id), false) => format!("- Human message [{}]: ", id),
+                (Some(id), true) => format!(
+                    "- Answered human notice [{}] (informational; do not call message/reply): ",
+                    id
+                ),
+                (None, _) => "- ".to_string(),
+            };
+            let body_budget = allowance.saturating_sub(heading.len() + 1);
+            let _ = writeln!(
+                notices,
+                "{}{}",
+                heading,
+                truncate(&message.text, body_budget)
+            );
+            notice_watermark = Some(message.sequence);
         }
         context.section("Current human messages and notices", &notices, 12_000);
 
@@ -517,11 +615,8 @@ impl<M: ModelClient> Scheduler<M> {
             );
         }
         context.section("Recent Lisp actions and results", &recent, 24_000);
-        context.section(
-            "Earlier compacted context",
-            &frame.state.compacted_context,
-            6_000,
-        );
+        let compacted = frame.state.compacted_context.render();
+        context.section("Earlier compacted context", &compacted, 6_000);
 
         let mut library = String::new();
         for name in kernel.env.namespace_names() {
@@ -538,61 +633,53 @@ impl<M: ModelClient> Scheduler<M> {
         }
         context.section("Library discovery", &library, 4_000);
 
-        ModelRequest {
-            system: if frame.state.instructions.is_empty() {
-                "You are Continuum, a persistent agent inhabiting a Lisp world. Choose one useful Lisp action.".into()
-            } else {
-                truncate(&frame.state.instructions, 16_000)
+        (
+            ModelRequest {
+                system,
+                context: context.finish(directive),
             },
-            context: context.finish(directive),
-        }
+            notice_watermark,
+        )
     }
 
     fn compact_current_frame(&self, kernel: &mut Kernel) {
+        const RECENT_TRANSCRIPT_BUDGET: usize = 24_000;
+        const COMPACTED_BUDGET: usize = 32_000;
         let Some(frame) = kernel.frames.last_mut() else {
             return;
         };
-        if frame.state.transcript.len() <= self.transcript_limit {
-            return;
+        let occupancy = |entry: &TranscriptEntry| entry.source.len() + entry.result.len() + 8;
+        let mut recent_bytes: usize = frame.state.transcript.iter().map(occupancy).sum();
+        while recent_bytes > RECENT_TRANSCRIPT_BUDGET && frame.state.transcript.len() > 1 {
+            let entry = frame.state.transcript.remove(0);
+            recent_bytes = recent_bytes.saturating_sub(occupancy(&entry));
+            frame
+                .state
+                .compacted_context
+                .entries
+                .push_back(crate::kernel::CompactedEntry {
+                    timestamp: entry.timestamp,
+                    source: truncate(&entry.source, 240),
+                    result: truncate(&entry.result, 480),
+                });
         }
-        let count = self.compact_batch.min(frame.state.transcript.len());
-        let drained: Vec<TranscriptEntry> = frame.state.transcript.drain(..count).collect();
-        if !frame.state.compacted_context.is_empty() {
-            frame.state.compacted_context.push('\n');
-        }
-        for entry in drained {
-            frame.state.compacted_context.push_str(&format!(
-                "[{}] {} => {}\n",
-                entry.timestamp,
-                truncate(&entry.source, 240),
-                truncate(&entry.result, 480),
-            ));
-        }
-        if frame.state.compacted_context.len() > 32_000 {
-            let mut drop = frame.state.compacted_context.len() - 32_000;
-            while !frame.state.compacted_context.is_char_boundary(drop) {
-                drop += 1;
+        while frame.state.compacted_context.rendered_len() > COMPACTED_BUDGET {
+            if frame.state.compacted_context.entries.pop_front().is_none() {
+                break;
             }
-            let boundary = frame.state.compacted_context[drop..]
-                .find('\n')
-                .map_or(drop, |offset| drop + offset + 1);
-            frame.state.compacted_context.drain(..boundary);
+            frame.state.compacted_context.omitted_turns += 1;
         }
     }
 }
 
-pub fn normalize_one_form(raw: &str) -> Result<String, String> {
+pub fn normalize_one_form(raw: &str) -> Result<String, NormalizeError> {
     let trimmed = raw.trim();
     if trimmed.starts_with("```") || trimmed.contains("<lisp>") {
-        return Err("model output must be raw Lisp without Markdown or tags".into());
+        return Err(NormalizeError::Wrapped);
     }
-    let forms =
-        reader::read_all(trimmed).map_err(|e| format!("model emitted invalid Lisp: {}", e))?;
+    let forms = reader::read_all(trimmed)?;
     if forms.len() != 1 {
-        return Err(format!(
-            "model must emit exactly one Lisp form, got {}",
-            forms.len()
-        ));
+        return Err(NormalizeError::FormCount(forms.len()));
     }
     Ok(trimmed.to_string())
 }
@@ -606,9 +693,17 @@ fn truncate(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_string();
     }
-    let mut end = max;
-    while !value.is_char_boundary(end) {
+    const ELLIPSIS: &str = "…";
+    if max < ELLIPSIS.len() {
+        let mut end = max.min(value.len());
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        return value[..end].to_string();
+    }
+    let mut end = (max - ELLIPSIS.len()).min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &value[..end])
+    format!("{}{}", &value[..end], ELLIPSIS)
 }

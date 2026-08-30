@@ -1,0 +1,22 @@
+name: Miri
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo miri setup
+      - run: cargo miri test --test repl captured_set_mutates_a_shared_persistent_cell
+      - run: cargo miri test --test repl letrec_closures_capture_the_recursive_placeholder_cell
+      - run: cargo miri test --test repl interpreted_functions_require_exact_arity
+      - run: cargo miri test --test input_hardening substring_uses_unicode_scalar_indices
+      - run: cargo miri test --test input_hardening odd_map_literals_are_rejected_by_reader_and_evaluator

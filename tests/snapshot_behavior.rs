@@ -1,4 +1,4 @@
-use persistent_lisp_harness::{Kernel, Value, VmTrap};
+use persistent_lisp_harness::{Kernel, Value};
 
 fn temp_dir() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("continuum-snapshots-{}", uuid::Uuid::new_v4()));
@@ -10,7 +10,7 @@ fn temp_dir() -> std::path::PathBuf {
 fn recovery_chooses_newest_snapshot() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel.eval("(define answer 1)").unwrap();
     kernel.snapshot().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -20,20 +20,20 @@ fn recovery_chooses_newest_snapshot() {
 
     let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
     assert_eq!(recovered.eval("answer").unwrap(), Value::Int(2));
-    assert_eq!(recovered.frames[0].state.transcript[0].result, "2");
+    assert_eq!(recovered.frames()[0].state().transcript()[0].result, "2");
     assert_eq!(
         recovered.eval("(+ 1 2)").unwrap(),
         Value::Int(3),
         "natives were not restored"
     );
-    assert_eq!(recovered.storage.snapshot_count, 2);
+    assert_eq!(recovered.snapshot_count(), 2);
 }
 
 #[test]
 fn corrupt_newest_snapshot_falls_back_to_previous_valid_one() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel.eval("(define answer 1)").unwrap();
     kernel.snapshot().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -48,7 +48,7 @@ fn corrupt_newest_snapshot_falls_back_to_previous_valid_one() {
                 && p.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .contains(&newest.id)
+                    .contains(newest.id.as_str())
         })
         .unwrap();
     std::fs::write(&newest_path, b"{truncated").unwrap();
@@ -66,7 +66,7 @@ fn corrupt_newest_snapshot_falls_back_to_previous_valid_one() {
 fn checksum_tampering_is_detected() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel.eval("(define answer 7)").unwrap();
     kernel.snapshot().unwrap();
     let path = std::fs::read_dir(&dir)
@@ -82,35 +82,47 @@ fn checksum_tampering_is_detected() {
     assert!(
         Kernel::recover_from_dir(&dir)
             .unwrap_err()
+            .to_string()
             .contains("checksum")
     );
 }
 
 #[test]
-fn pending_trap_source_and_transcript_survive_snapshot() {
+fn snapshot_refuses_pending_external_traps() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     let definition = "(define (twice x) (* x 2))";
     kernel.eval(definition).unwrap();
     kernel.append_transcript(definition, "twice");
-    kernel.eval(r#"(bash "printf hi")"#).unwrap();
-    assert!(kernel.has_trap());
     kernel.snapshot().unwrap();
 
-    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
-    assert_eq!(recovered.env.source("user/twice"), Some(definition));
-    assert_eq!(recovered.frames[0].state.transcript.len(), 1);
-    assert!(
-        matches!(recovered.take_trap(), Some(pending) if matches!(pending.operation, VmTrap::RunBash { ref command } if command == "printf hi"))
+    kernel.eval(r#"(bash "printf hi")"#).unwrap();
+    assert!(kernel.has_trap());
+    assert!(matches!(
+        kernel.snapshot(),
+        Err(persistent_lisp_harness::kernel::SnapshotError::Busy)
+    ));
+
+    let recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert_eq!(
+        recovered.environment().source("user/twice"),
+        Some(definition)
     );
+    assert!(!recovered.has_trap());
+    let root = recovered.frames()[0].id().clone();
+    assert!(recovered.notices_for_frame(&root).iter().any(|notice| {
+        notice
+            .text
+            .contains("in-flight external operation was interrupted")
+    }));
 }
 
 #[test]
 fn closure_heap_restores_across_real_snapshot() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel
         .eval("(define (make-adder n) (lambda (x) (+ x n)))")
         .unwrap();
@@ -124,55 +136,62 @@ fn closure_heap_restores_across_real_snapshot() {
 fn child_stack_transcripts_and_selected_memory_survive_snapshot() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
-    let parent = kernel.frames[0].id.clone();
-    kernel.append_transcript_to(&parent, "(+ 1 1)", "2");
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
+    kernel.append_transcript("(+ 1 1)", "2");
     let child = kernel.spawn_subagent("researcher", "inspect state");
     kernel
         .eval(r#"(memory/remember "finding" "snapshot-safe")"#)
         .unwrap();
-    kernel.append_transcript_to(&child, "(source/list)", "()");
+    kernel.append_transcript("(source/list)", "()");
     kernel.snapshot().unwrap();
 
     let recovered = Kernel::recover_from_dir(&dir).unwrap();
-    assert_eq!(recovered.frames.len(), 2);
-    assert_eq!(recovered.frames[0].state.transcript[0].source, "(+ 1 1)");
-    assert_eq!(recovered.frames[1].id, child);
+    assert_eq!(recovered.frames().len(), 2);
+    assert_eq!(
+        recovered.frames()[0].state().transcript()[0].source,
+        "(+ 1 1)"
+    );
+    assert_eq!(recovered.frames()[1].id(), &child);
     assert!(
-        recovered.frames[1]
-            .state
-            .instructions
+        recovered.frames()[1]
+            .state()
+            .instructions()
             .contains("inspect state")
     );
     assert_eq!(
-        recovered.frames[1].state.transcript[0].source,
+        recovered.frames()[1].state().transcript()[0].source,
         "(source/list)"
     );
-    assert_eq!(recovered.frames[1].state.memory[0].key, "finding");
-    assert_eq!(recovered.frames[1].state.memory[0].value, "snapshot-safe");
+    assert_eq!(recovered.frames()[1].state().memory()[0].key, "finding");
+    assert_eq!(
+        recovered.frames()[1].state().memory()[0].value,
+        "snapshot-safe"
+    );
 }
 
 #[test]
 fn native_registration_does_not_pollute_binding_history() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel.snapshot().unwrap();
     let recovered = Kernel::recover_from_dir(&dir).unwrap();
-    assert!(recovered.env.namespaces["kernel"].history("+").is_empty());
+    assert!(recovered.environment().binding_history_len("kernel", "+") == 0);
 }
 
 #[test]
 fn pending_human_message_id_survives_snapshot() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     let id = kernel.human_message("persist this question").unwrap();
     kernel.snapshot().unwrap();
     let recovered = Kernel::recover_from_dir(&dir).unwrap();
     assert!(recovered.has_pending_message(&id));
-    assert!(recovered.frames[0].messages.iter().any(|message| {
-        message.id.as_deref() == Some(id.as_str()) && message.text == "persist this question"
+    let root = recovered.frames()[0].id().clone();
+    assert!(recovered.notices_for_frame(&root).iter().any(|notice| {
+        notice.id.as_ref().map(|id| id.as_str()) == Some(id.as_str())
+            && notice.text == "persist this question"
     }));
 }
 
@@ -180,15 +199,15 @@ fn pending_human_message_id_survives_snapshot() {
 fn snapshot_collects_unreachable_closure_environments() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     for _ in 0..100 {
         kernel.eval("(let ((x 1)) (lambda () x))").unwrap();
     }
-    assert!(kernel.env.lexical.environments.len() >= 100);
+    assert!(kernel.lexical_arena_counts().0 >= 100);
     kernel.snapshot().unwrap();
-    assert_eq!(kernel.env.lexical.environments.len(), 1);
+    assert_eq!(kernel.lexical_arena_counts().0, 1);
     let recovered = Kernel::recover_from_dir(&dir).unwrap();
-    assert_eq!(recovered.env.lexical.environments.len(), 1);
+    assert_eq!(recovered.lexical_arena_counts().0, 1);
 }
 
 #[test]
@@ -196,7 +215,7 @@ fn v2_legacy_human_message_is_migrated_with_its_id() {
     use sha2::{Digest, Sha256};
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel.snapshot().unwrap();
     let path = std::fs::read_dir(&dir)
         .unwrap()
@@ -218,12 +237,12 @@ fn v2_legacy_human_message_is_migrated_with_its_id() {
     std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
 
     let recovered = Kernel::recover_from_dir(&dir).unwrap();
-    assert!(recovered.has_pending_message("msg-legacy"));
+    assert!(recovered.has_pending_message(&persistent_lisp_harness::MessageId::new("msg-legacy")));
     assert_eq!(
-        recovered.frames[0]
-            .messages
-            .iter()
-            .find(|message| message.id.as_deref() == Some("msg-legacy"))
+        recovered
+            .notices_for_frame(recovered.frames()[0].id())
+            .into_iter()
+            .find(|notice| notice.id.as_ref().map(|id| id.as_str()) == Some("msg-legacy"))
             .unwrap()
             .text,
         "still here"
@@ -234,7 +253,7 @@ fn v2_legacy_human_message_is_migrated_with_its_id() {
 fn mutated_closure_cells_survive_snapshot_recovery() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
-    kernel.storage.snapshot_dir = dir.to_string_lossy().into_owned();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel
         .eval("(define counter (let ((x 0)) (lambda () (set! x (+ x 1)) x)))")
         .unwrap();
@@ -244,4 +263,81 @@ fn mutated_closure_cells_survive_snapshot_recovery() {
     let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
     assert_eq!(recovered.eval("(counter)").unwrap(), Value::Int(2));
     assert_eq!(recovered.eval("(counter)").unwrap(), Value::Int(3));
+}
+
+#[test]
+fn recovery_discards_legacy_pending_bash_without_executing_it() {
+    use sha2::{Digest, Sha256};
+    let dir = temp_dir();
+    let marker = dir.join("must-not-exist");
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
+    kernel.snapshot().unwrap();
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    envelope["kernel"]["frames"][0]["state"]["pending_trap"] = serde_json::json!({
+        "source": format!("(bash \"touch {}\")", marker.display()),
+        "operation": { "RunBash": { "command": format!("touch {}", marker.display()) } }
+    });
+    envelope["checksum"] = hex::encode(Sha256::digest(
+        serde_json::to_vec(&envelope["kernel"]).unwrap(),
+    ))
+    .into();
+    std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert!(!recovered.has_trap());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn genuine_v2_cloned_closure_heap_migrates_to_the_cell_arena() {
+    use sha2::{Digest, Sha256};
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
+    kernel
+        .eval("(define captured (let ((x 41)) (lambda () (+ x 1))))")
+        .unwrap();
+    kernel.snapshot().unwrap();
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .unwrap();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let function =
+        &envelope["kernel"]["env"]["namespaces"]["user"]["bindings"]["captured"]["Function"];
+    let environment = function["env_id"].as_u64().unwrap();
+    let environment_key = environment.to_string();
+    let cell =
+        envelope["kernel"]["env"]["lexical"]["environments"][&environment_key]["bindings"]["x"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+    let value = envelope["kernel"]["env"]["lexical"]["cells"][&cell].clone();
+    envelope["format_version"] = 2.into();
+    envelope["kernel"]["lexical_heap"] = serde_json::json!({
+        environment_key: [{ "x": value }]
+    });
+    envelope["kernel"]["env"]
+        .as_object_mut()
+        .unwrap()
+        .remove("lexical");
+    envelope["checksum"] = hex::encode(Sha256::digest(
+        serde_json::to_vec(&envelope["kernel"]).unwrap(),
+    ))
+    .into();
+    std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert_eq!(recovered.eval("(captured)").unwrap(), Value::Int(42));
 }

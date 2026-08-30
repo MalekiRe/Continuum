@@ -4,40 +4,97 @@ use crate::vm::reader;
 use crate::vm::value::*;
 use indexmap::IndexMap;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-/// Global interrupt flag — set by kernel to request interruption of Lisp evaluation.
-pub static EVAL_INTERRUPTED: AtomicBool = AtomicBool::new(false);
-pub static EVAL_RUNNING: AtomicBool = AtomicBool::new(false);
 
-pub fn request_interrupt() -> bool {
-    EVAL_RUNNING.load(Ordering::Acquire) && !EVAL_INTERRUPTED.swap(true, Ordering::AcqRel)
+#[derive(Clone, Debug, Default)]
+pub struct EvalControl {
+    cancelled: Arc<AtomicBool>,
+    state: Arc<std::sync::Mutex<EvalState>>,
+    turns: Arc<AtomicU64>,
 }
 
-type PrintHook = Option<fn(&str)>;
+#[derive(Debug, Default)]
+struct EvalState {
+    running: bool,
+}
 
-/// Global print hook — set by main.rs to capture all output.
-pub static PRINT_HOOK: std::sync::LazyLock<Mutex<PrintHook>> =
-    std::sync::LazyLock::new(|| Mutex::new(None));
+#[derive(Clone, Debug)]
+pub struct EvalInterruptHandle(EvalControl);
 
-/// Turn counter — incremented on every evaluated expression for safepoint checks.
-pub static TURN_COUNTER: AtomicU64 = AtomicU64::new(0);
+impl EvalControl {
+    pub fn interrupt_handle(&self) -> EvalInterruptHandle {
+        EvalInterruptHandle(self.clone())
+    }
+
+    pub fn begin(&self) -> EvalRunGuard {
+        self.state.lock().unwrap().running = true;
+        EvalRunGuard {
+            control: self.clone(),
+            finished: false,
+        }
+    }
+
+    pub fn check_safepoint(&self) -> Result<(), EvalError> {
+        let count = self.turns.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(SAFEPOINT_INTERVAL) && self.cancelled.swap(false, Ordering::AcqRel)
+        {
+            return Err(EvalError::Interrupted);
+        }
+        Ok(())
+    }
+}
+
+impl EvalInterruptHandle {
+    pub fn request_interrupt(&self) -> bool {
+        let state = self.0.state.lock().unwrap();
+        self.0.cancelled.store(true, Ordering::Release);
+        state.running
+    }
+
+    pub fn clear_pending(&self) {
+        let state = self.0.state.lock().unwrap();
+        if !state.running {
+            self.0.cancelled.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.0.state.lock().unwrap().running
+    }
+}
+
+pub struct EvalRunGuard {
+    control: EvalControl,
+    finished: bool,
+}
+
+impl EvalRunGuard {
+    pub fn finish<T>(mut self, result: Result<T, EvalError>) -> Result<T, EvalError> {
+        let mut state = self.control.state.lock().unwrap();
+        let interrupted = self.control.cancelled.swap(false, Ordering::AcqRel);
+        state.running = false;
+        self.finished = true;
+        drop(state);
+        if interrupted && result.is_ok() {
+            Err(EvalError::Interrupted)
+        } else {
+            result
+        }
+    }
+}
+
+impl Drop for EvalRunGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.control.state.lock().unwrap().running = false;
+    }
+}
 
 /// Max turns before automatic safepoint check.
 pub const SAFEPOINT_INTERVAL: u64 = 1000;
-
-/// Check safepoint — if interrupted, return an error.
-#[inline]
-pub fn check_safepoint() -> Result<(), EvalError> {
-    let count = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if count.is_multiple_of(SAFEPOINT_INTERVAL) && EVAL_INTERRUPTED.load(Ordering::Relaxed) {
-        EVAL_INTERRUPTED.store(false, Ordering::Relaxed);
-        return Err(EvalError::KernelError(
-            "evaluation interrupted by kernel".into(),
-        ));
-    }
-    Ok(())
-}
 
 /// Result of a single evaluation step.
 /// Step(expr) means evaluate expr next (tail call).
@@ -47,48 +104,37 @@ pub enum StepResult {
     Step(Value),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EvalError {
+    #[error("undefined symbol: {0}")]
     UndefinedSymbol(String),
+    #[error("invalid form: {0}")]
     InvalidForm(String),
+    #[error("not a function: {0}")]
     NotAFunction(Value),
+    #[error("arity mismatch: {name} expects {expected} arguments, got {got}")]
     ArityMismatch {
         name: String,
-        expected: u32,
+        expected: usize,
         got: usize,
     },
+    #[error("syntax error: {0}")]
     SyntaxError(String),
+    #[error("error: {0}")]
     UserError(String),
+    #[error(transparent)]
+    Native(#[from] NativeError),
+    #[error("kernel error: {0}")]
     KernelError(String),
+    #[error(transparent)]
+    Environment(#[from] crate::vm::env::EnvError),
+    #[error("invalid pattern: {0}")]
     InvalidPattern(String),
+    #[error("evaluation interrupted")]
+    Interrupted,
+    #[error("tail call")]
     TailCall(Value),
 }
-
-impl std::fmt::Display for EvalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EvalError::UndefinedSymbol(s) => write!(f, "undefined symbol: {}", s),
-            EvalError::InvalidForm(s) => write!(f, "invalid form: {}", s),
-            EvalError::NotAFunction(v) => write!(f, "not a function: {}", v),
-            EvalError::ArityMismatch {
-                name,
-                expected,
-                got,
-            } => write!(
-                f,
-                "arity mismatch: {} expects {} arguments, got {}",
-                name, expected, got
-            ),
-            EvalError::SyntaxError(s) => write!(f, "syntax error: {}", s),
-            EvalError::UserError(s) => write!(f, "error: {}", s),
-            EvalError::KernelError(s) => write!(f, "kernel error: {}", s),
-            EvalError::InvalidPattern(s) => write!(f, "invalid pattern: {}", s),
-            EvalError::TailCall(_) => write!(f, "tail call"),
-        }
-    }
-}
-
-impl std::error::Error for EvalError {}
 
 /// Evaluate one step, converting TailCall to StepResult.
 fn eval_step(value: Value, kernel: &mut Kernel) -> Result<StepResult, EvalError> {
@@ -111,18 +157,12 @@ pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
             match eval_step(current, kernel) {
                 Ok(StepResult::Done(value)) => {
                     result = value;
-                    kernel
-                        .env
-                        .activate_environment(caller_environment)
-                        .map_err(EvalError::KernelError)?;
+                    kernel.env.activate_environment(caller_environment)?;
                     break;
                 }
                 Ok(StepResult::Step(next)) => current = next,
                 Err(error) => {
-                    kernel
-                        .env
-                        .activate_environment(caller_environment)
-                        .map_err(EvalError::KernelError)?;
+                    kernel.env.activate_environment(caller_environment)?;
                     return Err(error);
                 }
             }
@@ -133,7 +173,7 @@ pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
 
 fn eval_value_inner(val: Value, kernel: &mut Kernel, tail_pos: bool) -> Result<Value, EvalError> {
     // Safepoint: check if kernel wants to interrupt
-    check_safepoint()?;
+    kernel.eval_control.check_safepoint()?;
     match val {
         Value::Symbol(ref name) => kernel
             .env
@@ -246,10 +286,7 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
                 format!("(define {} {})", name, args[1])
             };
             let val = eval_any(args[1].clone(), kernel)?;
-            kernel
-                .env
-                .define(&qualified, val)
-                .map_err(EvalError::SyntaxError)?;
+            kernel.env.define(&qualified, val)?;
             kernel.store_source(&qualified, &retained);
             Ok(Value::Symbol(name.clone()))
         }
@@ -299,10 +336,7 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
             } else {
                 format!("user/{}", name)
             };
-            kernel
-                .env
-                .define(&qualified, lambda)
-                .map_err(EvalError::SyntaxError)?;
+            kernel.env.define(&qualified, lambda)?;
             kernel.store_source(&qualified, &retained);
             Ok(Value::Symbol(name))
         }
@@ -333,10 +367,7 @@ fn eval_undefine(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError
     // The family name is the full path (e.g., "my/Foo" not just "Foo")
     if kernel.env.is_data_family(&name) {
         // Undefine the data family, removing all constructors atomically
-        kernel
-            .env
-            .undefine_data_family(&name)
-            .map_err(EvalError::SyntaxError)?;
+        kernel.env.undefine_data_family(&name)?;
         return Ok(Value::Symbol(name));
     }
 
@@ -346,10 +377,7 @@ fn eval_undefine(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError
     } else {
         format!("user/{}", name)
     };
-    kernel
-        .env
-        .undefine(&qualified)
-        .map_err(EvalError::SyntaxError)?;
+    kernel.env.undefine(&qualified)?;
     Ok(Value::Nil)
 }
 
@@ -604,19 +632,13 @@ fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     // Check namespaces
     if name.contains('/') {
         if kernel.env.lookup(&name).is_some() {
-            kernel
-                .env
-                .define(&name, val)
-                .map_err(EvalError::SyntaxError)?;
+            kernel.env.define(&name, val)?;
             return Ok(Value::Nil);
         }
     } else {
         let qualified = format!("user/{}", name);
         if kernel.env.lookup(&qualified).is_some() {
-            kernel
-                .env
-                .define(&qualified, val)
-                .map_err(EvalError::SyntaxError)?;
+            kernel.env.define(&qualified, val)?;
             return Ok(Value::Nil);
         }
     }
@@ -755,15 +777,9 @@ fn eval_define_syntax(args: &[Value], kernel: &mut Kernel) -> Result<Value, Eval
             let m = Value::Macro(Macro::SyntaxRules { literals, rules });
 
             if !name.contains('/') {
-                kernel
-                    .env
-                    .define(&format!("user/{}", name), m)
-                    .map_err(EvalError::SyntaxError)?;
+                kernel.env.define(&format!("user/{}", name), m)?;
             } else {
-                kernel
-                    .env
-                    .define(&name, m)
-                    .map_err(EvalError::SyntaxError)?;
+                kernel.env.define(&name, m)?;
             }
             Ok(Value::Symbol(name))
         }
@@ -835,14 +851,15 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
         .iter()
         .map(|variant| format!("{}/{}", qualified_family, variant.name))
         .collect();
-    kernel
-        .env
-        .set_data_family(DataFamily {
-            name: qualified_family.clone(),
-            variants: variants.clone(),
-            generated_bindings: generated_bindings.clone(),
-        })
-        .map_err(EvalError::SyntaxError)?;
+    kernel.env.set_data_family(DataFamily {
+        name: crate::ids::QualifiedName::new(qualified_family.clone()),
+        variants: variants.clone(),
+        generated_bindings: generated_bindings
+            .iter()
+            .cloned()
+            .map(crate::ids::QualifiedName::new)
+            .collect(),
+    })?;
 
     for (variant, constructor_name) in variants.iter().zip(generated_bindings) {
         let constructor = Value::Function(Function::Constructor {
@@ -850,10 +867,7 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
             variant: variant.name.clone(),
             arity: variant.fields.len() as u32,
         });
-        kernel
-            .env
-            .define(&constructor_name, constructor)
-            .map_err(EvalError::SyntaxError)?;
+        kernel.env.define(&constructor_name, constructor)?;
     }
 
     Ok(Value::Symbol(family_name))
@@ -1169,24 +1183,26 @@ fn apply_tail(
         Value::Function(Function::Native {
             name, arity, func, ..
         }) => {
-            if arity != VARIADIC_ARITY && args.len() as u32 != arity {
+            if let Arity::Exact(expected) = arity
+                && args.len() as u32 != expected
+            {
                 return Err(EvalError::ArityMismatch {
                     name,
-                    expected: arity,
+                    expected: expected as usize,
                     got: args.len(),
                 });
             }
-            (func)(kernel, args).map_err(EvalError::UserError)
+            (func)(kernel, args).map_err(EvalError::Native)
         }
         Value::Function(Function::Constructor {
             family,
             variant,
             arity,
         }) => {
-            if arity != VARIADIC_ARITY && args.len() as u32 != arity {
+            if args.len() != arity as usize {
                 return Err(EvalError::ArityMismatch {
                     name: format!("{}/{}", family, variant),
-                    expected: arity,
+                    expected: arity as usize,
                     got: args.len(),
                 });
             }
@@ -1204,16 +1220,13 @@ fn apply_tail(
             if args.len() != params.len() {
                 return Err(EvalError::ArityMismatch {
                     name: "lambda".into(),
-                    expected: u32::try_from(params.len()).unwrap_or(u32::MAX),
+                    expected: params.len(),
                     got: args.len(),
                 });
             }
 
             let caller_environment = kernel.env.current_environment();
-            kernel
-                .env
-                .push_call_frame(env_id)
-                .map_err(EvalError::KernelError)?;
+            kernel.env.push_call_frame(env_id)?;
             for (parameter, argument) in params.iter().zip(args) {
                 kernel.env.set_lexical(parameter, argument);
             }
@@ -1229,10 +1242,7 @@ fn apply_tail(
                 Err(EvalError::TailCall(expr)) => eval_any(expr, kernel),
                 other => other,
             };
-            kernel
-                .env
-                .activate_environment(caller_environment)
-                .map_err(EvalError::KernelError)?;
+            kernel.env.activate_environment(caller_environment)?;
             result
         }
 

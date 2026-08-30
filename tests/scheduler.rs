@@ -93,8 +93,8 @@ async fn human_message_is_seen_then_explicitly_replied_to() {
         }
     );
     let request = &model.requests.lock().unwrap()[0];
-    assert!(request.context.contains(&id));
-    assert!(kernel.frames.last().unwrap().messages.is_empty());
+    assert!(request.context.contains(id.as_str()));
+    assert!(!kernel.has_pending_message(&id));
 }
 
 #[tokio::test]
@@ -104,30 +104,30 @@ async fn subagent_gets_own_context_and_returns_to_parent() {
         r#"(agent/return "done")"#,
     ]);
     let mut kernel = Kernel::new();
-    let parent = kernel.frames[0].id.clone();
+    let parent = kernel.frames()[0].id().clone();
     let first = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(matches!(first, TurnOutcome::Spawned { ref parent_id, .. } if parent_id == &parent));
-    assert_eq!(kernel.frames.len(), 2);
+    assert_eq!(kernel.frames().len(), 2);
     assert!(
         kernel
-            .frames
+            .frames()
             .last()
             .unwrap()
-            .state
-            .instructions
+            .state()
+            .instructions()
             .contains("researcher")
     );
     assert_eq!(
-        kernel.frames[0].status,
+        kernel.frames()[0].status(),
         persistent_lisp_harness::FrameStatus::Waiting
     );
     let second = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(
         matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "\"done\"")
     );
-    assert_eq!(kernel.frames.len(), 1);
+    assert_eq!(kernel.frames().len(), 1);
     assert_eq!(
-        kernel.frames[0].status,
+        kernel.frames()[0].status(),
         persistent_lisp_harness::FrameStatus::Running
     );
     let requests = model.requests.lock().unwrap();
@@ -149,10 +149,10 @@ fn source_is_exact_and_rolled_back_with_failed_turn() {
     let mut kernel = Kernel::new();
     let source = "(define (hello name)\n  (string-append \"hi \" name))";
     kernel.eval(source).unwrap();
-    assert_eq!(kernel.env.source("user/hello"), Some(source));
+    assert_eq!(kernel.environment().source("user/hello"), Some(source));
     let bad = kernel.eval("(begin (define (ghost) 1) (missing))");
     assert!(bad.is_err());
-    assert!(kernel.env.source("user/ghost").is_none());
+    assert!(kernel.environment().source("user/ghost").is_none());
     assert!(kernel.eval("ghost").is_err());
 }
 
@@ -169,19 +169,20 @@ fn model_must_emit_exactly_one_form() {
 
 #[tokio::test]
 async fn transcript_compacts_chronologically() {
-    let (mut scheduler, _) = scheduler(&["nil"]);
-    scheduler.transcript_limit = 4;
-    scheduler.compact_batch = 2;
+    let (scheduler, _) = scheduler(&["nil"]);
     let mut kernel = Kernel::new();
     for i in 0..5 {
-        kernel.append_transcript(&format!("form-{}", i), &format!("result-{}", i));
+        kernel.append_transcript(
+            &format!("form-{}", i),
+            &format!("result-{}-{}", i, "x".repeat(7_000)),
+        );
     }
     scheduler.run_turn(&mut kernel).await.unwrap();
-    let state = &kernel.frames[0].state;
-    assert!(state.compacted_context.contains("form-0"));
-    assert!(state.compacted_context.contains("form-1"));
-    assert!(!state.compacted_context.contains("form-2"));
-    assert_eq!(state.transcript.last().unwrap().source, "nil");
+    let state = kernel.frames()[0].state();
+    assert!(state.compacted_context().contains("form-0"));
+    assert!(state.compacted_context().contains("form-1"));
+    assert!(!state.compacted_context().contains("form-2"));
+    assert_eq!(state.transcript().last().unwrap().source, "nil");
 }
 
 #[tokio::test]
@@ -293,7 +294,7 @@ fn context_budget_preserves_high_priority_guidance() {
     }
     let request = scheduler.build_request(&kernel);
     assert!(request.context.len() <= 62_000);
-    assert!(request.context.contains(&message_id));
+    assert!(request.context.contains(message_id.as_str()));
     assert!(request.context.contains("PRIORITY-HUMAN"));
     assert!(request.context.contains("PRIORITY-MEMORY"));
     assert!(request.context.contains("PRIORITY-HOOK"));
@@ -302,29 +303,30 @@ fn context_budget_preserves_high_priority_guidance() {
 #[test]
 fn wake_timer_delivers_to_its_original_frame() {
     let mut kernel = Kernel::new();
-    let root = kernel.frames[0].id.clone();
+    let root = kernel.frames()[0].id().clone();
     kernel
-        .wake_timers
-        .push(persistent_lisp_harness::kernel::WakeEntry {
-            wake_at: chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .schedule_wake_at(
+            root.clone(),
+            chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
-            action: "wake-root".into(),
-            frame_id: root.clone(),
-        });
+            "wake-root",
+        )
+        .unwrap();
     kernel.spawn_subagent("child", "wait");
     assert_eq!(kernel.check_wake_timers(), 1);
     assert!(
-        kernel.frames[0]
-            .messages
+        kernel
+            .notices_for_frame(&root)
             .iter()
-            .any(|message| message.text == "wake-root")
+            .any(|notice| notice.text == "wake-root")
     );
+    let child = kernel.frames()[1].id().clone();
     assert!(
-        !kernel.frames[1]
-            .messages
+        !kernel
+            .notices_for_frame(&child)
             .iter()
-            .any(|message| message.text == "wake-root")
+            .any(|notice| notice.text == "wake-root")
     );
 }
 
@@ -391,11 +393,12 @@ async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
     .await
     .expect("cancelled generation did not stop");
     assert_eq!(
-        first_result.unwrap_err(),
+        first_result.unwrap_err().to_string(),
         "model request interrupted by human input"
     );
     assert_eq!(model.active.load(Ordering::SeqCst), 0);
-    assert!(!interrupt.request_interrupt());
+    assert!(interrupt.request_interrupt());
+    interrupt.clear_pending();
 
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -407,4 +410,152 @@ async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.max_active.load(Ordering::SeqCst), 1);
     assert_eq!(model.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn parent_sees_human_redirect_after_child_replies() {
+    let (scheduler, model) = scheduler(&[r#"(agent/call "child" "work")"#]);
+    let mut kernel = Kernel::new();
+    scheduler.run_turn(&mut kernel).await.unwrap();
+    let message_id = kernel.human_message("redirect the work").unwrap();
+    let reply = format!(r#"(message/reply "{}" "acknowledged")"#, message_id);
+    {
+        let mut replies = model.replies.lock().unwrap();
+        replies.push("nil".into());
+        replies.push("(agent/return :done)".into());
+        replies.push(reply);
+    }
+    scheduler.run_turn(&mut kernel).await.unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
+    scheduler.run_turn(&mut kernel).await.unwrap();
+    let requests = model.requests.lock().unwrap();
+    let parent_request = requests.last().unwrap();
+    assert!(parent_request.context.contains(message_id.as_str()));
+    assert!(parent_request.context.contains("redirect the work"));
+    assert!(parent_request.context.contains("Answered human notice"));
+    assert!(parent_request.context.contains("do not call message/reply"));
+    assert!(!kernel.has_pending_message(&message_id));
+}
+
+#[tokio::test]
+async fn external_model_failure_is_typed_and_clears_the_trap() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    kernel
+        .eval(r#"(model/call "fail deterministically")"#)
+        .unwrap();
+    let error = scheduler.run_turn(&mut kernel).await.unwrap_err();
+    assert!(matches!(
+        error,
+        persistent_lisp_harness::SchedulerError::Model(_)
+    ));
+    assert!(!kernel.has_trap());
+    assert!(
+        kernel.frames()[0]
+            .state()
+            .transcript()
+            .last()
+            .unwrap()
+            .result
+            .contains("error")
+    );
+}
+
+#[test]
+fn worst_case_context_sections_stay_within_the_total_request_budget() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    for index in 0..100 {
+        kernel.spawn_subagent(&format!("frame-{index}"), &"task".repeat(5_000));
+    }
+    for index in 0..32 {
+        kernel
+            .human_message(&format!("notice-{index}-{}", "🦀".repeat(2_000)))
+            .unwrap();
+    }
+    for index in 0..16 {
+        kernel
+            .eval(&format!(
+                r#"(context/add-hook "hook-{index}-{}")"#,
+                "h".repeat(1_980)
+            ))
+            .unwrap();
+    }
+    for index in 0..64 {
+        kernel
+            .eval(&format!(
+                r#"(memory/remember "key-{index}" "{}")"#,
+                "m".repeat(1_000)
+            ))
+            .unwrap();
+    }
+    for index in 0..100 {
+        kernel.append_transcript(
+            &format!("action-{index}-{}", "a".repeat(1_000)),
+            &"r".repeat(5_000),
+        );
+    }
+    let request = scheduler.build_request(&kernel);
+    assert!(request.system.len() + request.context.len() <= 62_000);
+    assert!(request.context.contains("Emit exactly one Lisp form"));
+    assert!(request.context.contains("notice-0"));
+    assert!(request.context.contains("notice-31"));
+}
+
+#[tokio::test]
+async fn model_interrupt_queued_before_activation_cancels_the_imminent_generation() {
+    let (scheduler, model) = scheduler(&["nil"]);
+    let interrupt = scheduler.model_interrupt_handle();
+    assert!(interrupt.request_interrupt());
+    let mut kernel = Kernel::new();
+    let error = scheduler.run_turn(&mut kernel).await.unwrap_err();
+    assert!(matches!(
+        error,
+        persistent_lisp_harness::SchedulerError::Model(ModelError::Cancelled)
+    ));
+    assert!(model.requests.lock().unwrap().is_empty());
+    scheduler.run_turn(&mut kernel).await.unwrap();
+}
+
+#[derive(Clone)]
+struct CompletionHandoffModel {
+    interrupt: Arc<Mutex<Option<persistent_lisp_harness::ModelInterruptHandle>>>,
+}
+
+#[async_trait]
+impl ModelClient for CompletionHandoffModel {
+    async fn complete(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<String, ModelError> {
+        self.interrupt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request_interrupt();
+        Ok("nil".into())
+    }
+}
+
+#[tokio::test]
+async fn interrupt_at_model_completion_discards_the_completed_generation() {
+    let slot = Arc::new(Mutex::new(None));
+    let executor =
+        Executor::new(ExecutorConfig::with_working_directory(temp_root("handoff"))).unwrap();
+    let scheduler = Scheduler::new(
+        CompletionHandoffModel {
+            interrupt: slot.clone(),
+        },
+        executor,
+    );
+    *slot.lock().unwrap() = Some(scheduler.model_interrupt_handle());
+    let mut kernel = Kernel::new();
+    let error = scheduler.run_turn(&mut kernel).await.unwrap_err();
+    assert!(matches!(
+        error,
+        persistent_lisp_harness::SchedulerError::Model(ModelError::Cancelled)
+    ));
+    assert!(kernel.frames()[0].state().transcript().is_empty());
 }

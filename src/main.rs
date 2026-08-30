@@ -1,12 +1,14 @@
 //! Continuum: a model inhabiting a persistent Lisp world.
 
+use anyhow::{Context, Result};
 use persistent_lisp_harness::{
-    Executor, ExecutorConfig, Kernel, ModelInterruptHandle, OpenRouterModel, Scheduler, TurnOutcome,
+    EvalInterruptHandle, Executor, ExecutorConfig, Kernel, ModelInterruptHandle, OpenRouterModel,
+    OutputSink, Scheduler, SchedulerError, TurnOutcome,
 };
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,14 +43,10 @@ fn snapshot_files_exist() -> bool {
         .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
 }
 
-fn load_kernel() -> Result<Kernel, String> {
+fn load_kernel() -> Result<Kernel> {
     if snapshot_files_exist() {
-        let kernel = Kernel::recover_from_latest().map_err(|e| {
-            format!(
-                "continuity violation: snapshots exist but none recover: {}",
-                e
-            )
-        })?;
+        let kernel = Kernel::recover_from_latest()
+            .context("continuity violation: snapshots exist but none recover")?;
         slog("[kernel] recovered latest valid snapshot");
         Ok(kernel)
     } else {
@@ -91,9 +89,11 @@ fn deliver_human(kernel: &mut Kernel, text: String) {
 }
 
 fn start_input_thread(
-    tx: mpsc::Sender<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
     executor: Executor,
     model_interrupt: ModelInterruptHandle,
+    eval_interrupt: EvalInterruptHandle,
+    intervention_gate: Arc<Mutex<()>>,
 ) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
@@ -101,8 +101,10 @@ fn start_input_thread(
             if line.is_empty() {
                 continue;
             }
-            // Any human intervention cancels an in-flight shell process group.
-            persistent_lisp_harness::vm::eval::request_interrupt();
+            // Publish cancellation and the corresponding message atomically with
+            // respect to main's acknowledgement of sticky pre-activation signals.
+            let _intervention = intervention_gate.lock().unwrap();
+            eval_interrupt.request_interrupt();
             model_interrupt.request_interrupt();
             if let Err(error) = executor.cancel() {
                 slog(format!("[executor] cancellation failed: {error}"));
@@ -144,7 +146,13 @@ fn chat_html() -> String {
         .collect()
 }
 
-fn start_http(tx: mpsc::Sender<String>, executor: Executor, model_interrupt: ModelInterruptHandle) {
+fn start_http(
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    executor: Executor,
+    model_interrupt: ModelInterruptHandle,
+    eval_interrupt: EvalInterruptHandle,
+    intervention_gate: Arc<Mutex<()>>,
+) {
     let logs = LOG_BUF.clone();
     thread::spawn(move || {
         let server = tiny_http::Server::http("0.0.0.0:8080").expect("HTTP listen failed");
@@ -186,11 +194,12 @@ fn start_http(tx: mpsc::Sender<String>, executor: Executor, model_interrupt: Mod
                         .as_reader()
                         .take(64 * 1024)
                         .read_to_string(&mut body);
-                    let message = urlencoding::decode(body.trim_start_matches("message="))
-                        .unwrap_or_default()
-                        .into_owned();
+                    let message = url::form_urlencoded::parse(body.as_bytes())
+                        .find_map(|(name, value)| (name == "message").then(|| value.into_owned()))
+                        .unwrap_or_default();
                     if !message.is_empty() {
-                        persistent_lisp_harness::vm::eval::request_interrupt();
+                        let _intervention = intervention_gate.lock().unwrap();
+                        eval_interrupt.request_interrupt();
                         model_interrupt.request_interrupt();
                         if let Err(error) = executor.cancel() {
                             slog(format!("[executor] cancellation failed: {error}"));
@@ -211,47 +220,47 @@ fn start_http(tx: mpsc::Sender<String>, executor: Executor, model_interrupt: Mod
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     slog("Continuum v0.2 — persistent context → model Lisp action → result");
-    let mut kernel = load_kernel().unwrap_or_else(|error| {
-        eprintln!("[kernel] {}", error);
-        std::process::exit(2);
-    });
-    *persistent_lisp_harness::vm::eval::PRINT_HOOK
-        .lock()
-        .unwrap() = Some(|message| slog(message));
-    if let Some(root) = kernel.frames.first_mut()
-        && root.state.instructions.is_empty()
-    {
-        root.state.instructions = root_instructions();
-    }
+    let mut kernel = load_kernel()?;
+    let eval_interrupt = kernel.eval_interrupt_handle();
+    kernel.set_output_sink(OutputSink::new(|message| {
+        slog(message.trim_end_matches('\n'))
+    }));
+    kernel.set_root_instructions_if_empty(root_instructions());
 
     let workspace = std::env::var_os("CONTINUUM_AGENT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("data/workspace").to_path_buf());
-    let executor =
-        Executor::new(ExecutorConfig::with_working_directory(workspace)).unwrap_or_else(|error| {
-            eprintln!("[executor] {}", error);
-            std::process::exit(2);
-        });
+    let executor = Executor::new(ExecutorConfig::with_working_directory(workspace))
+        .context("initialize Bash executor")?;
     let scheduler = Scheduler::new(OpenRouterModel::default(), executor.clone());
     let model_interrupt = scheduler.model_interrupt_handle();
-    let (tx, rx) = mpsc::channel();
-    start_input_thread(tx.clone(), executor.clone(), model_interrupt.clone());
-    start_http(tx, executor, model_interrupt);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let intervention_gate = Arc::new(Mutex::new(()));
+    start_input_thread(
+        tx.clone(),
+        executor.clone(),
+        model_interrupt.clone(),
+        eval_interrupt.clone(),
+        intervention_gate.clone(),
+    );
+    start_http(
+        tx,
+        executor,
+        model_interrupt.clone(),
+        eval_interrupt.clone(),
+        intervention_gate.clone(),
+    );
+
+    enum RuntimeEvent {
+        Human(Option<String>),
+        Turn(Result<TurnOutcome, SchedulerError>),
+    }
 
     let mut snapshot_timer = Instant::now();
     loop {
-        while let Ok(message) = rx.try_recv() {
-            if matches!(message.as_str(), "!!exit" | "!!quit") {
-                if let Err(error) = kernel.snapshot() {
-                    eprintln!("[snapshot] {}", error);
-                }
-                return;
-            }
-            deliver_human(&mut kernel, message);
-        }
         kernel.check_wake_timers();
         if snapshot_timer.elapsed() >= Duration::from_secs(3600) {
             if let Err(error) = kernel.snapshot() {
@@ -260,27 +269,49 @@ async fn main() {
             snapshot_timer = Instant::now();
         }
 
-        match scheduler.run_turn(&mut kernel).await {
-            Ok(TurnOutcome::Evaluated { source, result, .. }) => {
+        let event = tokio::select! {
+            biased;
+            message = rx.recv() => RuntimeEvent::Human(message),
+            outcome = scheduler.run_turn(&mut kernel) => RuntimeEvent::Turn(outcome),
+        };
+        match event {
+            RuntimeEvent::Human(Some(message)) => {
+                // The selected turn future is now dropped. Clear sticky pre-activation
+                // interrupts before starting a fresh turn that includes this message.
+                let _intervention = intervention_gate.lock().unwrap();
+                model_interrupt.clear_pending();
+                eval_interrupt.clear_pending();
+                if matches!(message.as_str(), "!!exit" | "!!quit") {
+                    if let Err(error) = kernel.snapshot() {
+                        eprintln!("[snapshot] {}", error);
+                    }
+                    return Ok(());
+                }
+                deliver_human(&mut kernel, message);
+            }
+            RuntimeEvent::Human(None) => return Ok(()),
+            RuntimeEvent::Turn(Ok(TurnOutcome::Evaluated { source, result, .. })) => {
                 slog(format!("[lisp] {} => {}", source, result));
             }
-            Ok(TurnOutcome::ToolCompleted { source, result, .. }) => {
+            RuntimeEvent::Turn(Ok(TurnOutcome::ToolCompleted { source, result, .. })) => {
                 slog(format!("[tool] {} => {}", source, result));
             }
-            Ok(TurnOutcome::Spawned { child_id, .. }) => {
-                slog(format!("[agent] spawned {}", child_id))
+            RuntimeEvent::Turn(Ok(TurnOutcome::Spawned { child_id, .. })) => {
+                slog(format!("[agent] spawned {}", child_id));
             }
-            Ok(TurnOutcome::Returned { result, .. }) => {
-                slog(format!("[agent] child returned {}", result))
+            RuntimeEvent::Turn(Ok(TurnOutcome::Returned { result, .. })) => {
+                slog(format!("[agent] child returned {}", result));
             }
-            Ok(TurnOutcome::Replied { text, .. }) => {
+            RuntimeEvent::Turn(Ok(TurnOutcome::Replied { text, .. })) => {
                 add_chat("agent", text.clone());
                 slog(format!("[agent] {}", text));
             }
-            Ok(TurnOutcome::Idle) => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(error) => {
+            RuntimeEvent::Turn(Ok(TurnOutcome::Idle)) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            RuntimeEvent::Turn(Err(error)) => {
                 slog(format!("[turn] {}", error));
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     }

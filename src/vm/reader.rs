@@ -1,30 +1,21 @@
 use crate::vm::value::Value;
 use indexmap::IndexMap;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReadError {
+    #[error("unexpected EOF: {0}")]
     UnexpectedEof(String),
+    #[error("invalid syntax: {0}")]
     InvalidSyntax(String),
+    #[error("unmatched '('")]
     UnmatchedParen,
+    #[error("unmatched '['")]
     UnmatchedBracket,
+    #[error("unmatched '{{'")]
     UnmatchedBrace,
+    #[error("unknown dispatch: {0}")]
     UnknownDispatch(String),
 }
-
-impl std::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadError::UnexpectedEof(s) => write!(f, "unexpected EOF: {}", s),
-            ReadError::InvalidSyntax(s) => write!(f, "invalid syntax: {}", s),
-            ReadError::UnmatchedParen => write!(f, "unmatched '('"),
-            ReadError::UnmatchedBracket => write!(f, "unmatched '['"),
-            ReadError::UnmatchedBrace => write!(f, "unmatched '{{'"),
-            ReadError::UnknownDispatch(s) => write!(f, "unknown dispatch: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for ReadError {}
 
 enum ParserState {
     List(Vec<Value>),

@@ -332,7 +332,7 @@ fn test_repl_wake() {
     let r = k.eval(r#"(wake 10000 '(bash "echo hi"))"#);
     assert!(r.is_ok(), "wake: {:?}", r.err());
     assert_eq!(r.unwrap(), Value::keyword("scheduled"));
-    assert_eq!(k.wake_timers.len(), 1);
+    assert_eq!(k.wake_timer_count(), 1);
 }
 
 #[test]
@@ -412,7 +412,12 @@ fn binding_history_is_bounded() {
             .eval(&format!("(define user/redefined {})", value))
             .unwrap();
     }
-    assert_eq!(kernel.env.namespaces["user"].history("redefined").len(), 32);
+    assert_eq!(
+        kernel
+            .environment()
+            .binding_history_len("user", "redefined"),
+        32
+    );
 }
 
 #[test]
@@ -512,15 +517,15 @@ fn failed_top_level_form_rolls_back_cells_and_arena_allocations() {
     kernel
         .eval("(define counter (let ((x 0)) (lambda () (set! x (+ x 1)) x)))")
         .unwrap();
-    let environments = kernel.env.lexical.environments.len();
-    let cells = kernel.env.lexical.cells.len();
+    let environments = kernel.lexical_arena_counts().0;
+    let cells = kernel.lexical_arena_counts().1;
     assert!(
         kernel
             .eval("(begin (counter) (let ((temporary 1)) unknown-symbol))")
             .is_err()
     );
-    assert_eq!(kernel.env.lexical.environments.len(), environments);
-    assert_eq!(kernel.env.lexical.cells.len(), cells);
+    assert_eq!(kernel.lexical_arena_counts().0, environments);
+    assert_eq!(kernel.lexical_arena_counts().1, cells);
     assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(1));
 }
 
@@ -563,4 +568,81 @@ fn redefining_a_data_family_removes_only_its_stale_constructors() {
         .unwrap();
     assert!(kernel.eval("(shapes/Shape/Square 2)").is_err());
     assert!(kernel.eval("(shapes/Shape/Circle 2)").is_ok());
+}
+
+#[test]
+fn output_sinks_are_kernel_local() {
+    use persistent_lisp_harness::OutputSink;
+    use std::sync::{Arc, Mutex};
+    let left_output = Arc::new(Mutex::new(String::new()));
+    let right_output = Arc::new(Mutex::new(String::new()));
+    let mut left = Kernel::new();
+    let mut right = Kernel::new();
+    let captured = left_output.clone();
+    left.set_output_sink(OutputSink::new(move |text| {
+        captured.lock().unwrap().push_str(text)
+    }));
+    let captured = right_output.clone();
+    right.set_output_sink(OutputSink::new(move |text| {
+        captured.lock().unwrap().push_str(text)
+    }));
+    left.eval(r#"(display "left")"#).unwrap();
+    right.eval(r#"(println "right")"#).unwrap();
+    assert_eq!(&*left_output.lock().unwrap(), r#""left""#);
+    assert_eq!(&*right_output.lock().unwrap(), "\"right\"\n");
+}
+
+#[test]
+fn eval_cancellation_is_kernel_local() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut interrupted = Kernel::new();
+    let interrupt = interrupted.eval_interrupt_handle();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = interrupted.eval("(begin (define (loop n) (loop (+ n 1))) (loop 0))");
+        let _ = sender.send(result.map_err(|error| error.to_string()));
+    });
+    for _ in 0..1_000 {
+        if interrupt.is_running() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(interrupt.is_running());
+    assert!(interrupt.request_interrupt());
+    let result = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("evaluation did not stop");
+    assert!(result.unwrap_err().contains("interrupted"));
+
+    let mut independent = Kernel::new();
+    assert_eq!(independent.eval("(+ 1 2)").unwrap(), Value::Int(3));
+}
+
+#[test]
+fn eval_interrupt_queued_before_activation_cancels_the_imminent_eval() {
+    let mut kernel = Kernel::new();
+    let interrupt = kernel.eval_interrupt_handle();
+    assert!(!interrupt.request_interrupt());
+    assert!(matches!(
+        kernel.eval("(+ 1 2)"),
+        Err(persistent_lisp_harness::EvalError::Interrupted)
+    ));
+    assert_eq!(kernel.eval("(+ 1 2)").unwrap(), Value::Int(3));
+}
+
+#[test]
+fn interrupt_at_eval_completion_discards_the_completed_value() {
+    use persistent_lisp_harness::OutputSink;
+    let mut kernel = Kernel::new();
+    let interrupt = kernel.eval_interrupt_handle();
+    let callback = interrupt.clone();
+    kernel.set_output_sink(OutputSink::new(move |_| {
+        assert!(callback.request_interrupt());
+    }));
+    assert!(matches!(
+        kernel.eval(r#"(display "finishing")"#),
+        Err(persistent_lisp_harness::EvalError::Interrupted)
+    ));
 }

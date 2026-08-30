@@ -1,12 +1,86 @@
+use crate::vm::env::EnvironmentId;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const VARIADIC_ARITY: u32 = u32::MAX;
-pub type NativeFn = fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, String>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Arity {
+    Exact(u32),
+    Variadic,
+}
 
-fn missing_native(_: &mut crate::kernel::Kernel, _: Vec<Value>) -> Result<Value, String> {
-    Err("native function was not registered after snapshot recovery".into())
+impl Serialize for Arity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Exact(count) => serializer.serialize_u32(*count),
+            Self::Variadic => serializer.serialize_str("variadic"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Arity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Arity;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an exact arity or 'variadic'")
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Arity, E> {
+                let value = u32::try_from(value).map_err(|_| E::custom("arity exceeds u32"))?;
+                Ok(if value == u32::MAX {
+                    Arity::Variadic
+                } else {
+                    Arity::Exact(value)
+                })
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Arity, E> {
+                if value == "variadic" {
+                    Ok(Arity::Variadic)
+                } else {
+                    Err(E::custom("invalid arity"))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl fmt::Display for Arity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(count) => count.fmt(formatter),
+            Self::Variadic => formatter.write_str("variadic"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeError {
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("native operation failed: {0}")]
+    Failed(String),
+}
+
+impl From<String> for NativeError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for NativeError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+pub type NativeFn = fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, NativeError>;
+
+fn missing_native(_: &mut crate::kernel::Kernel, _: Vec<Value>) -> Result<Value, NativeError> {
+    Err(NativeError::Failed(
+        "native function was not registered after snapshot recovery".into(),
+    ))
 }
 
 fn missing_native_fn() -> NativeFn {
@@ -20,14 +94,14 @@ fn missing_native_fn() -> NativeFn {
 pub enum Function {
     Native {
         name: String,
-        arity: u32,
+        arity: Arity,
         #[serde(skip, default = "missing_native_fn")]
         func: NativeFn,
     },
     Interpreted {
         params: Vec<String>,
         body: Vec<Value>,
-        env_id: u64,
+        env_id: EnvironmentId,
     },
     Constructor {
         family: String,
@@ -302,6 +376,50 @@ impl Value {
     }
     pub fn list(items: Vec<Value>) -> Self {
         Value::List(items)
+    }
+
+    pub fn require_int(&self, function: &str, position: usize) -> Result<i64, NativeError> {
+        self.as_int().ok_or_else(|| {
+            NativeError::InvalidArgument(format!(
+                "{}: argument {} must be an integer",
+                function, position
+            ))
+        })
+    }
+
+    pub fn require_number(&self, function: &str, position: usize) -> Result<f64, NativeError> {
+        self.as_number().ok_or_else(|| {
+            NativeError::InvalidArgument(format!(
+                "{}: argument {} must be a number",
+                function, position
+            ))
+        })
+    }
+
+    pub fn require_string<'a>(
+        &'a self,
+        function: &str,
+        position: usize,
+    ) -> Result<&'a str, NativeError> {
+        self.as_str().ok_or_else(|| {
+            NativeError::InvalidArgument(format!(
+                "{}: argument {} must be a string",
+                function, position
+            ))
+        })
+    }
+
+    pub fn require_nonnegative_usize(
+        &self,
+        function: &str,
+        position: usize,
+    ) -> Result<usize, NativeError> {
+        usize::try_from(self.require_int(function, position)?).map_err(|_| {
+            NativeError::InvalidArgument(format!(
+                "{}: argument {} must be a non-negative index",
+                function, position
+            ))
+        })
     }
 
     pub fn as_int(&self) -> Option<i64> {
