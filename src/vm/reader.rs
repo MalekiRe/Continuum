@@ -112,7 +112,16 @@ pub fn read_one(input: &str) -> Result<(Value, &str), ReadError> {
 
         if ch == '}' {
             match stack.pop() {
-                Some(ParserState::Map { pairs, .. }) => {
+                Some(ParserState::Map {
+                    pairs,
+                    expect_key,
+                    current_key,
+                }) => {
+                    if !expect_key || current_key.is_some() {
+                        return Err(ReadError::InvalidSyntax(
+                            "map literal requires an even number of forms".into(),
+                        ));
+                    }
                     let mut map = IndexMap::new();
                     for (k, v) in pairs {
                         map.insert(k, v);
@@ -257,21 +266,14 @@ pub fn read_all(input: &str) -> Result<Vec<Value>, ReadError> {
     Ok(results)
 }
 
-fn skip_whitespace_and_comments(input: &str) -> &str {
-    let mut i = 0;
-    let bytes = input.as_bytes();
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-        } else if bytes[i] == b';' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else {
-            break;
+fn skip_whitespace_and_comments(mut input: &str) -> &str {
+    loop {
+        input = input.trim_start_matches(char::is_whitespace);
+        if !input.starts_with(';') {
+            return input;
         }
+        input = input.find('\n').map_or("", |newline| &input[newline + 1..]);
     }
-    &input[i..]
 }
 
 fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
@@ -367,7 +369,12 @@ fn read_atom(input: &str) -> Result<(Value, &str), ReadError> {
 fn read_raw_symbol(input: &str) -> Result<(String, &str), ReadError> {
     let mut s = String::new();
     for (i, ch) in input.char_indices() {
-        if ch.is_ascii_whitespace() || "()[]{}'\";,`#".contains(ch) {
+        if ch.is_whitespace() || "()[]{}'\";,`#".contains(ch) {
+            if s.is_empty() {
+                return Err(ReadError::InvalidSyntax(
+                    "expected a symbol or number".into(),
+                ));
+            }
             return Ok((s, &input[i..]));
         }
         s.push(ch);

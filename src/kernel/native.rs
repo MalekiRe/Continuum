@@ -1,15 +1,42 @@
 use crate::kernel::Kernel;
 use crate::vm::value::{VARIADIC_ARITY, Value};
 
+fn argument<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a Value, String> {
+    args.get(index)
+        .ok_or_else(|| format!("{}: missing argument {}", name, index + 1))
+}
+
+fn integer_argument(args: &[Value], index: usize, name: &str) -> Result<i64, String> {
+    argument(args, index, name)?
+        .as_int()
+        .ok_or_else(|| format!("{}: argument {} must be an integer", name, index + 1))
+}
+
+fn index_argument(args: &[Value], index: usize, name: &str) -> Result<usize, String> {
+    let value = integer_argument(args, index, name)?;
+    usize::try_from(value).map_err(|_| {
+        format!(
+            "{}: argument {} must be a non-negative index",
+            name,
+            index + 1
+        )
+    })
+}
+
+fn string_argument<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a str, String> {
+    argument(args, index, name)?
+        .as_str()
+        .ok_or_else(|| format!("{}: argument {} must be a string", name, index + 1))
+}
+
 fn numbers(args: &[Value], name: &str) -> Result<(f64, f64), String> {
-    let number = |value: &Value| match value {
-        Value::Int(value) => Some(*value as f64),
-        Value::Float(value) => Some(*value),
-        _ => None,
-    };
     Ok((
-        number(&args[0]).ok_or_else(|| format!("{}: expected numbers", name))?,
-        number(&args[1]).ok_or_else(|| format!("{}: expected numbers", name))?,
+        argument(args, 0, name)?
+            .as_number()
+            .ok_or_else(|| format!("{}: expected numbers", name))?,
+        argument(args, 1, name)?
+            .as_number()
+            .ok_or_else(|| format!("{}: expected numbers", name))?,
     ))
 }
 
@@ -19,7 +46,7 @@ fn arithmetic(
     ints: fn(i64, i64) -> Option<i64>,
     floats: fn(f64, f64) -> f64,
 ) -> Result<Value, String> {
-    if let (Value::Int(a), Value::Int(b)) = (&args[0], &args[1]) {
+    if let (Some(Value::Int(a)), Some(Value::Int(b))) = (args.first(), args.get(1)) {
         return ints(*a, *b)
             .map(Value::Int)
             .ok_or_else(|| format!("{}: integer overflow", name));
@@ -30,6 +57,17 @@ fn arithmetic(
 
 impl Kernel {
     pub fn register_tools(&mut self) {
+        // Snapshots may contain natives retired after they were written. Remove
+        // them explicitly before restoring the current registry.
+        if let Some(namespace) =
+            std::sync::Arc::make_mut(&mut self.env.namespaces).get_mut("kernel")
+        {
+            for name in ["read", "sleep"] {
+                namespace.bindings.remove(name);
+                namespace.sources.remove(name);
+            }
+        }
+
         // Arithmetic
         self.define_native("kernel/+", 2, |_kernel, args| {
             arithmetic(&args, "+", i64::checked_add, |a, b| a + b)
@@ -110,14 +148,6 @@ impl Kernel {
                 println!("{}", msg);
             }
             Ok(args[0].clone())
-        });
-
-        self.define_native("kernel/read", 0, |_kernel, _args| {
-            let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .map_err(|e| format!("read error: {}", e))?;
-            Ok(Value::string(input.trim()))
         });
 
         // Type predicates
@@ -419,22 +449,24 @@ impl Kernel {
             Ok(Value::string(&format!("{}{}", a, b)))
         });
         self.define_native("nth", 2, |_kernel, args| {
-            let idx = match &args[0] {
-                Value::Int(i) => *i as usize,
-                _ => return Err("nth: expected integer index".into()),
-            };
-            match &args[1] {
-                Value::List(items) => items
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| format!("nth: index {} out of bounds", idx)),
-                _ => Err("nth: expected list".into()),
-            }
+            let index = index_argument(&args, 0, "nth")?;
+            let items = argument(&args, 1, "nth")?
+                .as_list()
+                .ok_or_else(|| "nth: argument 2 must be a list".to_string())?;
+            items
+                .get(index)
+                .cloned()
+                .ok_or_else(|| format!("nth: index {} out of bounds (len {})", index, items.len()))
         });
-        self.define_native("length", 1, |_kernel, args| match &args[0] {
-            Value::List(items) => Ok(Value::Int(items.len() as i64)),
-            Value::String(s) => Ok(Value::Int(s.len() as i64)),
-            _ => Err("length: expected list or string".into()),
+        self.define_native("length", 1, |_kernel, args| {
+            let length = match argument(&args, 0, "length")? {
+                Value::List(items) => items.len(),
+                Value::String(value) => value.chars().count(),
+                _ => return Err("length: expected list or string".into()),
+            };
+            i64::try_from(length)
+                .map(Value::Int)
+                .map_err(|_| "length: value is too large".into())
         });
         self.define_native("bash", 1, |kernel, args| {
             if !kernel.current_form_is("bash") {
@@ -450,35 +482,21 @@ impl Kernel {
             Ok(Value::keyword("suspended"))
         });
 
-        self.define_native("sleep", 1, |_kernel, args| {
-            let ms = match &args[0] {
-                Value::Int(n) => *n,
-                Value::Float(f) => *f as i64,
-                _ => return Err("sleep: expected integer milliseconds".into()),
-            };
-            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-            Ok(Value::keyword("awake"))
-        });
-
-        self.define_native("wake", 2, |_kernel, args| {
-            let duration_ms = match &args[0] {
-                Value::Int(ms) => *ms,
-                other => {
-                    return Err(format!(
-                        "wake: expected integer milliseconds, got {}",
-                        other
-                    ));
-                }
-            };
-            let action = format!("{}", args[1]);
-
-            let wake_at = chrono::Utc::now() + chrono::Duration::milliseconds(duration_ms);
-            let frame_id = _kernel
+        self.define_native("wake", 2, |kernel, args| {
+            let duration_ms = integer_argument(&args, 0, "wake")?;
+            if duration_ms < 0 {
+                return Err("wake: duration must be non-negative".into());
+            }
+            let action = format!("{}", argument(&args, 1, "wake")?);
+            let wake_at = chrono::Utc::now()
+                .checked_add_signed(chrono::Duration::milliseconds(duration_ms))
+                .ok_or_else(|| "wake: duration is out of range".to_string())?;
+            let frame_id = kernel
                 .frames
                 .last()
                 .map(|f| f.id.clone())
                 .unwrap_or_default();
-            _kernel.wake_timers.push(crate::kernel::WakeEntry {
+            kernel.wake_timers.push(crate::kernel::WakeEntry {
                 wake_at,
                 action,
                 frame_id,
@@ -506,28 +524,23 @@ impl Kernel {
         });
 
         self.define_native("map/get", 2, |_kernel, args| {
-            let map = match &args[0] {
-                Value::Map(m) => m,
-                other => return Err(format!("map/get: expected map, got {}", other)),
-            };
-            let key = &args[1];
+            let map = argument(&args, 0, "map/get")?
+                .as_map()
+                .ok_or_else(|| "map/get: argument 1 must be a map".to_string())?;
+            let key = argument(&args, 1, "map/get")?;
             Ok(map.get(key).cloned().unwrap_or(Value::Nil))
         });
 
         self.define_native("vector/get", 2, |_kernel, args| {
-            let vec = match &args[0] {
-                Value::Vector(v) => v,
-                other => return Err(format!("vector/get: expected vector, got {}", other)),
-            };
-            let idx = match &args[1] {
-                Value::Int(i) => *i as usize,
-                other => return Err(format!("vector/get: expected integer index, got {}", other)),
-            };
-            vec.get(idx).cloned().ok_or_else(|| {
+            let vector = argument(&args, 0, "vector/get")?
+                .as_vector()
+                .ok_or_else(|| "vector/get: argument 1 must be a vector".to_string())?;
+            let index = index_argument(&args, 1, "vector/get")?;
+            vector.get(index).cloned().ok_or_else(|| {
                 format!(
                     "vector/get: index {} out of bounds (len {})",
-                    idx,
-                    vec.len()
+                    index,
+                    vector.len()
                 )
             })
         });
@@ -564,46 +577,45 @@ impl Kernel {
 
         // inspect/source — show source code of a definition
         self.define_native("string-search", 2, |_kernel, args| {
-            let needle = match &args[0] {
-                Value::String(s) => s.clone(),
-                other => {
-                    return Err(format!(
-                        "string-search: expected string needle, got {}",
-                        other
-                    ));
-                }
-            };
-            let haystack = match &args[1] {
-                Value::String(s) => s.clone(),
-                other => {
-                    return Err(format!(
-                        "string-search: expected string haystack, got {}",
-                        other
-                    ));
-                }
-            };
-            if let Some(i) = haystack.find(&needle) {
-                Ok(Value::Int(i as i64))
+            let needle = string_argument(&args, 0, "string-search")?;
+            let haystack = string_argument(&args, 1, "string-search")?;
+            if let Some(byte_index) = haystack.find(needle) {
+                let scalar_index = haystack[..byte_index].chars().count();
+                i64::try_from(scalar_index)
+                    .map(Value::Int)
+                    .map_err(|_| "string-search: index is too large".into())
             } else {
                 Ok(Value::Bool(false))
             }
         });
         self.define_native("substring", 3, |_kernel, args| {
-            let s = match &args[0] {
-                Value::String(s) => s.clone(),
-                other => return Err(format!("substring: expected string, got {}", other)),
-            };
-            let start = match &args[1] {
-                Value::Int(i) => *i as usize,
-                _ => return Err("substring: expected integer start".into()),
-            };
-            let end = match &args[2] {
-                Value::Int(i) => *i as usize,
-                _ => return Err("substring: expected integer end".into()),
-            };
-            let end = end.min(s.len());
-            let start = start.min(end);
-            Ok(Value::string(&s[start..end]))
+            let value = string_argument(&args, 0, "substring")?;
+            let start = index_argument(&args, 1, "substring")?;
+            let end = index_argument(&args, 2, "substring")?;
+            if start > end {
+                return Err(format!(
+                    "substring: start index {} exceeds end index {}",
+                    start, end
+                ));
+            }
+
+            let scalar_count = value.chars().count();
+            if end > scalar_count {
+                return Err(format!(
+                    "substring: index {} out of bounds (len {})",
+                    end, scalar_count
+                ));
+            }
+
+            let start_byte = value
+                .char_indices()
+                .nth(start)
+                .map_or(value.len(), |(index, _)| index);
+            let end_byte = value
+                .char_indices()
+                .nth(end)
+                .map_or(value.len(), |(index, _)| index);
+            Ok(Value::string(&value[start_byte..end_byte]))
         });
 
         // history/read — read a specific event by ID

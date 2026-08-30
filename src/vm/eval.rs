@@ -1201,6 +1201,13 @@ fn apply_tail(
             body,
             env_id,
         }) => {
+            if args.len() != params.len() {
+                return Err(EvalError::ArityMismatch {
+                    name: "lambda".into(),
+                    expected: u32::try_from(params.len()).unwrap_or(u32::MAX),
+                    got: args.len(),
+                });
+            }
             let captured = kernel.lexical_env(env_id).ok_or_else(|| {
                 EvalError::KernelError(format!("closure environment {} is missing", env_id))
             })?;

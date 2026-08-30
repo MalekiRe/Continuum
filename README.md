@@ -12,7 +12,7 @@ bash — the universal tool interface
 Files, processes, network, everything else
 ```
 
-The kernel is the Lisp VM. It provides 52 native functions — arithmetic, list operations, type predicates, I/O, persistence, inspection, model operations, and `bash`. File I/O, web requests, git, package management, and other computer interaction go through `bash`; Rust's scheduler owns model inference and external suspension. The agent defines its own tools in Lisp.
+The kernel is the Lisp VM. It provides 50 native functions — arithmetic, list operations, type predicates, output, persistence, inspection, model operations, and `bash`. File I/O, web requests, git, package management, and other computer interaction go through `bash`; Rust's scheduler owns model inference and external suspension. The agent defines its own tools in Lisp.
 
 ## Language
 
@@ -20,7 +20,7 @@ A Scheme-like Lisp with:
 
 | Special forms | `define`, `lambda`, `if`, `begin`, `let`, `let*`, `letrec`, `set!`, `quote`, `quasiquote`, `undefine` |
 |---|---|
-| Macros | `define-syntax` with `syntax-rules` (including `...` ellipsis for variable-length patterns) |
+| Macros | Pattern-based, non-hygienic `define-syntax` with a small `syntax-rules`-style matcher (including trailing `...` ellipsis) |
 | Data types | `define-data` for tagged value families with automatic constructor functions |
 | Pattern matching | `match` with constructor pattern destructuring |
 | Tagged values | `(Ok value)`, `(Err problem)`, `(Cancelled reason)`, `(Indeterminate problem)` |
@@ -76,7 +76,7 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 |---|---|
 | Arithmetic | `+` `-` `*` `/` `<` `=` `>` |
 | Lists | `cons` `car` `cdr` `list` `append` `nth` `length` |
-| I/O | `display` `println` `read` |
+| Output | `display` `println` |
 | Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
 | System | `system/clock` `system/version` |
 | Model and messages | `model/call` `human/wait` `message/reply` |
@@ -84,6 +84,6 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 | Source and inspection | `source/get` `source/list` `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/history` |
 | Subagents | `agent/call` `agent/return` |
 | Shell | `bash` |
-| Scheduling | `sleep` `wake` |
+| Scheduling | `wake` |
 | Strings | `string-append` `string-search` `substring` |
 | Utilities | `map/get` `vector/get` `kernel/error` |

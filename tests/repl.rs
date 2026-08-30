@@ -325,11 +325,9 @@ fn test_repl_system_clock() {
 }
 
 #[test]
-fn test_repl_sleep_wake() {
+fn test_repl_wake() {
     let mut k = Kernel::new();
-    let r = k.eval("(sleep 1)");
-    assert!(r.is_ok(), "sleep: {:?}", r.err());
-    assert_eq!(r.unwrap(), Value::keyword("awake"));
+    assert!(k.eval("(sleep 1)").is_err());
 
     let r = k.eval(r#"(wake 10000 '(bash "echo hi"))"#);
     assert!(r.is_ok(), "wake: {:?}", r.err());

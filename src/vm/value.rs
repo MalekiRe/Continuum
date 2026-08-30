@@ -304,6 +304,56 @@ impl Value {
         Value::List(items)
     }
 
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Value::Int(value) => Some(*value as f64),
+            Value::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_symbol(&self) -> Option<&str> {
+        match self {
+            Value::Symbol(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn as_vector(&self) -> Option<&[Value]> {
+        match self {
+            Value::Vector(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn as_map(&self) -> Option<&IndexMap<Value, Value>> {
+        match self {
+            Value::Map(values) => Some(values),
+            _ => None,
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
