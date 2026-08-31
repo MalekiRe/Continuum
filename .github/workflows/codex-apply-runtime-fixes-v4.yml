@@ -1,0 +1,24 @@
+name: Apply runtime correctness fixes v4
+
+on:
+  push:
+    branches:
+      - codex/fix-runtime-correctness
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/fix-runtime-correctness
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/codex_apply_runtime_fixes.sh
