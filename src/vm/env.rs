@@ -1,18 +1,19 @@
 use crate::ids::QualifiedName;
-use crate::vm::value::{Function, Value, collect_captured_environments};
+use crate::state::{BoundedLog, Stamped};
+use crate::vm::value::{Value, collect_captured_environments};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+const HISTORY_LIMIT: usize = 32;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnvError {
     #[error("invalid qualified name: {0}")]
     InvalidName(String),
-    #[error("namespace '{0}' is protected and cannot be modified")]
-    Protected(String),
-    #[error("native binding '{0}' cannot be modified")]
-    NativeBinding(String),
+    #[error("immutable binding '{0}' cannot be modified")]
+    ImmutableBinding(String),
     #[error("namespace '{0}' not found")]
     NamespaceNotFound(String),
     #[error("binding '{0}' not found")]
@@ -32,106 +33,147 @@ fn qualified_parts(name: &str) -> Result<(&str, &str), EnvError> {
     }
 }
 
-/// A snapshot of a binding at one point in history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BindingRecord {
-    pub value: Value,
-    pub timestamp: String,
-    pub version: u64,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum BindingOrigin {
+    Kernel,
+    Prelude,
+    #[default]
+    Agent,
 }
 
-/// A tagged data variant.
+impl BindingOrigin {
+    fn mutable(self) -> bool {
+        self == Self::Agent
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BindingChange {
+    Defined {
+        source: Option<String>,
+        preview: String,
+    },
+    Undefined,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindingVersion {
+    pub version: u64,
+    pub change: BindingChange,
+}
+
+pub type BindingRecord = Stamped<BindingVersion>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataVariant {
     pub name: String,
     pub fields: Vec<String>,
 }
 
-/// A tagged data family.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataFamily {
-    /// Canonical `namespace/name` identity.
     pub name: QualifiedName,
     pub variants: Vec<DataVariant>,
-    /// Exact qualified bindings installed for this definition.
-    #[serde(default)]
     pub generated_bindings: Vec<QualifiedName>,
 }
 
-/// A single namespace holding named bindings with version history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Namespace {
     pub(crate) bindings: IndexMap<String, Value>,
-    pub(crate) history: IndexMap<String, Vec<BindingRecord>>,
-    #[serde(default)]
+    pub(crate) history: IndexMap<String, BoundedLog<BindingRecord, HISTORY_LIMIT>>,
     pub(crate) sources: IndexMap<String, String>,
+    pub(crate) origins: IndexMap<String, BindingOrigin>,
     pub(crate) next_version: u64,
-    pub(crate) protected: bool,
     pub(crate) data_families: IndexMap<String, DataFamily>,
 }
 
-impl Namespace {
-    pub fn new(name: &str) -> Self {
-        let protected =
-            name == "system" || name == "kernel" || name == "inspect" || name == "control";
-        Namespace {
+impl Default for Namespace {
+    fn default() -> Self {
+        Self {
             bindings: IndexMap::new(),
             history: IndexMap::new(),
             sources: IndexMap::new(),
+            origins: IndexMap::new(),
             next_version: 1,
-            protected,
             data_families: IndexMap::new(),
         }
     }
+}
 
-    fn remember(&mut self, name: &str, value: Value) {
-        let history = self.history.entry(name.into()).or_default();
-        history.push(BindingRecord {
-            value,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            version: self.next_version,
-        });
-        self.next_version += 1;
-        if history.len() > 32 {
-            history.remove(0);
-        }
+impl Namespace {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn define(&mut self, name: &str, value: Value) {
-        if let Some(old) = self.bindings.get(name).cloned() {
-            self.remember(name, old);
+    fn record(&mut self, name: &str, change: BindingChange) {
+        let version = self.next_version;
+        self.next_version = self.next_version.saturating_add(1);
+        self.history
+            .entry(name.into())
+            .or_default()
+            .push(Stamped::now(BindingVersion { version, change }));
+    }
+
+    fn define(
+        &mut self,
+        name: &str,
+        value: Value,
+        source: Option<String>,
+        origin: BindingOrigin,
+        record: bool,
+    ) {
+        if record {
+            self.record(
+                name,
+                BindingChange::Defined {
+                    source: source.clone(),
+                    preview: value.to_string().chars().take(512).collect(),
+                },
+            );
         }
         self.bindings.insert(name.into(), value);
+        self.origins.insert(name.into(), origin);
+        match source {
+            Some(source) => {
+                self.sources.insert(name.into(), source);
+            }
+            None => {
+                self.sources.shift_remove(name);
+            }
+        }
     }
 
-    pub fn undefine(&mut self, name: &str) -> Option<Value> {
-        if self.protected {
-            return None;
+    fn assign(&mut self, name: &str, value: Value) -> bool {
+        if !self.bindings.contains_key(name) {
+            return false;
         }
-        let removed = self.bindings.shift_remove(name);
+        self.bindings.insert(name.into(), value);
+        true
+    }
+
+    fn undefine(&mut self, name: &str) -> Option<Value> {
+        let removed = self.bindings.shift_remove(name)?;
         self.sources.shift_remove(name);
-        if let Some(value) = removed.clone() {
-            self.remember(name, value);
-        }
-        removed
+        self.origins.shift_remove(name);
+        self.record(name, BindingChange::Undefined);
+        Some(removed)
     }
 
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.bindings.get(name)
     }
 
-    pub fn history(&self, name: &str) -> &[BindingRecord] {
-        self.history.get(name).map_or(&[], Vec::as_slice)
+    pub fn history(&self, name: &str) -> Option<&BoundedLog<BindingRecord, HISTORY_LIMIT>> {
+        self.history.get(name)
     }
 
     pub fn list_bindings(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.bindings.keys().cloned().collect();
+        let mut names: Vec<_> = self.bindings.keys().cloned().collect();
         names.sort();
         names
     }
 }
 
-/// Stable identifiers used by the serializable lexical arena.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EnvironmentId(u64);
@@ -139,6 +181,7 @@ pub struct EnvironmentId(u64);
 impl EnvironmentId {
     pub const ROOT: Self = Self(0);
     const FIRST_ALLOCATED: Self = Self(1);
+
     fn take_and_advance(&mut self) -> Self {
         let current = *self;
         self.0 += 1;
@@ -158,6 +201,7 @@ pub struct CellId(u64);
 
 impl CellId {
     const FIRST: Self = Self(1);
+
     fn take_and_advance(&mut self) -> Self {
         let current = *self;
         self.0 += 1;
@@ -171,11 +215,6 @@ pub(crate) struct LexicalEnvironment {
     pub(crate) bindings: IndexMap<String, CellId>,
 }
 
-/// Serializable storage for lexical scopes and their mutable binding cells.
-///
-/// Environments point at cells rather than containing values directly. A
-/// closure therefore captures an environment id, and all closures which see a
-/// binding share the same cell (including after snapshot recovery).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LexicalArena {
     pub(crate) environments: IndexMap<EnvironmentId, LexicalEnvironment>,
@@ -271,23 +310,22 @@ impl LexicalArena {
     }
 
     fn define(&mut self, environment: EnvironmentId, name: &str, value: Value) {
-        let existing = self
+        if let Some(cell) = self
             .environments
             .get(&environment)
             .and_then(|frame| frame.bindings.get(name))
-            .copied();
-        if let Some(cell) = existing {
+            .copied()
+        {
             self.cells.insert(cell, value);
             return;
         }
-
         let cell = self.next_cell_id.take_and_advance();
         self.cells.insert(cell, value);
         self.environments
             .get_mut(&environment)
             .expect("active lexical environment must exist")
             .bindings
-            .insert(name.to_string(), cell);
+            .insert(name.into(), cell);
     }
 
     fn find_cell(&self, mut environment: EnvironmentId, name: &str) -> Option<CellId> {
@@ -301,107 +339,11 @@ impl LexicalArena {
     }
 }
 
-/// The namespaces and current cursor into the lexical arena.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvRef {
     pub(crate) namespaces: Arc<IndexMap<String, Namespace>>,
-    #[serde(default)]
     pub(crate) lexical: LexicalArena,
-    #[serde(default)]
     current_environment: EnvironmentId,
-}
-
-#[derive(Deserialize)]
-struct EnvRefWire {
-    namespaces: Arc<IndexMap<String, Namespace>>,
-    #[serde(default)]
-    lexical: LexicalArena,
-    #[serde(default)]
-    current_environment: EnvironmentId,
-}
-
-fn validate_namespaces(namespaces: &IndexMap<String, Namespace>) -> Result<(), String> {
-    for (name, namespace) in namespaces {
-        let protected = matches!(name.as_str(), "system" | "kernel" | "inspect" | "control");
-        let empty_local = namespace
-            .bindings
-            .keys()
-            .chain(namespace.sources.keys())
-            .chain(namespace.history.keys())
-            .chain(namespace.data_families.keys())
-            .any(String::is_empty);
-        let invalid_history = namespace.history.values().any(|records| {
-            records.len() > 32
-                || records
-                    .iter()
-                    .any(|record| record.version >= namespace.next_version)
-                || records
-                    .windows(2)
-                    .any(|pair| pair[0].version >= pair[1].version)
-        });
-        let invalid_family = namespace.data_families.iter().any(|(local, family)| {
-            family.name.as_str() != format!("{name}/{local}")
-                || family
-                    .generated_bindings
-                    .iter()
-                    .any(|binding| qualified_parts(binding.as_str()).is_err())
-        });
-        if name.is_empty()
-            || name.contains('/')
-            || namespace.protected != protected
-            || empty_local
-            || namespace.next_version == 0
-            || namespace.next_version == u64::MAX
-            || invalid_history
-            || invalid_family
-        {
-            return Err(format!("namespace '{name}' has invalid serialized state"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_captured_environment_ids(
-    namespaces: &IndexMap<String, Namespace>,
-    lexical: &LexicalArena,
-) -> Result<(), String> {
-    let mut captured = HashSet::new();
-    for namespace in namespaces.values() {
-        collect_captured_environments(namespace.bindings.values(), &mut captured);
-        collect_captured_environments(
-            namespace
-                .history
-                .values()
-                .flatten()
-                .map(|record| &record.value),
-            &mut captured,
-        );
-    }
-    collect_captured_environments(lexical.cells.values(), &mut captured);
-    if let Some(missing) = captured
-        .into_iter()
-        .find(|id| !lexical.environments.contains_key(id))
-    {
-        return Err(format!(
-            "captured lexical environment {missing} does not exist"
-        ));
-    }
-    Ok(())
-}
-
-impl<'de> Deserialize<'de> for EnvRef {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = EnvRefWire::deserialize(deserializer)?;
-        validate_namespaces(&wire.namespaces).map_err(serde::de::Error::custom)?;
-        wire.lexical
-            .validate(wire.current_environment)
-            .map_err(serde::de::Error::custom)?;
-        Ok(Self {
-            namespaces: wire.namespaces,
-            lexical: wire.lexical,
-            current_environment: wire.current_environment,
-        })
-    }
 }
 
 impl Default for EnvRef {
@@ -411,21 +353,54 @@ impl Default for EnvRef {
 }
 
 impl EnvRef {
-    pub(crate) fn validate_captured_environments(&self) -> Result<(), String> {
-        validate_captured_environment_ids(&self.namespaces, &self.lexical)
-    }
-
     pub fn new() -> Self {
-        let mut namespaces = IndexMap::new();
-        namespaces.insert("system".into(), Namespace::new("system"));
-        namespaces.insert("inspect".into(), Namespace::new("inspect"));
-        namespaces.insert("control".into(), Namespace::new("control"));
-        namespaces.insert("kernel".into(), Namespace::new("kernel"));
-        EnvRef {
+        let namespaces = ["system", "inspect", "control", "kernel", "user"]
+            .into_iter()
+            .map(|name| (name.into(), Namespace::new()))
+            .collect();
+        Self {
             namespaces: Arc::new(namespaces),
             lexical: LexicalArena::default(),
             current_environment: EnvironmentId::ROOT,
         }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.lexical.validate(self.current_environment)?;
+        for (namespace_name, namespace) in self.namespaces.iter() {
+            if namespace_name.is_empty()
+                || namespace_name.contains('/')
+                || namespace.next_version == 0
+                || namespace.next_version == u64::MAX
+                || namespace.bindings.keys().any(String::is_empty)
+                || namespace
+                    .bindings
+                    .keys()
+                    .any(|name| !namespace.origins.contains_key(name))
+                || namespace
+                    .origins
+                    .keys()
+                    .any(|name| !namespace.bindings.contains_key(name))
+            {
+                return Err(format!(
+                    "namespace '{namespace_name}' has invalid serialized state"
+                ));
+            }
+        }
+        let mut captured = HashSet::new();
+        for namespace in self.namespaces.values() {
+            collect_captured_environments(namespace.bindings.values(), &mut captured);
+        }
+        collect_captured_environments(self.lexical.cells.values(), &mut captured);
+        if let Some(missing) = captured
+            .into_iter()
+            .find(|id| !self.lexical.environments.contains_key(id))
+        {
+            return Err(format!(
+                "captured lexical environment {missing} does not exist"
+            ));
+        }
+        Ok(())
     }
 
     pub fn lookup(&self, symbol: &str) -> Option<&Value> {
@@ -442,32 +417,51 @@ impl EnvRef {
                     .find_map(|namespace| self.namespaces.get(namespace)?.get(symbol))
             })
     }
-    pub fn define(&mut self, qualified_name: &str, value: Value) -> Result<(), EnvError> {
+
+    pub fn define(
+        &mut self,
+        qualified_name: &str,
+        value: Value,
+        source: Option<String>,
+        origin: BindingOrigin,
+    ) -> Result<(), EnvError> {
         let (namespace, name) = qualified_parts(qualified_name)?;
-        let ns_name = namespace.to_string();
-
-        let ns = Arc::make_mut(&mut self.namespaces)
-            .entry(ns_name.clone())
-            .or_insert_with(|| Namespace::new(&ns_name));
-        if ns.protected {
-            return Err(EnvError::Protected(ns_name));
+        let namespaces = Arc::make_mut(&mut self.namespaces);
+        let ns = namespaces.entry(namespace.into()).or_default();
+        if ns.origins.get(name).is_some_and(|origin| !origin.mutable()) {
+            return Err(EnvError::ImmutableBinding(qualified_name.into()));
         }
-        if matches!(ns.get(name), Some(Value::Function(Function::Native { .. }))) {
-            return Err(EnvError::NativeBinding(qualified_name.into()));
-        }
-
-        ns.define(name, value);
+        ns.define(name, value, source, origin, true);
         Ok(())
     }
 
-    pub fn store_source(&mut self, qualified_name: &str, source: String) -> Result<(), EnvError> {
-        let (namespace, name) = qualified_parts(qualified_name)?;
+    pub(crate) fn force_define(
+        &mut self,
+        qualified_name: &str,
+        value: Value,
+        source: Option<String>,
+        origin: BindingOrigin,
+    ) {
+        let Ok((namespace, name)) = qualified_parts(qualified_name) else {
+            return;
+        };
         Arc::make_mut(&mut self.namespaces)
+            .entry(namespace.into())
+            .or_default()
+            .define(name, value, source, origin, false);
+    }
+
+    pub fn assign(&mut self, qualified_name: &str, value: Value) -> Result<(), EnvError> {
+        let (namespace, name) = qualified_parts(qualified_name)?;
+        let ns = Arc::make_mut(&mut self.namespaces)
             .get_mut(namespace)
-            .ok_or_else(|| EnvError::NamespaceNotFound(namespace.into()))?
-            .sources
-            .insert(name.into(), source);
-        Ok(())
+            .ok_or_else(|| EnvError::NamespaceNotFound(namespace.into()))?;
+        if ns.origins.get(name).is_some_and(|origin| !origin.mutable()) {
+            return Err(EnvError::ImmutableBinding(qualified_name.into()));
+        }
+        ns.assign(name, value)
+            .then_some(())
+            .ok_or_else(|| EnvError::BindingNotFound(qualified_name.into()))
     }
 
     pub fn source(&self, qualified_name: &str) -> Option<&str> {
@@ -479,35 +473,19 @@ impl EnvRef {
             .map(String::as_str)
     }
 
-    /// Force define, bypassing protection checks (for kernel use only).
-    pub(crate) fn force_define(&mut self, qualified_name: &str, value: Value) {
-        let Ok((namespace, name)) = qualified_parts(qualified_name) else {
-            return;
-        };
-        Arc::make_mut(&mut self.namespaces)
-            .entry(namespace.into())
-            .or_insert_with(|| Namespace::new(namespace))
-            .bindings
-            .insert(name.into(), value);
-    }
-
     pub fn undefine(&mut self, qualified_name: &str) -> Result<(), EnvError> {
         let (namespace, name) = qualified_parts(qualified_name)?;
         let ns = Arc::make_mut(&mut self.namespaces)
             .get_mut(namespace)
             .ok_or_else(|| EnvError::NamespaceNotFound(namespace.into()))?;
-        if ns.protected {
-            return Err(EnvError::Protected(namespace.into()));
-        }
-        if matches!(ns.get(name), Some(Value::Function(Function::Native { .. }))) {
-            return Err(EnvError::NativeBinding(qualified_name.into()));
+        if ns.origins.get(name).is_some_and(|origin| !origin.mutable()) {
+            return Err(EnvError::ImmutableBinding(qualified_name.into()));
         }
         ns.undefine(name)
-            .ok_or_else(|| EnvError::BindingNotFound(qualified_name.into()))?;
-        Ok(())
+            .map(drop)
+            .ok_or_else(|| EnvError::BindingNotFound(qualified_name.into()))
     }
 
-    /// Allocate a lexical child of the currently active environment.
     pub(crate) fn push_frame(&mut self) {
         self.current_environment = self.lexical.allocate_environment(self.current_environment);
     }
@@ -524,21 +502,6 @@ impl EnvRef {
         true
     }
 
-    pub(crate) fn import_legacy_frames(
-        &mut self,
-        frames: Vec<IndexMap<String, Value>>,
-    ) -> EnvironmentId {
-        let mut parent = EnvironmentId::ROOT;
-        for frame in frames {
-            let environment = self.lexical.allocate_environment(parent);
-            for (name, value) in frame {
-                self.lexical.define(environment, &name, value);
-            }
-            parent = environment;
-        }
-        parent
-    }
-
     pub fn lexical_arena_counts(&self) -> (usize, usize) {
         (self.lexical.environments.len(), self.lexical.cells.len())
     }
@@ -546,7 +509,8 @@ impl EnvRef {
     pub fn binding_history_len(&self, namespace: &str, name: &str) -> usize {
         self.namespaces
             .get(namespace)
-            .map_or(0, |namespace| namespace.history(name).len())
+            .and_then(|namespace| namespace.history(name))
+            .map_or(0, BoundedLog::len)
     }
 
     pub(crate) fn current_environment(&self) -> EnvironmentId {
@@ -564,7 +528,6 @@ impl EnvRef {
         Ok(())
     }
 
-    /// Allocate a call frame parented directly to a closure's captured scope.
     pub(crate) fn push_call_frame(&mut self, captured: EnvironmentId) -> Result<(), EnvError> {
         if !self.lexical.environments.contains_key(&captured) {
             return Err(EnvError::MissingEnvironment(captured));
@@ -574,43 +537,33 @@ impl EnvRef {
     }
 
     pub fn namespace_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.namespaces.keys().cloned().collect();
+        let mut names: Vec<_> = self.namespaces.keys().cloned().collect();
         names.sort();
         names
     }
 
     fn qualify_data_family(family_name: &str) -> Result<QualifiedName, EnvError> {
         let name = if family_name.contains('/') {
-            family_name.to_string()
+            family_name.into()
         } else {
-            format!("user/{}", family_name)
+            format!("user/{family_name}")
         };
         qualified_parts(&name)?;
         Ok(QualifiedName::new(name))
     }
 
-    /// Replace family metadata and remove only constructors generated by the
-    /// previous definition of this exact qualified family.
     pub fn set_data_family(&mut self, mut family: DataFamily) -> Result<(), EnvError> {
         let qualified = Self::qualify_data_family(family.name.as_str())?;
         family.name = qualified.clone();
         let (namespace, name) = qualified_parts(qualified.as_str())?;
         let namespaces = Arc::make_mut(&mut self.namespaces);
-        let previous = {
-            let ns = namespaces
-                .entry(namespace.into())
-                .or_insert_with(|| Namespace::new(namespace));
-            if ns.protected {
-                return Err(EnvError::Protected(namespace.into()));
-            }
-            ns.data_families.shift_remove(name)
-        };
-        if let Some(previous) = previous {
+        let ns = namespaces.entry(namespace.into()).or_default();
+        if let Some(previous) = ns.data_families.shift_remove(name) {
             for binding in previous.generated_bindings {
                 if let Ok((binding_namespace, binding_name)) = qualified_parts(binding.as_str())
-                    && let Some(binding_ns) = namespaces.get_mut(binding_namespace)
+                    && let Some(namespace) = namespaces.get_mut(binding_namespace)
                 {
-                    binding_ns.undefine(binding_name);
+                    namespace.undefine(binding_name);
                 }
             }
         }
@@ -631,29 +584,22 @@ impl EnvRef {
         };
         self.namespaces
             .get(namespace)
-            .is_some_and(|ns| ns.data_families.contains_key(family))
+            .is_some_and(|namespace| namespace.data_families.contains_key(family))
     }
 
-    /// Undefine one exact qualified data family and its recorded constructors.
     pub fn undefine_data_family(&mut self, family_name: &str) -> Result<(), EnvError> {
         let qualified = Self::qualify_data_family(family_name)?;
         let (namespace, name) = qualified_parts(qualified.as_str())?;
         let namespaces = Arc::make_mut(&mut self.namespaces);
-        let ns = namespaces
+        let family = namespaces
             .get_mut(namespace)
-            .ok_or_else(|| EnvError::FamilyNotFound(family_name.into()))?;
-        if ns.protected {
-            return Err(EnvError::Protected(namespace.into()));
-        }
-        let family = ns
-            .data_families
-            .shift_remove(name)
+            .and_then(|namespace| namespace.data_families.shift_remove(name))
             .ok_or_else(|| EnvError::FamilyNotFound(family_name.into()))?;
         for binding in family.generated_bindings {
             if let Ok((binding_namespace, binding_name)) = qualified_parts(binding.as_str())
-                && let Some(binding_ns) = namespaces.get_mut(binding_namespace)
+                && let Some(namespace) = namespaces.get_mut(binding_namespace)
             {
-                binding_ns.undefine(binding_name);
+                namespace.undefine(binding_name);
             }
         }
         Ok(())

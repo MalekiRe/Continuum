@@ -1,10 +1,11 @@
+mod context;
+
 use crate::executor::{ExecutionResult, Executor, ExecutorError};
 use crate::ids::{FrameId, MessageId};
-use crate::kernel::{AllocationError, FrameStatus, Kernel, MessageError, TranscriptEntry, VmTrap};
+use crate::kernel::{AllocationError, EvalOutcome, Kernel, MessageError, TrapRequest, VmTrap};
 use crate::vm::reader::{self, ReadError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -16,23 +17,6 @@ pub struct ModelRequest {
 }
 
 const MODEL_CONTEXT_LIMIT: usize = 62_000;
-
-fn append_section(text: &mut String, limit: usize, heading: &str, body: &str, budget: usize) {
-    let mut remaining = limit.saturating_sub(text.len());
-    if body.is_empty() || remaining == 0 {
-        return;
-    }
-    let prefix = format!("\n# {heading}\n");
-    if prefix.len() >= remaining {
-        return;
-    }
-    text.push_str(&prefix);
-    remaining -= prefix.len();
-    text.push_str(&truncate(body, budget.min(remaining)));
-    if text.len() < limit && !text.ends_with('\n') {
-        text.push('\n');
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -332,30 +316,19 @@ impl<M: ModelClient> Scheduler<M> {
         };
         let frame_id = frame.id.clone();
 
-        // Complete an in-memory top-level suspension before asking for a new action.
-        if let Some(pending) = kernel.pending_trap() {
-            if pending.operation == VmTrap::AwaitHuman {
-                if kernel.notices_for_frame(&frame_id).is_empty() {
-                    return Ok(TurnOutcome::Idle);
-                }
-                kernel.clear_trap();
-                kernel.frames.last_mut().unwrap().status = FrameStatus::Running;
-            } else {
-                return self
-                    .handle_trap(kernel, frame_id, pending, ":resumed".into())
-                    .await;
+        if frame.waiting_for_human {
+            if kernel.notices_for_frame(&frame_id).is_empty() {
+                return Ok(TurnOutcome::Idle);
             }
-        }
-        if kernel
-            .frames
-            .last()
-            .is_none_or(|frame| frame.status != FrameStatus::Running)
-        {
-            return Ok(TurnOutcome::Idle);
+            kernel
+                .frames
+                .last_mut()
+                .expect("active frame")
+                .waiting_for_human = false;
         }
 
-        self.compact_current_frame(kernel);
-        let (request, notice_watermark) = self.build_request_with_notices(kernel);
+        context::compact_current_frame(kernel);
+        let (request, notice_watermark) = context::build_request(kernel);
         let raw = self.complete_model(request).await?;
         if let Some(watermark) = notice_watermark {
             kernel.mark_notices_seen_through(&frame_id, watermark);
@@ -375,16 +348,23 @@ impl<M: ModelClient> Scheduler<M> {
         if self.model_runtime.take_pending() {
             return Err(ModelError::Cancelled.into());
         }
-        let displayed = match kernel.eval(&source) {
-            Ok(value) => format!("{}", value),
+        let outcome = match kernel.eval(&source) {
+            Ok(outcome) => outcome,
             Err(crate::vm::eval::EvalError::Interrupted) => {
                 return Err(SchedulerError::EvaluationInterrupted);
             }
-            Err(error) => format!("error: {}", error),
+            Err(error) => {
+                EvalOutcome::Value(crate::vm::value::Value::string(&format!("error: {error}")))
+            }
         };
-        if let Some(pending) = kernel.pending_trap() {
-            return self.handle_trap(kernel, frame_id, pending, displayed).await;
-        }
+        let displayed = match outcome {
+            EvalOutcome::Value(value) => value.to_string(),
+            EvalOutcome::Trap(request) => {
+                return self
+                    .handle_trap(kernel, frame_id, request, ":scheduled".into())
+                    .await;
+            }
+        };
         kernel.append_transcript_to(&frame_id, &source, &displayed);
         Ok(TurnOutcome::Evaluated {
             frame_id,
@@ -397,7 +377,7 @@ impl<M: ModelClient> Scheduler<M> {
         &self,
         kernel: &mut Kernel,
         frame_id: FrameId,
-        pending: crate::kernel::PendingTrap,
+        pending: TrapRequest,
         scheduled: String,
     ) -> Result<TurnOutcome, SchedulerError> {
         let source = pending.source;
@@ -408,11 +388,9 @@ impl<M: ModelClient> Scheduler<M> {
                     .await
                     .map_err(|_| SchedulerError::Invariant("Bash executor task panicked"))?
                     .inspect_err(|error| {
-                        kernel.clear_trap();
                         kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
                     })?;
                 let result = format_execution(&execution);
-                kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 Ok(TurnOutcome::ToolCompleted {
                     frame_id,
@@ -428,10 +406,8 @@ impl<M: ModelClient> Scheduler<M> {
                     })
                     .await
                     .inspect_err(|error| {
-                        kernel.clear_trap();
                         kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
                     })?;
-                kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 Ok(TurnOutcome::ToolCompleted {
                     frame_id,
@@ -440,7 +416,6 @@ impl<M: ModelClient> Scheduler<M> {
                 })
             }
             VmTrap::CallAgent { name, request } => {
-                kernel.clear_trap();
                 let child_id = kernel
                     .spawn_subagent(&name, &request)
                     .inspect_err(|error| {
@@ -453,12 +428,7 @@ impl<M: ModelClient> Scheduler<M> {
                 })
             }
             VmTrap::ReturnAgent { value } => {
-                let crate::vm::value::Value::String(result) = value else {
-                    return Err(SchedulerError::Invariant(
-                        "agent returned a non-string value",
-                    ));
-                };
-                kernel.clear_trap();
+                let result = value;
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 kernel.return_from_subagent();
                 let parent_id = kernel
@@ -471,16 +441,14 @@ impl<M: ModelClient> Scheduler<M> {
             }
             VmTrap::Reply { message_id, text } => {
                 kernel.complete_message(&message_id)?;
-                kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &text);
                 Ok(TurnOutcome::Replied { message_id, text })
             }
             VmTrap::AwaitHuman => {
-                kernel.clear_trap();
                 let frame = kernel.frames.last_mut().ok_or(SchedulerError::Invariant(
                     "human wait without an active frame",
                 ))?;
-                frame.status = FrameStatus::Waiting;
+                frame.waiting_for_human = true;
                 kernel.append_transcript_to(&frame_id, &source, "waiting for human input");
                 Ok(TurnOutcome::ToolCompleted {
                     frame_id,
@@ -492,126 +460,7 @@ impl<M: ModelClient> Scheduler<M> {
     }
 
     pub fn build_request(&self, kernel: &Kernel) -> ModelRequest {
-        self.build_request_with_notices(kernel).0
-    }
-
-    fn build_request_with_notices(&self, kernel: &Kernel) -> (ModelRequest, Option<u64>) {
-        let frame = kernel
-            .frames
-            .last()
-            .expect("build_request requires a frame");
-        let directive = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be top-level forms.\n";
-        let system = if frame.state.instructions.is_empty() {
-            "You are Continuum, a persistent agent inhabiting a Lisp world. Choose one useful Lisp action.".into()
-        } else {
-            truncate(&frame.state.instructions, 16_000)
-        };
-        let body_budget = MODEL_CONTEXT_LIMIT.saturating_sub(system.len() + directive.len());
-        let mut context = String::with_capacity(body_budget + directive.len());
-        let mut section = |heading, body, budget| {
-            append_section(&mut context, body_budget, heading, body, budget)
-        };
-
-        let visible_notices = kernel.notices_for_frame(&frame.id);
-        let mut notices = String::new();
-        let mut notice_watermark = None;
-        for (index, message) in visible_notices.iter().enumerate() {
-            let slots = visible_notices.len() - index;
-            let allowance = (12_000usize.saturating_sub(notices.len()) / slots).max(1);
-            let heading = match (&message.id, message.handled) {
-                (Some(id), false) => format!("- Human message [{}]: ", id),
-                (Some(id), true) => format!(
-                    "- Answered human notice [{}] (informational; do not call message/reply): ",
-                    id
-                ),
-                (None, _) => "- ".to_string(),
-            };
-            let body_budget = allowance.saturating_sub(heading.len() + 1);
-            let _ = writeln!(
-                notices,
-                "{}{}",
-                heading,
-                truncate(&message.text, body_budget)
-            );
-            notice_watermark = Some(message.sequence);
-        }
-        section("Current human messages and notices", &notices, 12_000);
-
-        let mut stack = String::new();
-        for active in &kernel.frames {
-            let _ = writeln!(
-                stack,
-                "- {} [{}] {:?}",
-                active.name, active.id, active.status
-            );
-        }
-        section("Active frame stack", &stack, 4_000);
-
-        let mut guidance = String::new();
-        for hook in &frame.state.context_hooks {
-            let _ = writeln!(guidance, "Hook: {}", truncate(hook, 2_000));
-        }
-        for entry in &frame.state.memory {
-            let _ = writeln!(
-                guidance,
-                "{}: {}",
-                truncate(&entry.key, 200),
-                truncate(&entry.value, 1_000)
-            );
-        }
-        section("Context hooks and selected memory", &guidance, 12_000);
-
-        let recent = render_recent_transcript(&frame.state.transcript, 24_000);
-        section("Recent Lisp actions and results", &recent, 24_000);
-        let compacted = render_recent_compacted(&frame.state.compacted_context, 6_000);
-        section("Earlier compacted context", &compacted, 6_000);
-
-        let mut library = String::new();
-        for name in kernel.env.namespace_names() {
-            let bindings = kernel.inspect_namespace(&name).unwrap_or_default();
-            let _ = writeln!(library, "{}: {}", name, bindings.join(", "));
-        }
-        let _ = writeln!(library, "\nDefinitions with retained source:");
-        for (namespace, values) in kernel.env.namespaces.iter() {
-            let mut names: Vec<_> = values.sources.keys().collect();
-            names.sort();
-            for name in names {
-                let _ = writeln!(library, "- {}/{}", namespace, name);
-            }
-        }
-        section("Library discovery", &library, 4_000);
-
-        context.push_str(directive);
-        (ModelRequest { system, context }, notice_watermark)
-    }
-
-    fn compact_current_frame(&self, kernel: &mut Kernel) {
-        const RECENT_TRANSCRIPT_BUDGET: usize = 24_000;
-        const COMPACTED_BUDGET: usize = 32_000;
-        let Some(frame) = kernel.frames.last_mut() else {
-            return;
-        };
-        let occupancy = |entry: &TranscriptEntry| entry.source.len() + entry.result.len() + 8;
-        let mut recent_bytes: usize = frame.state.transcript.iter().map(occupancy).sum();
-        while recent_bytes > RECENT_TRANSCRIPT_BUDGET && frame.state.transcript.len() > 1 {
-            let entry = frame.state.transcript.remove(0);
-            recent_bytes = recent_bytes.saturating_sub(occupancy(&entry));
-            frame
-                .state
-                .compacted_context
-                .entries
-                .push_back(crate::kernel::CompactedEntry {
-                    timestamp: entry.timestamp,
-                    source: truncate(&entry.source, 240),
-                    result: truncate(&entry.result, 480),
-                });
-        }
-        while frame.state.compacted_context.rendered_len() > COMPACTED_BUDGET {
-            if frame.state.compacted_context.entries.pop_front().is_none() {
-                break;
-            }
-            frame.state.compacted_context.omitted_turns += 1;
-        }
+        context::build_request(kernel).0
     }
 }
 
@@ -627,67 +476,7 @@ pub fn normalize_one_form(raw: &str) -> Result<String, NormalizeError> {
     Ok(trimmed.to_string())
 }
 
-fn render_recent_transcript(entries: &[TranscriptEntry], budget: usize) -> String {
-    let mut selected = Vec::new();
-    let mut used = 0;
-    for entry in entries.iter().rev() {
-        let rendered = format!(
-            "> {}\n{}\n",
-            truncate(&entry.source, 600),
-            truncate(&entry.result, 1_200)
-        );
-        if used + rendered.len() > budget {
-            if selected.is_empty() {
-                selected.push(truncate(&rendered, budget));
-            }
-            break;
-        }
-        used += rendered.len();
-        selected.push(rendered);
-    }
-    selected.reverse();
-    selected.concat()
-}
-
-fn render_recent_compacted(context: &crate::kernel::CompactedContext, budget: usize) -> String {
-    let mut selected = Vec::new();
-    let mut used = 0;
-    for entry in context.entries.iter().rev() {
-        let rendered = format!(
-            "[{}] {} => {}\n",
-            entry.timestamp, entry.source, entry.result
-        );
-        if used + rendered.len() > budget {
-            break;
-        }
-        used += rendered.len();
-        selected.push(rendered);
-    }
-    selected.reverse();
-    let omitted = context.omitted_turns
-        + u64::try_from(context.entries.len().saturating_sub(selected.len())).unwrap_or(u64::MAX);
-    let mut rendered = String::new();
-    if omitted > 0 {
-        let _ = writeln!(rendered, "[{omitted} older turns omitted]");
-    }
-    rendered.push_str(&selected.concat());
-    rendered
-}
-
 fn format_execution(result: &ExecutionResult) -> String {
     serde_json::to_string(result)
         .unwrap_or_else(|_| "{\"error\":\"cannot serialize execution result\"}".into())
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        return value.into();
-    }
-    const ELLIPSIS: &str = "…";
-    let suffix = if max >= ELLIPSIS.len() { ELLIPSIS } else { "" };
-    let limit = max.saturating_sub(suffix.len()).min(value.len());
-    let end = (0..=limit)
-        .rfind(|&index| value.is_char_boundary(index))
-        .unwrap_or_default();
-    format!("{}{suffix}", &value[..end])
 }

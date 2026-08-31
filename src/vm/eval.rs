@@ -1,4 +1,4 @@
-use crate::kernel::{Kernel, qualify_user_name};
+use crate::kernel::{Kernel, VmTrap, qualify_user_name};
 use crate::vm::env::{DataFamily, DataVariant, EnvRef};
 use crate::vm::value::*;
 use indexmap::IndexMap;
@@ -132,6 +132,8 @@ pub enum EvalError {
     Interrupted,
     #[error("tail call")]
     TailCall(Value),
+    #[error("external operation")]
+    Trap(VmTrap),
 }
 
 /// Evaluate one step, converting TailCall to StepResult.
@@ -143,7 +145,7 @@ fn eval_step(value: Value, kernel: &mut Kernel) -> Result<StepResult, EvalError>
     }
 }
 
-pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
+pub fn eval(input: &str, kernel: &mut Kernel) -> Result<crate::kernel::EvalOutcome, EvalError> {
     kernel.eval(input)
 }
 
@@ -321,8 +323,7 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
         }
     };
     let qualified = qualify_user_name(&name);
-    kernel.env.define(&qualified, value)?;
-    kernel.store_source(&qualified, &retained);
+    kernel.define_binding(&qualified, value, Some(retained))?;
     Ok(Value::Symbol(name))
 }
 fn eval_undefine(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
@@ -491,7 +492,7 @@ fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     }
     let qualified = qualify_user_name(&name);
     if kernel.env.lookup(&qualified).is_some() {
-        kernel.env.define(&qualified, value)?;
+        kernel.env.assign(&qualified, value)?;
         return Ok(Value::Nil);
     }
     Err(EvalError::UndefinedSymbol(name))
@@ -624,9 +625,13 @@ fn eval_define_syntax(args: &[Value], kernel: &mut Kernel) -> Result<Value, Eval
             let m = Value::Macro(Macro::SyntaxRules { literals, rules });
 
             if !name.contains('/') {
-                kernel.env.define(&format!("user/{}", name), m)?;
+                kernel.define_binding(
+                    &format!("user/{}", name),
+                    m,
+                    kernel.current_source().map(str::to_owned),
+                )?;
             } else {
-                kernel.env.define(&name, m)?;
+                kernel.define_binding(&name, m, kernel.current_source().map(str::to_owned))?;
             }
             Ok(Value::Symbol(name))
         }
@@ -714,7 +719,7 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
             variant: variant.name.clone(),
             arity: variant.fields.len(),
         });
-        kernel.env.define(&constructor_name, constructor)?;
+        kernel.define_binding(&constructor_name, constructor, None)?;
     }
 
     Ok(Value::Symbol(family_name))
@@ -1036,10 +1041,20 @@ fn apply_tail(
                     got: args.len(),
                 });
             }
-            let native = kernel.native(&name).ok_or_else(|| {
-                NativeError::Failed(format!("native function '{}' is not registered", name))
+            let builtin = crate::kernel::native::Builtin::from_name(&name).ok_or_else(|| {
+                NativeError::Failed(format!("native function '{name}' is not registered"))
             })?;
-            native(kernel, args).map_err(EvalError::Native)
+            match builtin.call(kernel, args) {
+                Ok(value) => Ok(value),
+                Err(crate::kernel::native::BuiltinError::Native(error)) => Err(error.into()),
+                Err(crate::kernel::native::BuiltinError::Trap(operation)) if tail_ok => {
+                    Err(EvalError::Trap(operation))
+                }
+                Err(crate::kernel::native::BuiltinError::Trap(_)) => Err(EvalError::InvalidForm(
+                    "external operation must be the final action of the top-level evaluation"
+                        .into(),
+                )),
+            }
         }
         Value::Function(Function::Constructor {
             family,
@@ -1089,6 +1104,13 @@ fn apply_tail(
                 Err(EvalError::TailCall(expr)) => eval_any(expr, kernel),
                 other => other,
             };
+            if !tail_ok && matches!(result, Err(EvalError::Trap(_))) {
+                kernel.env.activate_environment(caller_environment)?;
+                return Err(EvalError::InvalidForm(
+                    "external operation must be the final action of the top-level evaluation"
+                        .into(),
+                ));
+            }
             kernel.env.activate_environment(caller_environment)?;
             result
         }

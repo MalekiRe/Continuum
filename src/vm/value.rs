@@ -25,37 +25,10 @@ mod map_entries {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Arity {
     Exact(u32),
     Variadic,
-}
-
-impl Serialize for Arity {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Exact(count) => serializer.serialize_u32(*count),
-            Self::Variadic => serializer.serialize_str("variadic"),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredArity {
-    Exact(u32),
-    Named(String),
-}
-
-impl<'de> Deserialize<'de> for Arity {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match StoredArity::deserialize(deserializer)? {
-            StoredArity::Exact(u32::MAX) => Ok(Self::Variadic),
-            StoredArity::Exact(count) => Ok(Self::Exact(count)),
-            StoredArity::Named(name) if name == "variadic" => Ok(Self::Variadic),
-            StoredArity::Named(_) => Err(serde::de::Error::custom("invalid arity")),
-        }
-    }
 }
 
 impl fmt::Display for Arity {
@@ -86,8 +59,6 @@ impl From<&str> for NativeError {
         Self::Failed(message.into())
     }
 }
-
-pub type NativeFn = fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, NativeError>;
 
 /// A Lisp function. Native implementations live in the kernel registry;
 /// serializable values retain only their identity and arity.
@@ -415,6 +386,7 @@ impl Value {
 
     value_ref!(as_str, String, str);
     value_ref!(as_symbol, Symbol, str);
+    value_ref!(as_keyword, Keyword, str);
     value_ref!(as_list, List, [Value]);
     value_ref!(as_vector, Vector, [Value]);
     value_ref!(as_map, Map, IndexMap<Value, Value>);

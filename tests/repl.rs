@@ -6,9 +6,9 @@ use persistent_lisp_harness::{EvalError, Kernel};
 #[test]
 fn test_repl_define_and_lookup() {
     let mut k = Kernel::new();
-    let r = k.eval("(define x 42)");
+    let r = k.eval_value("(define x 42)");
     assert!(r.is_ok(), "define x: {:?}", r.err());
-    let r = k.eval("x");
+    let r = k.eval_value("x");
     assert!(r.is_ok(), "lookup x: {:?}", r.err());
     assert_eq!(r.unwrap(), Value::Int(42));
 }
@@ -16,20 +16,20 @@ fn test_repl_define_and_lookup() {
 #[test]
 fn test_repl_undefine_and_errors() {
     let mut k = Kernel::new();
-    let r = k.eval("(define x 42)");
+    let r = k.eval_value("(define x 42)");
     assert!(r.is_ok());
-    let r = k.eval("(undefine x)");
+    let r = k.eval_value("(undefine x)");
     assert!(r.is_ok());
-    let r = k.eval("x");
+    let r = k.eval_value("x");
     assert!(r.is_err(), "should error on undefined symbol");
 }
 
 #[test]
 fn test_repl_function_define_and_call() {
     let mut k = Kernel::new();
-    let r = k.eval("(define (add a b) (+ a b))");
+    let r = k.eval_value("(define (add a b) (+ a b))");
     assert!(r.is_ok());
-    let r = k.eval("(add 3 4)");
+    let r = k.eval_value("(add 3 4)");
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Int(7));
 }
@@ -37,9 +37,9 @@ fn test_repl_function_define_and_call() {
 #[test]
 fn test_repl_lambda() {
     let mut k = Kernel::new();
-    let r = k.eval("(define double (lambda (x) (* x 2)))");
+    let r = k.eval_value("(define double (lambda (x) (* x 2)))");
     assert!(r.is_ok());
-    let r = k.eval("(double 5)");
+    let r = k.eval_value("(double 5)");
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Int(10));
 }
@@ -47,19 +47,19 @@ fn test_repl_lambda() {
 #[test]
 fn test_repl_conditional() {
     let mut k = Kernel::new();
-    assert_eq!(k.eval("(if #t 1 2)").unwrap(), Value::Int(1));
-    assert_eq!(k.eval("(if #f 1 2)").unwrap(), Value::Int(2));
-    assert_eq!(k.eval("(if nil 1 2)").unwrap(), Value::Int(2));
-    assert_eq!(k.eval("(if 42 1 2)").unwrap(), Value::Int(1));
+    assert_eq!(k.eval_value("(if #t 1 2)").unwrap(), Value::Int(1));
+    assert_eq!(k.eval_value("(if #f 1 2)").unwrap(), Value::Int(2));
+    assert_eq!(k.eval_value("(if nil 1 2)").unwrap(), Value::Int(2));
+    assert_eq!(k.eval_value("(if 42 1 2)").unwrap(), Value::Int(1));
 }
 
 #[test]
 fn test_repl_let_and_scope() {
     let mut k = Kernel::new();
-    let r = k.eval("(let ((x 10) (y 20)) (+ x y))");
+    let r = k.eval_value("(let ((x 10) (y 20)) (+ x y))");
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Int(30));
-    let r = k.eval("(let* ((x 1) (y (+ x 1))) y)");
+    let r = k.eval_value("(let* ((x 1) (y (+ x 1))) y)");
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Int(2));
 }
@@ -67,7 +67,7 @@ fn test_repl_let_and_scope() {
 #[test]
 fn test_repl_begin() {
     let mut k = Kernel::new();
-    let r = k.eval("(begin (define a 1) (define b 2) (+ a b))");
+    let r = k.eval_value("(begin (define a 1) (define b 2) (+ a b))");
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Int(3));
 }
@@ -75,15 +75,15 @@ fn test_repl_begin() {
 #[test]
 fn test_repl_set_and_mutation() {
     let mut k = Kernel::new();
-    k.eval("(define x 10)").unwrap();
-    k.eval("(set! x 20)").unwrap();
-    assert_eq!(k.eval("x").unwrap(), Value::Int(20));
+    k.eval_value("(define x 10)").unwrap();
+    k.eval_value("(set! x 20)").unwrap();
+    assert_eq!(k.eval_value("x").unwrap(), Value::Int(20));
 }
 
 #[test]
 fn test_repl_quote() {
     let mut k = Kernel::new();
-    let r = k.eval("'(1 2 3)");
+    let r = k.eval_value("'(1 2 3)");
     assert!(r.is_ok());
     assert_eq!(
         r.unwrap(),
@@ -94,7 +94,7 @@ fn test_repl_quote() {
 #[test]
 fn test_repl_quasiquote() {
     let mut k = Kernel::new();
-    let r = k.eval("(let ((x 42)) `(1 ,x 3))");
+    let r = k.eval_value("(let ((x 42)) `(1 ,x 3))");
     assert!(r.is_ok());
     assert_eq!(
         r.unwrap(),
@@ -105,7 +105,7 @@ fn test_repl_quasiquote() {
 #[test]
 fn test_repl_quasiquote_splicing() {
     let mut k = Kernel::new();
-    let r = k.eval("(let ((lst '(a b c))) `(x ,@lst y))");
+    let r = k.eval_value("(let ((lst '(a b c))) `(x ,@lst y))");
     assert!(r.is_ok());
     assert!(r.unwrap().is_list());
 }
@@ -114,31 +114,31 @@ fn test_repl_quasiquote_splicing() {
 fn test_repl_list_ops() {
     let mut k = Kernel::new();
     let three = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-    assert_eq!(k.eval("(list 1 2 3)").unwrap(), three);
-    assert_eq!(k.eval("(car (list 1 2 3))").unwrap(), Value::Int(1));
+    assert_eq!(k.eval_value("(list 1 2 3)").unwrap(), three);
+    assert_eq!(k.eval_value("(car (list 1 2 3))").unwrap(), Value::Int(1));
     assert_eq!(
-        k.eval("(cdr (list 1 2 3))").unwrap(),
+        k.eval_value("(cdr (list 1 2 3))").unwrap(),
         Value::list(vec![Value::Int(2), Value::Int(3)])
     );
-    assert_eq!(k.eval("(cons 1 (list 2 3))").unwrap(), three);
+    assert_eq!(k.eval_value("(cons 1 (list 2 3))").unwrap(), three);
 }
 
 #[test]
 fn test_repl_arithmetic() {
     let mut k = Kernel::new();
-    assert_eq!(k.eval("(+ 1 2)").unwrap(), Value::Int(3));
-    assert_eq!(k.eval("(- 5 3)").unwrap(), Value::Int(2));
-    assert_eq!(k.eval("(* 2 3)").unwrap(), Value::Int(6));
-    assert_eq!(k.eval("(= 5 5)").unwrap(), Value::Bool(true));
-    assert_eq!(k.eval("(= 5 6)").unwrap(), Value::Bool(false));
-    assert!(k.eval("(< 1 2)").unwrap().is_truthy());
-    assert!(!k.eval("(> 1 2)").unwrap().is_truthy());
+    assert_eq!(k.eval_value("(+ 1 2)").unwrap(), Value::Int(3));
+    assert_eq!(k.eval_value("(- 5 3)").unwrap(), Value::Int(2));
+    assert_eq!(k.eval_value("(* 2 3)").unwrap(), Value::Int(6));
+    assert_eq!(k.eval_value("(= 5 5)").unwrap(), Value::Bool(true));
+    assert_eq!(k.eval_value("(= 5 6)").unwrap(), Value::Bool(false));
+    assert!(k.eval_value("(< 1 2)").unwrap().is_truthy());
+    assert!(!k.eval_value("(> 1 2)").unwrap().is_truthy());
 }
 
 #[test]
 fn test_repl_string_append() {
     let mut k = Kernel::new();
-    let r = k.eval(r#"(string-append "hello " "world")"#);
+    let r = k.eval_value(r#"(string-append "hello " "world")"#);
     assert!(r.is_ok(), "string-append: {:?}", r.err());
     let v = r.unwrap();
     assert_eq!(v, Value::string("hello world"), "got {}", v);
@@ -147,10 +147,10 @@ fn test_repl_string_append() {
 #[test]
 fn test_repl_string_search() {
     let mut k = Kernel::new();
-    let r = k.eval(r#"(string-search "lisp" "hello lisp world")"#);
+    let r = k.eval_value(r#"(string-search "lisp" "hello lisp world")"#);
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Int(6));
-    let r = k.eval(r#"(string-search "xyz" "hello world")"#);
+    let r = k.eval_value(r#"(string-search "xyz" "hello world")"#);
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::Bool(false));
 }
@@ -158,45 +158,26 @@ fn test_repl_string_search() {
 #[test]
 fn test_repl_substring() {
     let mut k = Kernel::new();
-    let r = k.eval(r#"(substring "hello world" 0 5)"#);
+    let r = k.eval_value(r#"(substring "hello world" 0 5)"#);
     assert!(r.is_ok(), "substring: {:?}", r.err());
     let v = r.unwrap();
     assert_eq!(v, Value::string("hello"), "got {}", v);
 }
 
 #[test]
-fn test_repl_bash_echo() {
-    let mut k = Kernel::new();
-    let r = k.eval(r#"(bash "echo hello world")"#);
-    assert!(r.is_ok());
-    assert_eq!(r.unwrap(), Value::keyword("suspended"));
-    assert!(
-        matches!(k.take_trap(), Some(pending) if matches!(pending.operation, persistent_lisp_harness::VmTrap::RunBash { ref command } if command == "echo hello world"))
-    );
-}
-
-#[test]
-fn test_repl_bash_exit_code() {
-    let mut k = Kernel::new();
-    let r = k.eval(r#"(bash "exit 42")"#);
-    assert!(r.is_ok());
-    assert_eq!(r.unwrap(), Value::keyword("suspended"));
-    assert!(
-        matches!(k.take_trap(), Some(pending) if matches!(pending.operation, persistent_lisp_harness::VmTrap::RunBash { ref command } if command == "exit 42"))
-    );
-}
-
-#[test]
 fn test_repl_type_predicates() {
     let mut k = Kernel::new();
-    assert_eq!(k.eval("(nil? nil)").unwrap(), Value::Bool(true));
-    assert_eq!(k.eval("(nil? 42)").unwrap(), Value::Bool(false));
-    assert_eq!(k.eval("(number? 42)").unwrap(), Value::Bool(true));
-    assert_eq!(k.eval("(symbol? 'x)").unwrap(), Value::Bool(true));
-    assert_eq!(k.eval("(string? \"x\")").unwrap(), Value::Bool(true));
-    assert_eq!(k.eval("(list? (list 1 2))").unwrap(), Value::Bool(true));
+    assert_eq!(k.eval_value("(nil? nil)").unwrap(), Value::Bool(true));
+    assert_eq!(k.eval_value("(nil? 42)").unwrap(), Value::Bool(false));
+    assert_eq!(k.eval_value("(number? 42)").unwrap(), Value::Bool(true));
+    assert_eq!(k.eval_value("(symbol? 'x)").unwrap(), Value::Bool(true));
+    assert_eq!(k.eval_value("(string? \"x\")").unwrap(), Value::Bool(true));
     assert_eq!(
-        k.eval("(function? (lambda (x) x))").unwrap(),
+        k.eval_value("(list? (list 1 2))").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        k.eval_value("(function? (lambda (x) x))").unwrap(),
         Value::Bool(true)
     );
 }
@@ -204,9 +185,9 @@ fn test_repl_type_predicates() {
 #[test]
 fn test_repl_define_data_and_match() {
     let mut k = Kernel::new();
-    let r = k.eval("(define-data result/Result (Ok value) (Err problem))");
+    let r = k.eval_value("(define-data result/Result (Ok value) (Err problem))");
     assert!(r.is_ok());
-    let r = k.eval(
+    let r = k.eval_value(
         r#"(match (result/Result/Ok 42)
           ((result/Result/Ok n) (+ n 1))
           ((result/Result/Err msg) -1))"#,
@@ -218,7 +199,7 @@ fn test_repl_define_data_and_match() {
 #[test]
 fn test_repl_macro_syntax_rules() {
     let mut k = Kernel::new();
-    let r = k.eval(
+    let r = k.eval_value(
         r#"
         (define-syntax my-when
           (syntax-rules ()
@@ -227,22 +208,28 @@ fn test_repl_macro_syntax_rules() {
     "#,
     );
     assert!(r.is_ok());
-    assert_eq!(k.eval("(my-when #t 42)").unwrap(), Value::Int(42));
-    assert_eq!(k.eval("(my-when #f 99)").unwrap(), Value::Nil);
+    assert_eq!(k.eval_value("(my-when #t 42)").unwrap(), Value::Int(42));
+    assert_eq!(k.eval_value("(my-when #f 99)").unwrap(), Value::Nil);
 }
 
 #[test]
 fn test_repl_nth_and_length() {
     let mut k = Kernel::new();
-    assert_eq!(k.eval("(nth 0 (list 10 20 30))").unwrap(), Value::Int(10));
-    assert_eq!(k.eval("(length (list 1 2 3))").unwrap(), Value::Int(3));
-    assert_eq!(k.eval(r#"(length "hello")"#).unwrap(), Value::Int(5));
+    assert_eq!(
+        k.eval_value("(nth 0 (list 10 20 30))").unwrap(),
+        Value::Int(10)
+    );
+    assert_eq!(
+        k.eval_value("(length (list 1 2 3))").unwrap(),
+        Value::Int(3)
+    );
+    assert_eq!(k.eval_value(r#"(length "hello")"#).unwrap(), Value::Int(5));
 }
 
 #[test]
 fn test_repl_append() {
     let mut k = Kernel::new();
-    let r = k.eval("(append (list 1 2) (list 3 4))");
+    let r = k.eval_value("(append (list 1 2) (list 3 4))");
     assert!(r.is_ok());
     let expected = Value::list(vec![
         Value::Int(1),
@@ -256,9 +243,9 @@ fn test_repl_append() {
 #[test]
 fn test_repl_tail_recursion() {
     let mut k = Kernel::new();
-    k.eval("(define (count n) (if (= n 0) \"done\" (count (- n 1))))")
+    k.eval_value("(define (count n) (if (= n 0) \"done\" (count (- n 1))))")
         .unwrap();
-    let r = k.eval("(count 10000)");
+    let r = k.eval_value("(count 10000)");
     assert!(r.is_ok());
     assert_eq!(r.unwrap(), Value::string("done"));
 }
@@ -266,11 +253,11 @@ fn test_repl_tail_recursion() {
 #[test]
 fn test_repl_closure() {
     let mut k = Kernel::new();
-    let r = k.eval("(define (make-adder n) (lambda (x) (+ x n)))");
+    let r = k.eval_value("(define (make-adder n) (lambda (x) (+ x n)))");
     assert!(r.is_ok(), "define make-adder: {:?}", r.err());
-    let r = k.eval("(define add5 (make-adder 5))");
+    let r = k.eval_value("(define add5 (make-adder 5))");
     assert!(r.is_ok(), "define add5: {:?}", r.err());
-    let r = k.eval("(add5 10)");
+    let r = k.eval_value("(add5 10)");
     assert!(r.is_ok(), "add5 call: {:?}", r.err());
     assert_eq!(r.unwrap(), Value::Int(15), "closure result");
 }
@@ -293,43 +280,43 @@ fn test_repl_agent_core_loads() {
           (println msg)
           msg)
     "#;
-    assert!(k.eval(core).is_ok(), "agent core load");
-    assert!(k.eval("(step)").is_ok(), "step call");
-    assert!(k.eval("(cognize \"test\")").is_ok(), "cognize call");
+    assert!(k.eval_value(core).is_ok(), "agent core load");
+    assert!(k.eval_value("(step)").is_ok(), "step call");
+    assert!(k.eval_value("(cognize \"test\")").is_ok(), "cognize call");
 }
 
 #[test]
 fn test_repl_arity_mismatch() {
     let mut k = Kernel::new();
-    let r = k.eval("(+ 1)");
+    let r = k.eval_value("(+ 1)");
     assert!(r.is_err(), "arity mismatch should error");
 }
 
 #[test]
 fn test_repl_syntax_error() {
     let mut k = Kernel::new();
-    let r = k.eval("(+ 1 (");
+    let r = k.eval_value("(+ 1 (");
     assert!(r.is_err(), "syntax error should error");
 }
 
 #[test]
 fn test_repl_system_version() {
     let mut k = Kernel::new();
-    assert!(k.eval("(system/version)").is_ok());
+    assert!(k.eval_value("(system/version)").is_ok());
 }
 
 #[test]
 fn test_repl_system_clock() {
     let mut k = Kernel::new();
-    assert!(k.eval("(system/clock)").is_ok());
+    assert!(k.eval_value("(system/clock)").is_ok());
 }
 
 #[test]
 fn test_repl_wake() {
     let mut k = Kernel::new();
-    assert!(k.eval("(sleep 1)").is_err());
+    assert!(k.eval_value("(sleep 1)").is_err());
 
-    let r = k.eval(r#"(wake 10000 '(bash "echo hi"))"#);
+    let r = k.eval_value(r#"(wake 10000 '(bash "echo hi"))"#);
     assert!(r.is_ok(), "wake: {:?}", r.err());
     assert_eq!(r.unwrap(), Value::keyword("scheduled"));
     assert_eq!(k.wake_timer_count(), 1);
@@ -338,13 +325,16 @@ fn test_repl_wake() {
 #[test]
 fn test_tail_call_restores_caller_lexical_frames() {
     let mut k = Kernel::new();
-    k.eval("(define n 99)").unwrap();
-    k.eval("(define (count n) (if (= n 0) \"done\" (count (- n 1))))")
+    k.eval_value("(define n 99)").unwrap();
+    k.eval_value("(define (count n) (if (= n 0) \"done\" (count (- n 1))))")
         .unwrap();
-    assert_eq!(k.eval("(count 10000)").unwrap(), Value::string("done"));
-    assert_eq!(k.eval("n").unwrap(), Value::Int(99));
     assert_eq!(
-        k.eval("(+ 1 ((lambda (x) (* x 2)) 2))").unwrap(),
+        k.eval_value("(count 10000)").unwrap(),
+        Value::string("done")
+    );
+    assert_eq!(k.eval_value("n").unwrap(), Value::Int(99));
+    assert_eq!(
+        k.eval_value("(+ 1 ((lambda (x) (* x 2)) 2))").unwrap(),
         Value::Int(5)
     );
 }
@@ -354,8 +344,8 @@ fn test_equal_maps_have_equal_hashes_across_insertion_order() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut k = Kernel::new();
-    let first = k.eval("{:a 1 :b 2}").unwrap();
-    let second = k.eval("{:b 2 :a 1}").unwrap();
+    let first = k.eval_value("{:a 1 :b 2}").unwrap();
+    let second = k.eval_value("{:b 2 :a 1}").unwrap();
     assert_eq!(first, second);
     let mut a = DefaultHasher::new();
     let mut b = DefaultHasher::new();
@@ -367,30 +357,36 @@ fn test_equal_maps_have_equal_hashes_across_insertion_order() {
 #[test]
 fn tail_call_inside_non_tail_function_call_preserves_caller() {
     let mut k = Kernel::new();
-    k.eval("(define (g x) (* x 2))").unwrap();
-    k.eval("(define (f x) (g x))").unwrap();
-    assert_eq!(k.eval("(+ 1 (f 2))").unwrap(), Value::Int(5));
+    k.eval_value("(define (g x) (* x 2))").unwrap();
+    k.eval_value("(define (f x) (g x))").unwrap();
+    assert_eq!(k.eval_value("(+ 1 (f 2))").unwrap(), Value::Int(5));
 }
 
 #[test]
 fn zero_arity_native_rejects_extra_arguments() {
     let mut k = Kernel::new();
-    assert!(k.eval("(system/version 1)").is_err());
-    assert!(k.eval("(kernel/list 1 2 3)").is_ok());
+    assert!(k.eval_value("(system/version 1)").is_err());
+    assert!(k.eval_value("(kernel/list 1 2 3)").is_ok());
 }
 
 #[test]
 fn unicode_character_literal_is_safe() {
     let mut k = Kernel::new();
-    assert_eq!(k.eval(r"#\é").unwrap(), Value::String("é".into()));
+    assert_eq!(k.eval_value(r"#\é").unwrap(), Value::String("é".into()));
 }
 
 #[test]
 fn let_initializers_are_parallel_but_let_star_is_sequential() {
     let mut k = Kernel::new();
-    k.eval("(define user/x 10)").unwrap();
-    assert_eq!(k.eval("(let ((x 1) (y x)) y)").unwrap(), Value::Int(10));
-    assert_eq!(k.eval("(let* ((x 1) (y x)) y)").unwrap(), Value::Int(1));
+    k.eval_value("(define user/x 10)").unwrap();
+    assert_eq!(
+        k.eval_value("(let ((x 1) (y x)) y)").unwrap(),
+        Value::Int(10)
+    );
+    assert_eq!(
+        k.eval_value("(let* ((x 1) (y x)) y)").unwrap(),
+        Value::Int(1)
+    );
 }
 
 #[test]
@@ -409,7 +405,7 @@ fn binding_history_is_bounded() {
     let mut kernel = Kernel::new();
     for value in 0..100 {
         kernel
-            .eval(&format!("(define user/redefined {})", value))
+            .eval_value(&format!("(define user/redefined {})", value))
             .unwrap();
     }
     assert_eq!(
@@ -423,14 +419,14 @@ fn binding_history_is_bounded() {
 #[test]
 fn integer_overflow_is_an_eval_error_not_a_panic() {
     let mut kernel = Kernel::new();
-    assert!(kernel.eval("(+ 9223372036854775807 1)").is_err());
+    assert!(kernel.eval_value("(+ 9223372036854775807 1)").is_err());
 }
 
 #[test]
 fn captured_set_mutates_a_shared_persistent_cell() {
     let mut kernel = Kernel::new();
     kernel
-        .eval(
+        .eval_value(
             "(define make-counter
                (lambda ()
                  (let ((count 0))
@@ -439,9 +435,11 @@ fn captured_set_mutates_a_shared_persistent_cell() {
                      count))))",
         )
         .unwrap();
-    kernel.eval("(define counter (make-counter))").unwrap();
-    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(1));
-    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(2));
+    kernel
+        .eval_value("(define counter (make-counter))")
+        .unwrap();
+    assert_eq!(kernel.eval_value("(counter)").unwrap(), Value::Int(1));
+    assert_eq!(kernel.eval_value("(counter)").unwrap(), Value::Int(2));
 }
 
 #[test]
@@ -449,7 +447,7 @@ fn letrec_closures_capture_the_recursive_placeholder_cell() {
     let mut kernel = Kernel::new();
     assert_eq!(
         kernel
-            .eval(
+            .eval_value(
                 "(letrec ((factorial
                             (lambda (n)
                               (if (= n 0)
@@ -466,7 +464,7 @@ fn letrec_closures_capture_the_recursive_placeholder_cell() {
 fn calls_bind_parameters_in_a_child_of_the_captured_environment() {
     let mut kernel = Kernel::new();
     kernel
-        .eval(
+        .eval_value(
             "(define closures
                (let ((x 7))
                  (list (lambda (x) x)
@@ -474,18 +472,21 @@ fn calls_bind_parameters_in_a_child_of_the_captured_environment() {
         )
         .unwrap();
     assert_eq!(
-        kernel.eval("((nth 0 closures) 99)").unwrap(),
+        kernel.eval_value("((nth 0 closures) 99)").unwrap(),
         Value::Int(99)
     );
-    assert_eq!(kernel.eval("((nth 1 closures))").unwrap(), Value::Int(7));
+    assert_eq!(
+        kernel.eval_value("((nth 1 closures))").unwrap(),
+        Value::Int(7)
+    );
 }
 
 #[test]
 fn interpreted_functions_require_exact_arity() {
     let mut kernel = Kernel::new();
-    kernel.eval("(define (pair x y) (list x y))").unwrap();
+    kernel.eval_value("(define (pair x y) (list x y))").unwrap();
     assert!(matches!(
-        kernel.eval("(pair 1)"),
+        kernel.eval_value("(pair 1)"),
         Err(EvalError::ArityMismatch {
             expected: 2,
             got: 1,
@@ -493,16 +494,16 @@ fn interpreted_functions_require_exact_arity() {
         })
     ));
     assert!(matches!(
-        kernel.eval("(pair 1 2 3)"),
+        kernel.eval_value("(pair 1 2 3)"),
         Err(EvalError::ArityMismatch {
             expected: 2,
             got: 3,
             ..
         })
     ));
-    kernel.eval("(define (nothing) 42)").unwrap();
+    kernel.eval_value("(define (nothing) 42)").unwrap();
     assert!(matches!(
-        kernel.eval("(nothing 1)"),
+        kernel.eval_value("(nothing 1)"),
         Err(EvalError::ArityMismatch {
             expected: 0,
             got: 1,
@@ -515,59 +516,63 @@ fn interpreted_functions_require_exact_arity() {
 fn failed_top_level_form_rolls_back_cells_and_arena_allocations() {
     let mut kernel = Kernel::new();
     kernel
-        .eval("(define counter (let ((x 0)) (lambda () (set! x (+ x 1)) x)))")
+        .eval_value("(define counter (let ((x 0)) (lambda () (set! x (+ x 1)) x)))")
         .unwrap();
     let environments = kernel.lexical_arena_counts().0;
     let cells = kernel.lexical_arena_counts().1;
     assert!(
         kernel
-            .eval("(begin (counter) (let ((temporary 1)) unknown-symbol))")
+            .eval_value("(begin (counter) (let ((temporary 1)) unknown-symbol))")
             .is_err()
     );
     assert_eq!(kernel.lexical_arena_counts().0, environments);
     assert_eq!(kernel.lexical_arena_counts().1, cells);
-    assert_eq!(kernel.eval("(counter)").unwrap(), Value::Int(1));
+    assert_eq!(kernel.eval_value("(counter)").unwrap(), Value::Int(1));
 }
 
 #[test]
 fn data_families_use_exact_qualified_identity_and_bindings() {
     let mut kernel = Kernel::new();
     kernel
-        .eval("(define-data alpha/Result (Ok value) (Old value))")
+        .eval_value("(define-data alpha/Result (Ok value) (Old value))")
         .unwrap();
-    kernel.eval("(define-data beta/Result (Ok value))").unwrap();
-    kernel.eval("(define alpha/Result/unrelated 17)").unwrap();
+    kernel
+        .eval_value("(define-data beta/Result (Ok value))")
+        .unwrap();
+    kernel
+        .eval_value("(define alpha/Result/unrelated 17)")
+        .unwrap();
 
-    assert!(kernel.eval("(alpha/Result/Ok 1)").is_ok());
-    assert!(kernel.eval("(beta/Result/Ok 2)").is_ok());
+    assert!(kernel.eval_value("(alpha/Result/Ok 1)").is_ok());
+    assert!(kernel.eval_value("(beta/Result/Ok 2)").is_ok());
     assert_eq!(
         kernel
-            .eval("(match (beta/Result/Ok 2) ((alpha/Result/Ok x) 0) ((beta/Result/Ok x) x))")
+            .eval_value("(match (beta/Result/Ok 2) ((alpha/Result/Ok x) 0) ((beta/Result/Ok x) x))")
             .unwrap(),
         Value::Int(2)
     );
 
-    kernel.eval("(undefine alpha/Result)").unwrap();
-    assert!(kernel.eval("(alpha/Result/Ok 1)").is_err());
-    assert!(kernel.eval("(alpha/Result/Old 1)").is_err());
+    kernel.eval_value("(undefine alpha/Result)").unwrap();
+    assert!(kernel.eval_value("(alpha/Result/Ok 1)").is_err());
+    assert!(kernel.eval_value("(alpha/Result/Old 1)").is_err());
     assert_eq!(
-        kernel.eval("alpha/Result/unrelated").unwrap(),
+        kernel.eval_value("alpha/Result/unrelated").unwrap(),
         Value::Int(17)
     );
-    assert!(kernel.eval("(beta/Result/Ok 2)").is_ok());
+    assert!(kernel.eval_value("(beta/Result/Ok 2)").is_ok());
 }
 
 #[test]
 fn redefining_a_data_family_removes_only_its_stale_constructors() {
     let mut kernel = Kernel::new();
     kernel
-        .eval("(define-data shapes/Shape (Circle radius) (Square side))")
+        .eval_value("(define-data shapes/Shape (Circle radius) (Square side))")
         .unwrap();
     kernel
-        .eval("(define-data shapes/Shape (Circle radius))")
+        .eval_value("(define-data shapes/Shape (Circle radius))")
         .unwrap();
-    assert!(kernel.eval("(shapes/Shape/Square 2)").is_err());
-    assert!(kernel.eval("(shapes/Shape/Circle 2)").is_ok());
+    assert!(kernel.eval_value("(shapes/Shape/Square 2)").is_err());
+    assert!(kernel.eval_value("(shapes/Shape/Circle 2)").is_ok());
 }
 
 #[test]
@@ -586,8 +591,8 @@ fn output_sinks_are_kernel_local() {
     right.set_output_sink(OutputSink::new(move |text| {
         captured.lock().unwrap().push_str(text)
     }));
-    left.eval(r#"(display "left")"#).unwrap();
-    right.eval(r#"(println "right")"#).unwrap();
+    left.eval_value(r#"(display "left")"#).unwrap();
+    right.eval_value(r#"(println "right")"#).unwrap();
     assert_eq!(&*left_output.lock().unwrap(), r#""left""#);
     assert_eq!(&*right_output.lock().unwrap(), "\"right\"\n");
 }
@@ -600,7 +605,7 @@ fn eval_cancellation_is_kernel_local() {
     let interrupt = interrupted.eval_interrupt_handle();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = interrupted.eval("(begin (define (loop n) (loop (+ n 1))) (loop 0))");
+        let result = interrupted.eval_value("(begin (define (loop n) (loop (+ n 1))) (loop 0))");
         let _ = sender.send(result.map_err(|error| error.to_string()));
     });
     for _ in 0..1_000 {
@@ -617,7 +622,7 @@ fn eval_cancellation_is_kernel_local() {
     assert!(result.unwrap_err().contains("interrupted"));
 
     let mut independent = Kernel::new();
-    assert_eq!(independent.eval("(+ 1 2)").unwrap(), Value::Int(3));
+    assert_eq!(independent.eval_value("(+ 1 2)").unwrap(), Value::Int(3));
 }
 
 #[test]
@@ -626,10 +631,10 @@ fn eval_interrupt_queued_before_activation_cancels_the_imminent_eval() {
     let interrupt = kernel.eval_interrupt_handle();
     assert!(!interrupt.request_interrupt());
     assert!(matches!(
-        kernel.eval("(+ 1 2)"),
+        kernel.eval_value("(+ 1 2)"),
         Err(persistent_lisp_harness::EvalError::Interrupted)
     ));
-    assert_eq!(kernel.eval("(+ 1 2)").unwrap(), Value::Int(3));
+    assert_eq!(kernel.eval_value("(+ 1 2)").unwrap(), Value::Int(3));
 }
 
 #[test]
@@ -642,7 +647,7 @@ fn interrupt_at_eval_completion_discards_the_completed_value() {
         assert!(callback.request_interrupt());
     }));
     assert!(matches!(
-        kernel.eval(r#"(display "finishing")"#),
+        kernel.eval_value(r#"(display "finishing")"#),
         Err(persistent_lisp_harness::EvalError::Interrupted)
     ));
 }
@@ -662,16 +667,16 @@ fn direct_eval_value_restores_scope_after_failing_letrec() {
 #[test]
 fn rhs_tail_calls_restore_the_enclosing_lexical_scope() {
     let mut kernel = Kernel::new();
-    kernel.eval("(define (id x) x)").unwrap();
+    kernel.eval_value("(define (id x) x)").unwrap();
     assert_eq!(
         kernel
-            .eval("(let ((a 1)) (begin (set! a (id 2)) a))")
+            .eval_value("(let ((a 1)) (begin (set! a (id 2)) a))")
             .unwrap(),
         Value::Int(2)
     );
     assert_eq!(
         kernel
-            .eval("(let ((a 3)) (begin (define user/from-local (id a)) a))")
+            .eval_value("(let ((a 3)) (begin (define user/from-local (id a)) a))")
             .unwrap(),
         Value::Int(3)
     );
@@ -687,11 +692,54 @@ fn registered_native_bindings_are_immutable() {
         "memory/remember",
         "source/get",
     ] {
-        assert!(kernel.eval(&format!("(define {name} 1)")).is_err());
-        assert!(kernel.eval(&format!("(undefine {name})")).is_err());
+        assert!(kernel.eval_value(&format!("(define {name} 1)")).is_err());
+        assert!(kernel.eval_value(&format!("(undefine {name})")).is_err());
         assert_eq!(
-            kernel.eval(&format!("(function? {name})")).unwrap(),
+            kernel.eval_value(&format!("(function? {name})")).unwrap(),
             Value::Bool(true)
         );
     }
+}
+
+#[test]
+fn top_level_bash_returns_a_typed_trap() {
+    let mut kernel = Kernel::new();
+    let outcome = kernel.eval(r#"(bash "echo hello world")"#).unwrap();
+    assert!(matches!(
+        outcome,
+        persistent_lisp_harness::EvalOutcome::Trap(
+            persistent_lisp_harness::TrapRequest {
+                operation: persistent_lisp_harness::VmTrap::RunBash { ref command },
+                ..
+            }
+        ) if command == "echo hello world"
+    ));
+}
+
+#[test]
+fn immutable_prelude_bindings_do_not_lock_their_namespaces() {
+    let mut kernel = Kernel::new();
+    assert!(kernel.eval_value("(define agent/call 1)").is_err());
+    assert!(kernel.eval_value("(undefine agent/call)").is_err());
+    kernel.eval_value("(define agent/helper 42)").unwrap();
+    assert_eq!(kernel.eval_value("agent/helper").unwrap(), Value::Int(42));
+    assert!(
+        kernel
+            .environment()
+            .source("agent/call")
+            .is_some_and(|source| source.contains("kernel/trap"))
+    );
+}
+
+#[test]
+fn set_mutates_state_without_creating_definition_history() {
+    let mut kernel = Kernel::new();
+    kernel.eval_value("(define counter 0)").unwrap();
+    let versions = kernel.environment().binding_history_len("user", "counter");
+    kernel.eval_value("(set! counter 1)").unwrap();
+    assert_eq!(
+        kernel.environment().binding_history_len("user", "counter"),
+        versions
+    );
+    assert_eq!(kernel.eval_value("counter").unwrap(), Value::Int(1));
 }

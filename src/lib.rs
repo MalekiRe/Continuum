@@ -3,6 +3,7 @@ pub mod ids;
 pub mod kernel;
 pub mod output;
 pub mod scheduler;
+pub mod state;
 pub mod vm;
 
 pub use executor::{
@@ -11,8 +12,8 @@ pub use executor::{
 };
 pub use ids::{FrameId, MessageId, QualifiedName, SnapshotId};
 pub use kernel::{
-    AllocationError, FrameStatus, Kernel, MessageError, PendingTrap, ScheduleError, SnapshotError,
-    SnapshotInfo, StackNotice, TranscriptEntry, TrapError, VmTrap,
+    AllocationError, EvalOutcome, Kernel, MessageError, ScheduleError, SnapshotError, SnapshotInfo,
+    StackNotice, TranscriptEntry, TrapRequest, VmTrap,
 };
 pub use output::OutputSink;
 pub use vm::{

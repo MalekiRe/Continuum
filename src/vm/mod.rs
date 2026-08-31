@@ -1,6 +1,5 @@
 pub mod env;
 pub mod eval;
-pub mod primitives;
 pub mod reader;
 pub mod value;
 

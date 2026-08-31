@@ -243,7 +243,6 @@ async fn main() -> Result<()> {
                 let Some(message) = message else { return Ok(()) };
                 // The selected turn future is dropped before its trap and sticky
                 // interruption signals are discarded.
-                kernel.discard_pending_operation();
                 intervention.acknowledge();
                 if matches!(message.as_str(), "!!exit" | "!!quit") {
                     if let Err(error) = kernel.snapshot() {
