@@ -1,4 +1,4 @@
-use crate::kernel::{Kernel, VmTrap, qualify_user_name};
+use crate::kernel::{DeferredHook, HookPhase, HookSpec, Kernel, VmTrap, qualify_user_name};
 use crate::vm::env::{DataFamily, DataVariant, EnvRef};
 use crate::vm::value::*;
 use indexmap::IndexMap;
@@ -7,12 +7,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const RUNNING: u8 = 1;
-const PENDING: u8 = 2;
+const CANCEL_PENDING: u8 = 2;
+
+#[derive(Debug, Default)]
+struct PauseState {
+    requested: bool,
+    paused: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EvalControl {
     state: Arc<std::sync::atomic::AtomicU8>,
     turns: Arc<AtomicU64>,
+    pause: Arc<(std::sync::Mutex<PauseState>, std::sync::Condvar)>,
 }
 
 #[derive(Clone, Debug)]
@@ -33,18 +40,71 @@ impl EvalControl {
 
     pub(crate) fn check_safepoint(&self) -> Result<(), EvalError> {
         let count = self.turns.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(SAFEPOINT_INTERVAL)
-            && self.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0
-        {
+        if !count.is_multiple_of(SAFEPOINT_INTERVAL) {
+            return Ok(());
+        }
+        if self.state.fetch_and(!CANCEL_PENDING, Ordering::AcqRel) & CANCEL_PENDING != 0 {
             return Err(EvalError::Interrupted);
         }
-        Ok(())
+        let (lock, wake) = &*self.pause;
+        let mut pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pause.requested {
+            pause.paused = true;
+            wake.notify_all();
+            while pause.requested && self.state.load(Ordering::Acquire) & CANCEL_PENDING == 0 {
+                pause = wake
+                    .wait(pause)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            pause.paused = false;
+            wake.notify_all();
+        }
+        if self.state.fetch_and(!CANCEL_PENDING, Ordering::AcqRel) & CANCEL_PENDING != 0 {
+            Err(EvalError::Interrupted)
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl EvalInterruptHandle {
     pub fn request_interrupt(&self) -> bool {
-        self.0.state.fetch_or(PENDING, Ordering::AcqRel) & RUNNING != 0
+        let running = self.0.state.fetch_or(CANCEL_PENDING, Ordering::AcqRel) & RUNNING != 0;
+        let (lock, wake) = &*self.0.pause;
+        let mut pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pause.requested = false;
+        wake.notify_all();
+        running
+    }
+
+    pub fn request_pause(&self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        let (lock, wake) = &*self.0.pause;
+        let mut pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pause.requested = true;
+        wake.notify_all();
+        true
+    }
+
+    pub fn wait_until_paused(&self, timeout: std::time::Duration) -> bool {
+        let (lock, wake) = &*self.0.pause;
+        let pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pause.paused {
+            return true;
+        }
+        let (pause, _) = wake
+            .wait_timeout_while(pause, timeout, |state| !state.paused && self.is_running())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pause.paused
+    }
+
+    pub fn resume(&self) {
+        let (lock, wake) = &*self.0.pause;
+        let mut pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pause.requested = false;
+        wake.notify_all();
     }
 
     pub fn clear_pending(&self) {
@@ -52,7 +112,7 @@ impl EvalInterruptHandle {
             .0
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (state & RUNNING == 0).then_some(state & !PENDING)
+                (state & RUNNING == 0).then_some(state & !CANCEL_PENDING)
             });
     }
 
@@ -71,9 +131,15 @@ impl EvalRunGuard {
         let interrupted = self
             .control
             .state
-            .fetch_and(!(RUNNING | PENDING), Ordering::AcqRel)
-            & PENDING
+            .fetch_and(!(RUNNING | CANCEL_PENDING), Ordering::AcqRel)
+            & CANCEL_PENDING
             != 0;
+        let (lock, wake) = &*self.control.pause;
+        let mut pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pause.requested = false;
+        pause.paused = false;
+        wake.notify_all();
+        drop(pause);
         self.finished = true;
         if interrupted && result.is_ok() {
             Err(EvalError::Interrupted)
@@ -87,6 +153,11 @@ impl Drop for EvalRunGuard {
     fn drop(&mut self) {
         if !self.finished {
             self.control.state.fetch_and(!RUNNING, Ordering::AcqRel);
+            let (lock, wake) = &*self.control.pause;
+            let mut pause = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            pause.requested = false;
+            pause.paused = false;
+            wake.notify_all();
         }
     }
 }
@@ -150,9 +221,13 @@ pub fn eval(input: &str, kernel: &mut Kernel) -> Result<crate::kernel::EvalOutco
 }
 
 pub(crate) fn eval_forms(exprs: Vec<Value>, kernel: &mut Kernel) -> Result<Value, EvalError> {
-    exprs
-        .into_iter()
-        .try_fold(Value::Nil, |_, expression| eval_any(expression, kernel))
+    let Some((last, preceding)) = exprs.split_last() else {
+        return Ok(Value::Nil);
+    };
+    for expression in preceding {
+        kernel.with_trap_permission(false, |kernel| eval_any(expression.clone(), kernel))?;
+    }
+    kernel.with_trap_permission(true, |kernel| eval_any(last.clone(), kernel))
 }
 fn eval_value_inner(val: Value, kernel: &mut Kernel, tail_pos: bool) -> Result<Value, EvalError> {
     // Safepoint: check if kernel wants to interrupt
@@ -183,7 +258,7 @@ fn eval_value_inner(val: Value, kernel: &mut Kernel, tail_pos: bool) -> Result<V
                         "quasiquote" => eval_quasiquote(args, kernel),
                         "define-syntax" => eval_define_syntax(args, kernel),
                         "define-data" => eval_define_data(args, kernel),
-                        "match" => eval_match(args, kernel),
+                        "match" => eval_match(args, kernel, tail_pos),
                         _ => {
                             // Check if this symbol is a macro
                             let expanded = try_expand_macro(s, args, &kernel.env)?;
@@ -192,7 +267,7 @@ fn eval_value_inner(val: Value, kernel: &mut Kernel, tail_pos: bool) -> Result<V
                             } else {
                                 let fun =
                                     eval_value_inner(Value::Symbol(s.clone()), kernel, false)?;
-                                apply_tail(fun, eval_args(args, kernel)?, kernel, tail_pos)
+                                apply_named(s, fun, eval_args(args, kernel)?, kernel, tail_pos)
                             }
                         }
                     }
@@ -260,9 +335,24 @@ fn eval_any(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
     let mut current = val;
     let result = loop {
         match eval_step(current, kernel) {
-            Ok(StepResult::Done(value)) => break Ok(value),
+            Ok(StepResult::Done(value)) => {
+                if let Err(error) = finish_deferred_hooks(kernel, &value) {
+                    break Err(error);
+                }
+                break Ok(value);
+            }
             Ok(StepResult::Step(next)) => current = next,
-            Err(error) => break Err(error),
+            Err(EvalError::Trap(operation)) => {
+                let scheduled = Value::keyword("scheduled");
+                if let Err(error) = finish_deferred_hooks(kernel, &scheduled) {
+                    break Err(error);
+                }
+                break Err(EvalError::Trap(operation));
+            }
+            Err(error) => {
+                kernel.clear_deferred_hooks();
+                break Err(error);
+            }
         }
     };
     kernel.env.activate_environment(caller_environment)?;
@@ -286,7 +376,9 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
             } else {
                 format!("(define {name} {})", args[1])
             };
-            (name.clone(), eval_any(args[1].clone(), kernel)?, retained)
+            let value =
+                kernel.with_trap_permission(false, |kernel| eval_any(args[1].clone(), kernel))?;
+            (name.clone(), value, retained)
         }
         Value::List(signature) => {
             let Some(name) = signature.first() else {
@@ -486,7 +578,7 @@ fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
         return Err(EvalError::InvalidForm("set! expects 2 arguments".into()));
     }
     let name = expect_symbol(&args[0], "set!", "symbol")?;
-    let value = eval_any(args[1].clone(), kernel)?;
+    let value = kernel.with_trap_permission(false, |kernel| eval_any(args[1].clone(), kernel))?;
     if kernel.env.set_existing_lexical(&name, value.clone()) {
         return Ok(Value::Nil);
     }
@@ -727,7 +819,7 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
 
 // ---- match ----
 
-fn eval_match(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
+fn eval_match(args: &[Value], kernel: &mut Kernel, tail_pos: bool) -> Result<Value, EvalError> {
     if args.len() < 2 {
         return Err(EvalError::InvalidForm(
             "match requires a value and at least one clause".into(),
@@ -747,7 +839,7 @@ fn eval_match(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
                         for (name, value) in bindings {
                             kernel.env.set_lexical(&name, value);
                         }
-                        eval_begin_tail(body, kernel, false)
+                        eval_begin_tail(body, kernel, tail_pos)
                     });
                 }
             }
@@ -1022,6 +1114,108 @@ fn apply_template(template: &Value, bindings: &HashMap<String, Value>) -> Result
     }
 }
 
+fn run_hook_specs(
+    target: &str,
+    arguments: &[Value],
+    result: Option<&Value>,
+    hooks: Vec<HookSpec>,
+    kernel: &mut Kernel,
+) -> Result<(), EvalError> {
+    for hook in hooks {
+        if !kernel.enter_hook(&hook.id) {
+            continue;
+        }
+        let mut hook_arguments = vec![Value::string(target), Value::Vector(arguments.to_vec())];
+        if let Some(result) = result {
+            hook_arguments.push(result.clone());
+        }
+        let callback = kernel
+            .env
+            .lookup(&hook.function)
+            .cloned()
+            .ok_or_else(|| EvalError::UndefinedSymbol(hook.function.clone()));
+        let invoked = callback.and_then(|callback| {
+            kernel.with_trap_permission(false, |kernel| {
+                apply_named(&hook.function, callback, hook_arguments, kernel, false)
+            })
+        });
+        kernel.leave_hook(&hook.id);
+        invoked?;
+    }
+    Ok(())
+}
+
+fn finish_deferred_hooks(kernel: &mut Kernel, result: &Value) -> Result<(), EvalError> {
+    let deferred = kernel.take_deferred_hooks();
+    for deferred in deferred.into_iter().rev() {
+        run_hook_specs(
+            &deferred.target,
+            &deferred.arguments,
+            Some(result),
+            deferred.hooks,
+            kernel,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_named(
+    target: &str,
+    function: Value,
+    arguments: Vec<Value>,
+    kernel: &mut Kernel,
+    tail_ok: bool,
+) -> Result<Value, EvalError> {
+    run_hook_specs(
+        target,
+        &arguments,
+        None,
+        kernel.hooks_for(target, HookPhase::Before),
+        kernel,
+    )?;
+    let after = kernel.hooks_for(target, HookPhase::After);
+    match apply_tail(function, arguments.clone(), kernel, tail_ok) {
+        Ok(value) => {
+            run_hook_specs(target, &arguments, Some(&value), after, kernel)?;
+            Ok(value)
+        }
+        Err(error @ (EvalError::TailCall(_) | EvalError::Trap(_)))
+            if tail_ok && !after.is_empty() =>
+        {
+            kernel.defer_hooks(DeferredHook {
+                target: target.into(),
+                arguments,
+                hooks: after,
+            });
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn run_explicit_hooks(
+    target: &str,
+    value: Value,
+    kernel: &mut Kernel,
+) -> Result<Value, EvalError> {
+    let arguments = vec![value.clone()];
+    run_hook_specs(
+        target,
+        &arguments,
+        None,
+        kernel.hooks_for(target, HookPhase::Before),
+        kernel,
+    )?;
+    run_hook_specs(
+        target,
+        &arguments,
+        Some(&value),
+        kernel.hooks_for(target, HookPhase::After),
+        kernel,
+    )?;
+    Ok(value)
+}
+
 // ---- Application ----
 
 fn apply_tail(
@@ -1047,7 +1241,9 @@ fn apply_tail(
             match builtin.call(kernel, args) {
                 Ok(value) => Ok(value),
                 Err(crate::kernel::native::BuiltinError::Native(error)) => Err(error.into()),
-                Err(crate::kernel::native::BuiltinError::Trap(operation)) if tail_ok => {
+                Err(crate::kernel::native::BuiltinError::Trap(operation))
+                    if tail_ok && kernel.traps_allowed() =>
+                {
                     Err(EvalError::Trap(operation))
                 }
                 Err(crate::kernel::native::BuiltinError::Trap(_)) => Err(EvalError::InvalidForm(
@@ -1093,18 +1289,27 @@ fn apply_tail(
                 kernel.env.set_lexical(parameter, argument);
             }
 
-            // The trampoline owns the active cursor after a tail call. The call
-            // frame remains parented to the closure environment, not the caller.
-            if tail_ok && body.len() == 1 {
-                let next_expr = body.into_iter().next().unwrap();
-                return Err(EvalError::TailCall(next_expr));
+            if tail_ok {
+                let Some((last, preceding)) = body.split_last() else {
+                    kernel.env.activate_environment(caller_environment)?;
+                    return Ok(Value::Nil);
+                };
+                for expression in preceding {
+                    if let Err(error) = eval_value_inner(expression.clone(), kernel, false) {
+                        kernel.env.activate_environment(caller_environment)?;
+                        return Err(error);
+                    }
+                }
+                // The trampoline owns the callee environment until the final
+                // expression finishes or enters another tail call.
+                return Err(EvalError::TailCall(last.clone()));
             }
 
             let result = match eval_begin_tail(&body, kernel, true) {
                 Err(EvalError::TailCall(expr)) => eval_any(expr, kernel),
                 other => other,
             };
-            if !tail_ok && matches!(result, Err(EvalError::Trap(_))) {
+            if matches!(result, Err(EvalError::Trap(_))) {
                 kernel.env.activate_environment(caller_environment)?;
                 return Err(EvalError::InvalidForm(
                     "external operation must be the final action of the top-level evaluation"

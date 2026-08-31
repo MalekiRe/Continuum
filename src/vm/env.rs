@@ -215,12 +215,29 @@ pub(crate) struct LexicalEnvironment {
     pub(crate) bindings: IndexMap<String, CellId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
+struct BindingUndo {
+    environment: EnvironmentId,
+    name: String,
+    previous: Option<CellId>,
+}
+
+#[derive(Debug)]
+struct LexicalTransaction {
+    next_environment_id: EnvironmentId,
+    next_cell_id: CellId,
+    changed_cells: IndexMap<CellId, Value>,
+    changed_bindings: Vec<BindingUndo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct LexicalArena {
     pub(crate) environments: IndexMap<EnvironmentId, LexicalEnvironment>,
     pub(crate) cells: IndexMap<CellId, Value>,
     next_environment_id: EnvironmentId,
     next_cell_id: CellId,
+    #[serde(skip)]
+    transaction: Option<LexicalTransaction>,
 }
 
 impl Default for LexicalArena {
@@ -238,11 +255,66 @@ impl Default for LexicalArena {
             cells: IndexMap::new(),
             next_environment_id: EnvironmentId::FIRST_ALLOCATED,
             next_cell_id: CellId::FIRST,
+            transaction: None,
         }
     }
 }
 
 impl LexicalArena {
+    fn begin_transaction(&mut self) {
+        assert!(self.transaction.is_none(), "nested lexical transaction");
+        self.transaction = Some(LexicalTransaction {
+            next_environment_id: self.next_environment_id,
+            next_cell_id: self.next_cell_id,
+            changed_cells: IndexMap::new(),
+            changed_bindings: Vec::new(),
+        });
+    }
+
+    fn commit_transaction(&mut self) {
+        self.transaction = None;
+    }
+
+    fn rollback_transaction(&mut self) {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        for undo in transaction.changed_bindings.into_iter().rev() {
+            let bindings = &mut self
+                .environments
+                .get_mut(&undo.environment)
+                .expect("transaction environment must exist")
+                .bindings;
+            match undo.previous {
+                Some(cell) => {
+                    bindings.insert(undo.name, cell);
+                }
+                None => {
+                    bindings.shift_remove(&undo.name);
+                }
+            }
+        }
+        self.environments
+            .retain(|id, _| id.0 < transaction.next_environment_id.0);
+        self.cells.retain(|id, _| id.0 < transaction.next_cell_id.0);
+        for (cell, value) in transaction.changed_cells {
+            self.cells.insert(cell, value);
+        }
+        self.next_environment_id = transaction.next_environment_id;
+        self.next_cell_id = transaction.next_cell_id;
+    }
+
+    fn write_cell(&mut self, cell: CellId, value: Value) {
+        if let Some(transaction) = &mut self.transaction
+            && cell.0 < transaction.next_cell_id.0
+            && !transaction.changed_cells.contains_key(&cell)
+            && let Some(previous) = self.cells.get(&cell)
+        {
+            transaction.changed_cells.insert(cell, previous.clone());
+        }
+        self.cells.insert(cell, value);
+    }
+
     fn validate(&self, current: EnvironmentId) -> Result<(), String> {
         let root = self
             .environments
@@ -316,8 +388,28 @@ impl LexicalArena {
             .and_then(|frame| frame.bindings.get(name))
             .copied()
         {
-            self.cells.insert(cell, value);
+            self.write_cell(cell, value);
             return;
+        }
+        let previous = self
+            .environments
+            .get(&environment)
+            .expect("active lexical environment must exist")
+            .bindings
+            .get(name)
+            .copied();
+        if let Some(transaction) = &mut self.transaction
+            && environment.0 < transaction.next_environment_id.0
+            && !transaction
+                .changed_bindings
+                .iter()
+                .any(|undo| undo.environment == environment && undo.name == name)
+        {
+            transaction.changed_bindings.push(BindingUndo {
+                environment,
+                name: name.into(),
+                previous,
+            });
         }
         let cell = self.next_cell_id.take_and_advance();
         self.cells.insert(cell, value);
@@ -339,11 +431,19 @@ impl LexicalArena {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
+pub(crate) struct EnvTransaction {
+    namespaces: Arc<IndexMap<String, Namespace>>,
+    current_environment: EnvironmentId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EnvRef {
     pub(crate) namespaces: Arc<IndexMap<String, Namespace>>,
     pub(crate) lexical: LexicalArena,
     current_environment: EnvironmentId,
+    #[serde(skip)]
+    transaction: Option<EnvTransaction>,
 }
 
 impl Default for EnvRef {
@@ -353,6 +453,28 @@ impl Default for EnvRef {
 }
 
 impl EnvRef {
+    pub(crate) fn begin_transaction(&mut self) {
+        assert!(self.transaction.is_none(), "nested environment transaction");
+        self.transaction = Some(EnvTransaction {
+            namespaces: self.namespaces.clone(),
+            current_environment: self.current_environment,
+        });
+        self.lexical.begin_transaction();
+    }
+
+    pub(crate) fn commit_transaction(&mut self) {
+        self.lexical.commit_transaction();
+        self.transaction = None;
+    }
+
+    pub(crate) fn rollback_transaction(&mut self) {
+        self.lexical.rollback_transaction();
+        if let Some(transaction) = self.transaction.take() {
+            self.namespaces = transaction.namespaces;
+            self.current_environment = transaction.current_environment;
+        }
+    }
+
     pub fn new() -> Self {
         let namespaces = ["system", "inspect", "control", "kernel", "user"]
             .into_iter()
@@ -362,6 +484,7 @@ impl EnvRef {
             namespaces: Arc::new(namespaces),
             lexical: LexicalArena::default(),
             current_environment: EnvironmentId::ROOT,
+            transaction: None,
         }
     }
 
@@ -498,7 +621,7 @@ impl EnvRef {
         let Some(cell) = self.lexical.find_cell(self.current_environment, name) else {
             return false;
         };
-        self.lexical.cells.insert(cell, value);
+        self.lexical.write_cell(cell, value);
         true
     }
 

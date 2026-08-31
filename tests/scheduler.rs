@@ -146,7 +146,7 @@ async fn selected_memory_and_context_hooks_are_injected() {
         .eval_value(r#"(memory/remember "project" "Continuum")"#)
         .unwrap();
     kernel
-        .eval_value(r#"(context/add-hook "Prefer tests before edits")"#)
+        .eval_value(r#"(context/inject "direction" :frame "Prefer tests before edits")"#)
         .unwrap();
     scheduler.run_turn(&mut kernel).await.unwrap();
     let request = &model.requests.lock().unwrap()[0];
@@ -220,7 +220,7 @@ fn context_budget_preserves_high_priority_guidance() {
         .eval_value(r#"(memory/remember "priority" "PRIORITY-MEMORY")"#)
         .unwrap();
     kernel
-        .eval_value(r#"(context/add-hook "PRIORITY-HOOK")"#)
+        .eval_value(r#"(context/inject "priority-hook" :frame "PRIORITY-HOOK")"#)
         .unwrap();
     for index in 0..100 {
         kernel.append_transcript(&format!("action-{index}"), &"noise".repeat(10_000));
@@ -349,7 +349,7 @@ async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
     .expect("cancelled generation did not stop");
     assert_eq!(
         first_result.unwrap_err().to_string(),
-        "model request interrupted by human input"
+        "model request interrupted by control input"
     );
     assert_eq!(model.active.load(Ordering::SeqCst), 0);
     assert!(interrupt.request_interrupt());
@@ -409,7 +409,7 @@ fn worst_case_context_sections_stay_within_the_total_request_budget() {
     for index in 0..16 {
         kernel
             .eval_value(&format!(
-                r#"(context/add-hook "hook-{index}-{}")"#,
+                r#"(context/inject "hook-{index}" :frame "hook-{index}-{}")"#,
                 "h".repeat(1_980)
             ))
             .unwrap();
@@ -432,7 +432,7 @@ fn worst_case_context_sections_stay_within_the_total_request_budget() {
     assert!(request.system.len() + request.context.len() <= 62_000);
     assert!(request.context.contains("Emit exactly one Lisp form"));
     assert!(request.context.contains("notice-0"));
-    assert!(request.context.contains("notice-31"));
+    assert!(!request.context.contains("notice-31"));
 }
 
 #[tokio::test]
@@ -652,4 +652,105 @@ fn tail_position_trap_commits_prior_synchronous_work() {
         persistent_lisp_harness::Value::Int(1)
     );
     assert!(kernel.eval_value(r#"(+ 1 (bash "true"))"#).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_human_control_replies_without_cancelling_blocking_bash() {
+    use persistent_lisp_harness::{ControlReply, ControlTrigger};
+    let (scheduler, model) = scheduler(&[
+        r#"(bash "sleep 0.15; printf complete")"#,
+        r#"(control/continue "training is still running")"#,
+    ]);
+    let kernel = Kernel::new();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<ControlReply>();
+    let keepalive = control_tx.clone();
+    let control = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        control_tx
+            .send(ControlTrigger::Human("status?".into()))
+            .unwrap();
+    };
+    let turn = scheduler.run_supervised_turn(kernel, &mut control_rx, &reply_tx);
+    let ((kernel, outcome), ()) = tokio::join!(turn, control);
+    drop(keepalive);
+    assert!(
+        matches!(outcome.unwrap(), TurnOutcome::ToolCompleted { ref result, .. } if result.contains("complete"))
+    );
+    assert_eq!(
+        reply_rx.recv().await.unwrap().text,
+        "training is still running"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert!(
+        kernel.frames()[0]
+            .state()
+            .transcript()
+            .last()
+            .unwrap()
+            .result
+            .contains("complete")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_control_can_cancel_lisp_at_a_safepoint() {
+    use persistent_lisp_harness::{ControlReply, ControlTrigger};
+    let (scheduler, _) = scheduler(&[
+        "(begin (define (loop n) (loop (+ n 1))) (loop 0))",
+        r#"(control/cancel "loop is unproductive" "stopped it")"#,
+    ]);
+    let kernel = Kernel::new();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<ControlReply>();
+    let keepalive = control_tx.clone();
+    let control = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        control_tx
+            .send(ControlTrigger::Human("stop that loop".into()))
+            .unwrap();
+    };
+    let turn = scheduler.run_supervised_turn(kernel, &mut control_rx, &reply_tx);
+    let ((_kernel, outcome), ()) = tokio::join!(turn, control);
+    drop(keepalive);
+    assert!(matches!(outcome.unwrap(), TurnOutcome::Cancelled { .. }));
+    assert_eq!(reply_rx.recv().await.unwrap().text, "stopped it");
+}
+
+#[test]
+fn chronological_spine_stays_logarithmic_without_forgetting_the_beginning() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    for index in 0..1_024 {
+        kernel.append_transcript(
+            &format!("action-{index}"),
+            &format!("result-{index}-{}", "x".repeat(256)),
+        );
+    }
+    let _ = scheduler.build_request(&kernel);
+    // build_request is read-only; one cognition boundary performs compaction.
+    persistent_lisp_harness::scheduler::compact_for_test(&mut kernel);
+    let spine = kernel.frames()[0].state().spine();
+    assert!(spine.len() < 64, "spine grew linearly: {}", spine.len());
+    assert_eq!(spine.first().unwrap().first_event, 1);
+    assert!(spine.last().unwrap().last_event > 900);
+}
+
+#[test]
+fn optmem_view_is_bounded_but_recall_reaches_old_memories() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    for index in 0..256 {
+        kernel
+            .eval_value(&format!(
+                "(memory/remember \"key-{index}\" \"memory-{index}-{}\")",
+                "x".repeat(80)
+            ))
+            .unwrap();
+    }
+    let request = scheduler.build_request(&kernel);
+    assert!(request.context.len() <= 62_000);
+    let recalled = kernel.eval_value("(memory/recall \"memory-0-\")").unwrap();
+    assert!(!matches!(recalled, persistent_lisp_harness::Value::Nil));
+    assert!(recalled.to_string().contains("memory-0-"));
 }

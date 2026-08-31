@@ -1,6 +1,21 @@
 (define (bash command)
   (kernel/trap :bash command))
 
+(define (bash/start command)
+  (kernel/trap :bash-start command))
+
+(define (bash/status job-id)
+  (kernel/trap :bash-status job-id))
+
+(define (bash/cancel job-id)
+  (kernel/trap :bash-cancel job-id))
+
+(define (bash/collect job-id)
+  (kernel/trap :bash-collect job-id))
+
+(define (bash/list)
+  (kernel/trap :bash-list nil))
+
 (define (model/call prompt)
   (kernel/trap :model-call prompt))
 
@@ -44,3 +59,6 @@
 
 (define (identity value)
   value)
+
+(define (remember text)
+  (memory/note text))
