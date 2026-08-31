@@ -621,26 +621,20 @@ fn agent_boundaries_require_strings() {
 }
 
 #[tokio::test]
-async fn human_wait_is_snapshot_safe_and_wakes_on_message() {
+async fn model_cannot_stop_autonomous_cognition_by_waiting() {
     let (scheduler, _) = scheduler(&["(human/wait)", "nil"]);
     let mut kernel = Kernel::new();
-    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
-    assert!(matches!(outcome, TurnOutcome::ToolCompleted { .. }));
-    assert_eq!(
-        kernel.frames()[0].status(),
-        persistent_lisp_harness::FrameStatus::Waiting
-    );
-    assert!(!kernel.has_trap());
 
-    let snapshots = temp_root("wait-snapshot");
-    kernel.set_snapshot_directory(&snapshots);
-    kernel.snapshot().unwrap();
-    kernel.human_message("resume").unwrap();
+    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(matches!(outcome, TurnOutcome::Evaluated { .. }));
     assert_eq!(
         kernel.frames()[0].status(),
         persistent_lisp_harness::FrameStatus::Running
     );
+    assert!(!kernel.has_trap());
+
     scheduler.run_turn(&mut kernel).await.unwrap();
+    assert_eq!(kernel.frames()[0].state().transcript().len(), 2);
 }
 
 #[test]

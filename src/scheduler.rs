@@ -55,8 +55,8 @@ pub enum ModelError {
         status: reqwest::StatusCode,
         message: String,
     },
-    #[error("model response contained no content")]
-    MissingContent,
+    #[error("model response contained no content ({0})")]
+    MissingContent(String),
     #[error("{0}")]
     Client(String),
 }
@@ -98,7 +98,6 @@ pub trait ModelClient: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct OpenRouterModel {
     pub model: String,
-    pub max_tokens: u32,
     pub timeout: std::time::Duration,
     client: reqwest::Client,
 }
@@ -108,7 +107,6 @@ impl Default for OpenRouterModel {
         Self {
             model: std::env::var("CONTINUUM_MODEL")
                 .unwrap_or_else(|_| "deepseek/deepseek-v4-flash".into()),
-            max_tokens: 600,
             timeout: std::time::Duration::from_secs(60),
             client: reqwest::Client::new(),
         }
@@ -132,7 +130,6 @@ impl OpenRouterModel {
                     {"role": "system", "content": request.system},
                     {"role": "user", "content": request.context}
                 ],
-                "max_tokens": self.max_tokens,
                 "temperature": 0.4
             }))
             .send()
@@ -150,10 +147,23 @@ impl OpenRouterModel {
                 .to_string();
             return Err(ModelError::Http { status, message });
         }
-        body.pointer("/choices/0/message/content")
+        if let Some(content) = body
+            .pointer("/choices/0/message/content")
             .and_then(|value| value.as_str())
-            .map(str::to_owned)
-            .ok_or(ModelError::MissingContent)
+            .filter(|content| !content.trim().is_empty())
+        {
+            return Ok(content.to_owned());
+        }
+        let finish_reason = body
+            .pointer("/choices/0/finish_reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("missing");
+        let completion_tokens = body
+            .pointer("/usage/completion_tokens")
+            .map_or_else(|| "missing".into(), ToString::to_string);
+        Err(ModelError::MissingContent(format!(
+            "finish reason: {finish_reason}, completion tokens: {completion_tokens}"
+        )))
     }
 }
 
@@ -334,17 +344,9 @@ impl<M: ModelClient> Scheduler<M> {
 
         // Complete an in-memory top-level suspension before asking for a new action.
         if let Some(pending) = kernel.pending_trap() {
-            if pending.operation == VmTrap::AwaitHuman {
-                if kernel.notices_for_frame(&frame_id).is_empty() {
-                    return Ok(TurnOutcome::Idle);
-                }
-                kernel.clear_trap();
-                kernel.frames.last_mut().unwrap().status = FrameStatus::Running;
-            } else {
-                return self
-                    .handle_trap(kernel, frame_id, pending, ":resumed".into())
-                    .await;
-            }
+            return self
+                .handle_trap(kernel, frame_id, pending, ":resumed".into())
+                .await;
         }
         if kernel
             .frames
@@ -475,19 +477,6 @@ impl<M: ModelClient> Scheduler<M> {
                 kernel.append_transcript_to(&frame_id, &source, &text);
                 Ok(TurnOutcome::Replied { message_id, text })
             }
-            VmTrap::AwaitHuman => {
-                kernel.clear_trap();
-                let frame = kernel.frames.last_mut().ok_or(SchedulerError::Invariant(
-                    "human wait without an active frame",
-                ))?;
-                frame.status = FrameStatus::Waiting;
-                kernel.append_transcript_to(&frame_id, &source, "waiting for human input");
-                Ok(TurnOutcome::ToolCompleted {
-                    frame_id,
-                    source,
-                    result: "waiting for human input".into(),
-                })
-            }
         }
     }
 
@@ -500,7 +489,7 @@ impl<M: ModelClient> Scheduler<M> {
             .frames
             .last()
             .expect("build_request requires a frame");
-        let directive = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be top-level forms.\n";
+        let directive = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Keep taking useful actions indefinitely, including after replying to a human. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, and message/reply must be top-level forms.\n";
         let system = if frame.state.instructions.is_empty() {
             "You are Continuum, a persistent agent inhabiting a Lisp world. Choose one useful Lisp action.".into()
         } else {

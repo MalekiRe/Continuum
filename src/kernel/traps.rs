@@ -49,10 +49,6 @@ impl Kernel {
                 prompt: prompt.coerce_text(),
             })
         });
-        exact_native!(self, "human/wait", |kernel, []| {
-            kernel.require_top_level("human/wait", false)?;
-            kernel.suspend(VmTrap::AwaitHuman)
-        });
         exact_native!(self, "bash", |kernel, [command]| {
             kernel.require_top_level("bash", true)?;
             let command = match command {

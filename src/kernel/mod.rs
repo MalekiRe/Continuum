@@ -264,7 +264,6 @@ pub enum TrapError {
 pub enum VmTrap {
     CallModel { prompt: String },
     RunBash { command: String },
-    AwaitHuman,
     CallAgent { name: String, request: String },
     ReturnAgent { value: Value },
     Reply { message_id: MessageId, text: String },

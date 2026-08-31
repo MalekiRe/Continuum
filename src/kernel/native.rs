@@ -45,12 +45,14 @@ impl Kernel {
     pub(crate) fn register_tools(&mut self) {
         self.natives.clear();
         // Snapshots may contain natives retired after they were written.
-        if let Some(namespace) =
-            std::sync::Arc::make_mut(&mut self.env.namespaces).get_mut("kernel")
-        {
-            for name in ["read", "sleep"] {
-                namespace.bindings.shift_remove(name);
-                namespace.sources.shift_remove(name);
+        let namespaces = std::sync::Arc::make_mut(&mut self.env.namespaces);
+        for (namespace, names) in [("kernel", &["read", "sleep"][..]), ("human", &["wait"][..])] {
+            let Some(namespace) = namespaces.get_mut(namespace) else {
+                continue;
+            };
+            for name in names {
+                namespace.bindings.shift_remove(*name);
+                namespace.sources.shift_remove(*name);
             }
         }
         self.register_vm_primitives();

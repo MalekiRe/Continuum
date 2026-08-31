@@ -79,7 +79,7 @@ Snapshots happen automatically. Recover from a crash with `cargo run` — it aut
 | Output | `display` `println` |
 | Type predicates | `nil?` `number?` `symbol?` `string?` `list?` `function?` `keyword?` |
 | System | `system/clock` `system/version` |
-| Model and messages | `model/call` `human/wait` `message/reply` |
+| Model and messages | `model/call` `message/reply` |
 | Persistence and context | `memory/remember` `memory/forget` `memory/list` `context/add-hook` `context/clear-hooks` `transcript/recent` |
 | Source and inspection | `source/get` `source/list` `inspect/namespaces` `inspect/bindings` `inspect/find` `inspect/history` |
 | Subagents | `agent/call` `agent/return` |
