@@ -25,6 +25,17 @@ jobs:
         run: |
           sed -i '/count = text.scan/a\  return if count == 0' scripts/codex_reduce_loc.rb
           ruby scripts/codex_reduce_loc.rb
+          ruby <<'RUBY'
+          path = "src/vm/value.rs"
+          text = File.read(path)
+          start = text.index('            Value::List(items) => {') or abort "missing list formatter"
+          finish = text.index('            Value::Map(map) => {', start) or abort "missing map formatter"
+          replacement = <<~'RUST'
+                        Value::List(items) => write_values(f, "(", items, ")"),
+                        Value::Vector(items) => write_values(f, "#(", items, ")"),
+          RUST
+          File.write(path, text[0...start] + replacement + text[finish..])
+          RUBY
           ruby -e 'path = "src/scheduler.rs"; text = File.read(path); text.sub!(/\n}\n}\s*\z/, "\n}\n") or abort "expected duplicate scheduler brace"; File.write(path, text)'
       - name: Format
         run: cargo fmt --all
