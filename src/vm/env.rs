@@ -1,5 +1,5 @@
 use crate::ids::QualifiedName;
-use crate::vm::value::{Value, collect_captured_environments};
+use crate::vm::value::{Function, Value, collect_captured_environments};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -11,6 +11,8 @@ pub enum EnvError {
     InvalidName(String),
     #[error("namespace '{0}' is protected and cannot be modified")]
     Protected(String),
+    #[error("native binding '{0}' cannot be modified")]
+    NativeBinding(String),
     #[error("namespace '{0}' not found")]
     NamespaceNotFound(String),
     #[error("binding '{0}' not found")]
@@ -456,6 +458,9 @@ impl EnvRef {
         if ns.protected {
             return Err(EnvError::Protected(ns_name));
         }
+        if matches!(ns.get(name), Some(Value::Function(Function::Native { .. }))) {
+            return Err(EnvError::NativeBinding(qualified_name.into()));
+        }
 
         ns.define(name, value);
         Ok(())
@@ -499,6 +504,9 @@ impl EnvRef {
             .ok_or_else(|| EnvError::NamespaceNotFound(namespace.into()))?;
         if ns.protected {
             return Err(EnvError::Protected(namespace.into()));
+        }
+        if matches!(ns.get(name), Some(Value::Function(Function::Native { .. }))) {
+            return Err(EnvError::NativeBinding(qualified_name.into()));
         }
         ns.undefine(name)
             .ok_or_else(|| EnvError::BindingNotFound(qualified_name.into()))?;

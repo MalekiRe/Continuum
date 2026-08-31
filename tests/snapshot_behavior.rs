@@ -525,3 +525,28 @@ fn recovery_restores_one_active_top_frame() {
         persistent_lisp_harness::FrameStatus::Running
     );
 }
+
+#[test]
+fn snapshots_round_trip_maps_with_arbitrary_lisp_keys() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    kernel
+        .eval("(define user/mixed-map {:mode \"fast\" 1 \"one\" '(a b) 3})")
+        .unwrap();
+    kernel.snapshot().unwrap();
+
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert_eq!(
+        recovered.eval("(map/get mixed-map :mode)").unwrap(),
+        Value::string("fast")
+    );
+    assert_eq!(
+        recovered.eval("(map/get mixed-map 1)").unwrap(),
+        Value::string("one")
+    );
+    assert_eq!(
+        recovered.eval("(map/get mixed-map '(a b))").unwrap(),
+        Value::Int(3)
+    );
+}

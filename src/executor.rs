@@ -275,6 +275,10 @@ impl Executor {
             .arg(command)
             .current_dir(&self.config.working_directory)
             .stdin(Stdio::null())
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", &self.config.working_directory)
+            .env("LANG", "C.UTF-8")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         unix::configure_process_session(&mut cmd);

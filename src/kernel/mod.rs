@@ -603,6 +603,9 @@ impl Kernel {
             text.chars().take(8_000).collect(),
             targets,
         )?;
+        if let Some(active) = self.frames.last_mut() {
+            active.status = FrameStatus::Running;
+        }
         Ok(id)
     }
 
@@ -997,7 +1000,7 @@ impl Kernel {
             .map_err(|error| SnapshotError::json("snapshot payload", error))?;
         let checksum = sha256(&payload);
         let envelope = SnapshotEnvelope {
-            format_version: 5,
+            format_version: 6,
             id: id.clone(),
             timestamp: timestamp.clone(),
             kernel,
@@ -1274,7 +1277,7 @@ fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, SnapshotError
     let bytes = std::fs::read(path)
         .map_err(|error| SnapshotError::io(format!("read {}", path.display()), error))?;
     if let Ok(envelope) = serde_json::from_slice::<SnapshotEnvelope>(&bytes) {
-        if !matches!(envelope.format_version, 2..=5) {
+        if !matches!(envelope.format_version, 2..=6) {
             return Err(SnapshotError::Invalid(format!(
                 "unsupported snapshot format {}",
                 envelope.format_version

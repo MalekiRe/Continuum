@@ -250,17 +250,17 @@ pub fn eval_value(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
 
 /// Evaluate a value, handling TailCall by following the trampoline.
 fn eval_any(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
+    let caller_environment = kernel.env.current_environment();
     let mut current = val;
-    loop {
+    let result = loop {
         match eval_step(current, kernel) {
-            Ok(StepResult::Done(v)) => return Ok(v),
-            Ok(StepResult::Step(next)) => {
-                current = next;
-                continue;
-            }
-            Err(e) => return Err(e),
+            Ok(StepResult::Done(value)) => break Ok(value),
+            Ok(StepResult::Step(next)) => current = next,
+            Err(error) => break Err(error),
         }
-    }
+    };
+    kernel.env.activate_environment(caller_environment)?;
+    result
 }
 
 fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
