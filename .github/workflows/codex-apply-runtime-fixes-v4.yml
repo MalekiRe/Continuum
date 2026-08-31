@@ -24,6 +24,6 @@ jobs:
       - name: Normalize escaped result assertion
         shell: bash
         run: |
-          ruby -pi -e 'if $_.include?("matches!(second, TurnOutcome::Returned"); $_ = "        matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == \\\"done\\\")\n"; end' tests/scheduler.rs
+          sed -i '126c\        matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "done")' tests/scheduler.rs
           sed -i '/count = text.scan/a\  return if count == 0' scripts/codex_apply_runtime_fixes.sh
       - run: bash scripts/codex_apply_runtime_fixes.sh
