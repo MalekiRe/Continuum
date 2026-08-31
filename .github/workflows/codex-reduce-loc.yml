@@ -22,7 +22,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Apply refactor
-        run: ruby scripts/codex_reduce_loc.rb
+        run: |
+          sed -i '/count = text.scan/a\  return if count == 0' scripts/codex_reduce_loc.rb
+          ruby scripts/codex_reduce_loc.rb
+          ruby -e 'path = "src/scheduler.rs"; text = File.read(path); text.sub!(/\n}\n}\s*\z/, "\n}\n") or abort "expected duplicate scheduler brace"; File.write(path, text)'
       - name: Format
         run: cargo fmt --all
       - name: Lint
