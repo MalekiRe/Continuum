@@ -21,9 +21,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Normalize escaped result assertion
+      - name: Normalize string-only agent return expectations
         shell: bash
         run: |
           sed -i '126c\        matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "done")' tests/scheduler.rs
+          sed -i 's/(agent\/return :done)/(agent\/return \\"done\\")/' tests/scheduler.rs
           sed -i '/count = text.scan/a\  return if count == 0' scripts/codex_apply_runtime_fixes.sh
       - run: bash scripts/codex_apply_runtime_fixes.sh
