@@ -1,5 +1,5 @@
-use crate::ids::MessageId;
-use crate::kernel::{Kernel, VmTrap};
+use crate::ids::{JobId, MessageId};
+use crate::kernel::{HookPhase, HookSpec, Kernel, VmTrap};
 use crate::vm::env::BindingOrigin;
 use crate::vm::value::{Arity, Function, NativeError, Value};
 
@@ -123,7 +123,14 @@ fn arithmetic(
             .ok_or_else(|| NativeError::InvalidArgument(format!("{name}: integer overflow")));
     }
     let (left, right) = numbers(left, right, name)?;
-    Ok(Value::Float(floats(left, right)))
+    let result = floats(left, right);
+    if result.is_finite() {
+        Ok(Value::Float(result))
+    } else {
+        Err(NativeError::InvalidArgument(format!(
+            "{name}: non-finite result"
+        )))
+    }
 }
 
 fn type_name(value: &Value) -> &'static str {
@@ -174,7 +181,12 @@ builtins! {
         if right == 0.0 {
             Err("/: division by zero".into())
         } else {
-            Ok(Value::Float(left / right))
+let result = left / right;
+if result.is_finite() {
+    Ok(Value::Float(result))
+} else {
+    Err("/: non-finite result".into())
+}
         }
     };
     Equal => "kernel/=", exact [left, right], |_kernel| {
@@ -339,60 +351,162 @@ builtins! {
         names.sort_by_key(ToString::to_string);
         Ok(Value::List(names))
     };
-    ContextAddHook => "context/add-hook", exact [hook], |kernel| {
-        let hook = hook.coerce_text();
-        if hook.chars().count() > 2_000 {
-            return Err("context/add-hook: hook exceeds 2000 characters".into());
-        }
-        let frame = kernel.frames.last_mut().ok_or("context/add-hook: no frame")?;
-        if frame.state.context_hooks.len() >= 16 {
-            return Err("context/add-hook: at most 16 hooks are allowed".into());
-        }
-        frame.state.context_hooks.push(hook);
-        Ok(Value::keyword("ok"))
+HookAdd => "hook/add", exact [id, target, phase, function], |kernel| {
+    let text = |value: &Value, operation: &str| {
+        value
+            .as_symbol()
+            .or_else(|| value.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| NativeError::InvalidArgument(format!(
+                "{operation}: expected symbol or string"
+            )))
     };
-    ContextClearHooks => "context/clear-hooks", exact [], |kernel| {
-        if let Some(frame) = kernel.frames.last_mut() {
-            frame.state.context_hooks.clear();
-        }
-        Ok(Value::keyword("ok"))
+    let phase = match phase.as_keyword() {
+        Some("before") => HookPhase::Before,
+        Some("after") => HookPhase::After,
+        _ => return Err("hook/add: phase must be :before or :after".into()),
     };
-    MemoryRemember => "memory/remember", exact [key, value], |kernel| {
-        let key = key.coerce_text();
-        let value = value.coerce_text();
-        if key.chars().count() > 200 || value.chars().count() > 2_000 {
-            return Err("memory/remember: key or value exceeds context limits".into());
-        }
-        let frame = kernel.frames.last_mut().ok_or("memory/remember: no frame")?;
-        if frame.state.memory.len() >= 64 && !frame.state.memory.iter().any(|entry| entry.key == key) {
-            return Err("memory/remember: at most 64 entries are allowed".into());
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        if let Some(entry) = frame.state.memory.iter_mut().find(|entry| entry.key == key) {
-            entry.value = value;
-            entry.updated_at = now;
-        } else {
-            frame.state.memory.push(crate::kernel::MemoryEntry { key, value, updated_at: now });
-        }
-        Ok(Value::keyword("ok"))
+    kernel.add_hook(HookSpec {
+        id: text(id, "hook/add id")?,
+        target: text(target, "hook/add target")?,
+        phase,
+        function: text(function, "hook/add function")?,
+    });
+    Ok(Value::keyword("ok"))
+};
+HookRemove => "hook/remove", exact [id], |kernel| {
+    let id = id.as_symbol().or_else(|| id.as_str()).ok_or(
+        "hook/remove: expected symbol or string",
+    )?;
+    Ok(Value::Bool(kernel.remove_hook(id)))
+};
+HookList => "hook/list", exact [target], |kernel| {
+    let target = match target {
+        Value::Nil => None,
+        value => Some(value.as_symbol().or_else(|| value.as_str()).ok_or(
+            "hook/list: target must be nil, symbol, or string",
+        )?),
     };
-    MemoryForget => "memory/forget", exact [key], |kernel| {
-        let key = key.coerce_text();
-        if let Some(frame) = kernel.frames.last_mut() {
-            frame.state.memory.retain(|entry| entry.key != key);
-        }
-        Ok(Value::keyword("ok"))
+    Ok(Value::List(kernel.list_hooks(target).into_iter().map(|hook| {
+        Value::list(vec![
+            Value::string(&hook.id),
+            Value::string(&hook.target),
+            Value::keyword(match hook.phase {
+                HookPhase::Before => "before",
+                HookPhase::After => "after",
+            }),
+            Value::string(&hook.function),
+        ])
+    }).collect()))
+};
+HookRun => "hook/run", exact [target, value], |kernel| {
+    let target = target.as_symbol().or_else(|| target.as_str()).ok_or(
+        "hook/run: expected symbol or string target",
+    )?;
+    crate::vm::eval::run_explicit_hooks(target, (*value).clone(), kernel)
+        .map_err(|error| NativeError::Failed(error.to_string()).into())
+};
+ContextInject => "context/inject", exact [key, lifetime, text], |kernel| {
+    let key = key.require_string("context/inject", 1)?.to_owned();
+    let lifetime = match lifetime.as_keyword() {
+        Some("next") => crate::kernel::ContextLifetime::Next,
+        Some("frame") => crate::kernel::ContextLifetime::Frame,
+        _ => return Err("context/inject: lifetime must be :next or :frame".into()),
     };
-    MemoryList => "memory/list", exact [], |kernel| {
-        let Some(frame) = kernel.frames.last() else {
-            return Ok(Value::Nil);
-        };
-        Ok(Value::List(frame.state.memory.iter().map(|entry| Value::list(vec![
-            Value::string(&entry.key),
-            Value::string(&entry.value),
-            Value::string(&entry.updated_at),
-        ])).collect()))
+    let text = text.require_string("context/inject", 3)?.to_owned();
+    if !kernel.inject_context(key, lifetime, text) {
+        return Err("context/inject: no active frame".into());
+    }
+    Ok(Value::keyword("ok"))
+};
+ContextRemove => "context/remove", exact [key], |kernel| {
+    let key = key.require_string("context/remove", 1)?;
+    Ok(Value::Bool(kernel.remove_context(key)))
+};
+ContextList => "context/list", exact [], |kernel| {
+    let Some(frame) = kernel.frames.last() else { return Ok(Value::Nil); };
+    Ok(Value::List(frame.state.context_entries.iter().map(|entry| Value::list(vec![
+        Value::string(&entry.key),
+        Value::keyword(match entry.lifetime {
+            crate::kernel::ContextLifetime::Next => "next",
+            crate::kernel::ContextLifetime::Frame => "frame",
+        }),
+        Value::string(&entry.text),
+    ])).collect()))
+};
+MemoryRemember => "memory/remember", exact [key, value], |kernel| {
+    let id = kernel.remember(key.coerce_text(), value.coerce_text());
+    Ok(Value::string(id.as_str()))
+};
+MemoryNote => "memory/note", exact [value], |kernel| {
+    let id = kernel.note_memory(value.coerce_text());
+    Ok(Value::string(id.as_str()))
+};
+MemoryForget => "memory/forget", exact [selector], |kernel| {
+    Ok(Value::Bool(kernel.forget_memory(&selector.coerce_text())))
+};
+MemoryView => "memory/view", exact [], |kernel| {
+    Ok(Value::List(kernel.visible_memory().into_iter().map(|entry| Value::list(vec![
+        Value::string(entry.id.as_str()),
+        Value::string(&entry.key),
+        Value::string(&entry.value),
+        Value::string(&entry.updated_at),
+    ])).collect()))
+};
+MemoryRecall => "memory/recall", exact [query], |kernel| {
+    let query = query.require_string("memory/recall", 1)?.to_lowercase();
+    Ok(Value::List(kernel.visible_memory().into_iter().filter(|entry| {
+        entry.key.to_lowercase().contains(&query)
+            || entry.value.to_lowercase().contains(&query)
+    }).map(|entry| Value::list(vec![
+        Value::string(entry.id.as_str()),
+        Value::string(&entry.key),
+        Value::string(&entry.value),
+    ])).collect()))
+};
+MemoryList => "memory/list", exact [], |kernel| {
+    Ok(Value::List(kernel.visible_memory().into_iter().map(|entry| Value::list(vec![
+        Value::string(entry.id.as_str()),
+        Value::string(&entry.key),
+        Value::string(&entry.value),
+        Value::string(&entry.updated_at),
+    ])).collect()))
+};
+HistoryRead => "history/read", exact [id], |kernel| {
+    let id = id.require_int("history/read", 1)?;
+    let id = u64::try_from(id).map_err(|_| NativeError::from("history/read: ID must be non-negative"))?;
+    let Some(event) = kernel.history.iter().find(|event| event.id == id) else {
+        return Ok(Value::Nil);
     };
+    Ok(Value::list(vec![
+        Value::int(event.id as i64),
+        Value::string(&event.timestamp),
+        event.frame_id.as_ref().map(|id| Value::string(id.as_str())).unwrap_or(Value::Nil),
+        Value::string(&event.kind),
+        Value::string(&event.text),
+    ]))
+};
+HistoryFind => "history/find", exact [query], |kernel| {
+    let query = query.require_string("history/find", 1)?.to_lowercase();
+    Ok(Value::List(kernel.history.iter().filter(|event| {
+        event.kind.to_lowercase().contains(&query)
+            || event.text.to_lowercase().contains(&query)
+    }).map(|event| Value::list(vec![
+        Value::int(event.id as i64),
+        Value::string(&event.timestamp),
+        Value::string(&event.kind),
+        Value::string(&event.text),
+    ])).collect()))
+};
+HistorySpine => "history/spine", exact [], |kernel| {
+    let Some(frame) = kernel.frames.last() else { return Ok(Value::Nil); };
+    Ok(Value::List(frame.state.spine.iter().map(|node| Value::list(vec![
+        Value::int(node.level as i64),
+        Value::int(node.first_event as i64),
+        Value::int(node.last_event as i64),
+        Value::string(&node.summary),
+    ])).collect()))
+};
     InspectNamespaces => "inspect/namespaces", exact [], |kernel| {
         Ok(Value::List(kernel.env.namespace_names().into_iter().map(|name| {
             let count = kernel.env.namespaces.get(&name).map_or(0, |namespace| namespace.bindings.len());
@@ -451,7 +565,21 @@ builtins! {
             "bash" => VmTrap::RunBash {
                 command: payload.require_string("bash", 1)?.into(),
             },
-            "model-call" => VmTrap::CallModel {
+"bash-start" => VmTrap::StartBash {
+    command: payload.require_string("bash/start", 1)?.into(),
+},
+"bash-status" => VmTrap::BashStatus {
+    id: JobId::new(payload.require_string("bash/status", 1)?),
+},
+"bash-cancel" => VmTrap::BashCancel {
+    id: JobId::new(payload.require_string("bash/cancel", 1)?),
+},
+"bash-collect" => VmTrap::BashCollect {
+    id: JobId::new(payload.require_string("bash/collect", 1)?),
+},
+"bash-list" if matches!(payload, Value::Nil) => VmTrap::BashList,
+"bash-list" => return Err("bash/list: payload must be nil".into()),
+"model-call" => VmTrap::CallModel {
                 prompt: payload.require_string("model/call", 1)?.into(),
             },
             "agent-call" => {
@@ -506,12 +634,4 @@ pub(crate) fn install(kernel: &mut Kernel) {
             BindingOrigin::Kernel,
         );
     }
-}
-
-pub(crate) fn signature() -> String {
-    Builtin::ALL
-        .iter()
-        .map(|builtin| format!("{}:{}", builtin.name(), builtin.arity()))
-        .collect::<Vec<_>>()
-        .join("\n")
 }

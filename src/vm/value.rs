@@ -156,12 +156,13 @@ impl fmt::Display for Value {
             Value::Nil => write!(f, "nil"),
             Value::Bool(b) => write!(f, "{}", if *b { "#t" } else { "#f" }),
             Value::Int(n) => write!(f, "{}", n),
-            Value::Float(n) => write!(f, "{}", n),
+            Value::Float(n) if n.fract() == 0.0 => write!(f, "{n:.1}"),
+            Value::Float(n) => write!(f, "{n}"),
             Value::String(s) => write!(f, "{:?}", s),
             Value::Symbol(s) => write!(f, "{}", s),
             Value::Keyword(k) => write!(f, ":{}", k),
             Value::List(items) => write_values(f, "(", items, ")"),
-            Value::Vector(items) => write_values(f, "#(", items, ")"),
+            Value::Vector(items) => write_values(f, "[", items, "]"),
             Value::Map(map) => {
                 write!(f, "{{")?;
                 let mut first = true;

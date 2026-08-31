@@ -4,6 +4,337 @@ use crate::vm::value::collect_captured_environments;
 use std::collections::HashSet;
 
 impl Kernel {
+    fn begin_eval_transaction(&mut self) {
+        self.env.begin_transaction();
+        self.deferred_hooks.clear();
+        self.active_hooks.clear();
+        self.eval_transaction = Some(EvalTransaction {
+            frame_id: self.frames.last().map(|frame| frame.id.clone()),
+            context_before: IndexMap::new(),
+            memory_before: IndexMap::new(),
+            hooks_before: None,
+            wake_len: self.wake_timers.len(),
+            history_len: self.history.len(),
+            next_event_id: self.next_event_id,
+        });
+    }
+
+    fn commit_eval_transaction(&mut self) {
+        self.env.commit_transaction();
+        self.eval_transaction = None;
+        self.deferred_hooks.clear();
+        self.active_hooks.clear();
+    }
+
+    fn rollback_eval_transaction(&mut self) {
+        self.env.rollback_transaction();
+        let Some(transaction) = self.eval_transaction.take() else {
+            return;
+        };
+        if let Some(frame_id) = transaction.frame_id
+            && let Some(frame) = self.frames.iter_mut().find(|frame| frame.id == frame_id)
+        {
+            for key in transaction.context_before.keys() {
+                frame
+                    .state
+                    .context_entries
+                    .retain(|entry| &entry.key != key);
+            }
+            let mut context: Vec<_> = transaction.context_before.into_values().flatten().collect();
+            context.sort_by_key(|(index, _)| *index);
+            for (index, entry) in context {
+                frame
+                    .state
+                    .context_entries
+                    .insert(index.min(frame.state.context_entries.len()), entry);
+            }
+
+            for id in transaction.memory_before.keys() {
+                frame.state.memory.retain(|entry| &entry.id != id);
+            }
+            let mut memory: Vec<_> = transaction.memory_before.into_values().flatten().collect();
+            memory.sort_by_key(|(index, _)| *index);
+            for (index, entry) in memory {
+                frame
+                    .state
+                    .memory
+                    .insert(index.min(frame.state.memory.len()), entry);
+            }
+            history::rebuild_memory_index(&frame.state.memory, &mut frame.state.memory_index);
+        }
+        if let Some(hooks) = transaction.hooks_before {
+            self.hooks = hooks;
+        }
+        self.wake_timers.truncate(transaction.wake_len);
+        self.history.truncate(transaction.history_len);
+        self.next_event_id = transaction.next_event_id;
+        self.deferred_hooks.clear();
+        self.active_hooks.clear();
+    }
+
+    fn note_context_before(&mut self, key: &str) {
+        let before = self.frames.last().and_then(|frame| {
+            frame
+                .state
+                .context_entries
+                .iter()
+                .position(|entry| entry.key == key)
+                .map(|index| (index, frame.state.context_entries[index].clone()))
+        });
+        if let Some(transaction) = &mut self.eval_transaction {
+            transaction
+                .context_before
+                .entry(key.into())
+                .or_insert(before);
+        }
+    }
+
+    fn note_memory_before(&mut self, id: &MemoryId) {
+        let before = self.frames.last().and_then(|frame| {
+            frame
+                .state
+                .memory
+                .iter()
+                .position(|entry| &entry.id == id)
+                .map(|index| (index, frame.state.memory[index].clone()))
+        });
+        if let Some(transaction) = &mut self.eval_transaction {
+            transaction
+                .memory_before
+                .entry(id.clone())
+                .or_insert(before);
+        }
+    }
+
+    fn note_hooks_before(&mut self) {
+        if let Some(transaction) = &mut self.eval_transaction
+            && transaction.hooks_before.is_none()
+        {
+            transaction.hooks_before = Some(self.hooks.clone());
+        }
+    }
+
+    pub(crate) fn inject_context(
+        &mut self,
+        key: String,
+        lifetime: ContextLifetime,
+        text: String,
+    ) -> bool {
+        self.note_context_before(&key);
+        let Some(frame) = self.frames.last_mut() else {
+            return false;
+        };
+        if let Some(entry) = frame
+            .state
+            .context_entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            entry.lifetime = lifetime;
+            entry.text = text;
+        } else {
+            frame.state.context_entries.push(ContextEntry {
+                key,
+                lifetime,
+                text,
+            });
+        }
+        true
+    }
+
+    pub(crate) fn remove_context(&mut self, key: &str) -> bool {
+        self.note_context_before(key);
+        let Some(frame) = self.frames.last_mut() else {
+            return false;
+        };
+        let before = frame.state.context_entries.len();
+        frame.state.context_entries.retain(|entry| entry.key != key);
+        before != frame.state.context_entries.len()
+    }
+
+    pub(crate) fn add_hook(&mut self, spec: HookSpec) {
+        self.note_hooks_before();
+        if let Some(existing) = self.hooks.iter_mut().find(|hook| hook.id == spec.id) {
+            *existing = spec;
+        } else {
+            self.hooks.push(spec);
+        }
+    }
+
+    pub(crate) fn remove_hook(&mut self, id: &str) -> bool {
+        self.note_hooks_before();
+        let before = self.hooks.len();
+        self.hooks.retain(|hook| hook.id != id);
+        before != self.hooks.len()
+    }
+
+    pub(crate) fn list_hooks(&self, target: Option<&str>) -> Vec<HookSpec> {
+        self.hooks
+            .iter()
+            .filter(|hook| target.is_none_or(|target| hook.target == target))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn hooks_for(&self, target: &str, phase: HookPhase) -> Vec<HookSpec> {
+        if target == "kernel/trap" || target.starts_with("hook/") || target.starts_with("context/")
+        {
+            return Vec::new();
+        }
+        self.hooks
+            .iter()
+            .filter(|hook| hook.target == target && hook.phase == phase)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn enter_hook(&mut self, id: &str) -> bool {
+        self.active_hooks.insert(id.into())
+    }
+
+    pub(crate) fn leave_hook(&mut self, id: &str) {
+        self.active_hooks.remove(id);
+    }
+
+    pub(crate) fn defer_hooks(&mut self, deferred: DeferredHook) {
+        self.deferred_hooks.push(deferred);
+    }
+
+    pub(crate) fn take_deferred_hooks(&mut self) -> Vec<DeferredHook> {
+        std::mem::take(&mut self.deferred_hooks)
+    }
+
+    pub(crate) fn clear_deferred_hooks(&mut self) {
+        self.deferred_hooks.clear();
+    }
+
+    pub(crate) fn run_stage(&mut self, target: &str, value: Value) -> Result<(), eval::EvalError> {
+        let target = Value::symbol(target);
+        let form = Value::list(vec![
+            Value::symbol("hook/run"),
+            Value::list(vec![Value::symbol("quote"), target]),
+            value,
+        ]);
+        let source = form.to_string();
+        self.eval_value(&source).map(drop)
+    }
+
+    pub(crate) fn record_event(
+        &mut self,
+        frame_id: Option<FrameId>,
+        kind: impl Into<String>,
+        text: impl Into<String>,
+        timestamp: String,
+    ) -> u64 {
+        let id = self.next_event_id;
+        self.next_event_id = id.checked_add(1).expect("history event sequence exhausted");
+        self.history.push(HistoryEvent {
+            id,
+            timestamp,
+            frame_id,
+            kind: kind.into(),
+            text: text.into(),
+        });
+        id
+    }
+
+    pub(crate) fn record_now(
+        &mut self,
+        frame_id: Option<FrameId>,
+        kind: impl Into<String>,
+        text: impl Into<String>,
+    ) -> u64 {
+        self.record_event(frame_id, kind, text, chrono::Utc::now().to_rfc3339())
+    }
+
+    pub(crate) fn remember(&mut self, key: String, value: String) -> MemoryId {
+        let frame_id = self.frames.last().map(|frame| frame.id.clone());
+        let now = chrono::Utc::now().to_rfc3339();
+        let existing = self.frames.last().and_then(|frame| {
+            frame
+                .state
+                .memory
+                .iter()
+                .find(|entry| entry.key == key)
+                .map(|entry| entry.id.clone())
+        });
+        let id =
+            existing.unwrap_or_else(|| MemoryId::new(format!("memory-{}", uuid::Uuid::new_v4())));
+        self.note_memory_before(&id);
+        if let Some(entry) = self
+            .frames
+            .last_mut()
+            .and_then(|frame| frame.state.memory.iter_mut().find(|entry| entry.id == id))
+        {
+            entry.value = value.clone();
+            entry.updated_at = now;
+        } else if let Some(frame) = self.frames.last_mut() {
+            frame.state.memory.push(MemoryEntry {
+                id: id.clone(),
+                key: key.clone(),
+                value: value.clone(),
+                updated_at: now,
+            });
+        }
+        if let Some(frame) = self.frames.last_mut() {
+            history::rebuild_memory_index(&frame.state.memory, &mut frame.state.memory_index);
+        }
+        self.record_now(frame_id, "memory", format!("remember {id} {key}: {value}"));
+        id
+    }
+
+    pub(crate) fn note_memory(&mut self, value: String) -> MemoryId {
+        let id = MemoryId::new(format!("memory-{}", uuid::Uuid::new_v4()));
+        let key = id.to_string();
+        self.remember(key, value)
+    }
+
+    pub(crate) fn forget_memory(&mut self, selector: &str) -> bool {
+        let frame_id = self.frames.last().map(|frame| frame.id.clone());
+        let Some(frame) = self.frames.last_mut() else {
+            return false;
+        };
+        let selected: Vec<_> = frame
+            .state
+            .memory
+            .iter()
+            .filter(|entry| entry.key == selector || entry.id.as_str() == selector)
+            .map(|entry| entry.id.clone())
+            .collect();
+        let _ = frame;
+        for id in &selected {
+            self.note_memory_before(id);
+        }
+        let frame = self.frames.last_mut().expect("active frame");
+        let before = frame.state.memory.len();
+        frame
+            .state
+            .memory
+            .retain(|entry| entry.key != selector && entry.id.as_str() != selector);
+        let removed = frame.state.memory.len() != before;
+        if removed {
+            history::rebuild_memory_index(&frame.state.memory, &mut frame.state.memory_index);
+            self.record_now(frame_id, "memory", format!("forget {selector}"));
+        }
+        removed
+    }
+
+    pub(crate) fn visible_memory(&self) -> Vec<&MemoryEntry> {
+        let Some(active) = self.frames.last() else {
+            return Vec::new();
+        };
+        let mut entries: Vec<_> = self
+            .frames
+            .first()
+            .into_iter()
+            .flat_map(|root| root.state.memory.iter())
+            .collect();
+        if self.frames.len() > 1 {
+            entries.extend(active.state.memory.iter());
+        }
+        entries
+    }
+
     pub fn snapshot_count(&self) -> u64 {
         self.storage.snapshot_count
     }
@@ -50,12 +381,7 @@ impl Kernel {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<EvalOutcome, eval::EvalError> {
-        let checkpoint = (
-            self.env.clone(),
-            self.frames.clone(),
-            self.wake_timers.clone(),
-            self.next_frame_id,
-        );
+        self.begin_eval_transaction();
         let previous_form = self.current_form.replace(CurrentForm {
             source: source.into(),
         });
@@ -67,17 +393,19 @@ impl Kernel {
         );
         self.current_form = previous_form;
         match result {
-            Ok(value) => Ok(EvalOutcome::Value(value)),
-            Err(eval::EvalError::Trap(operation)) => Ok(EvalOutcome::Trap(TrapRequest {
-                source: source.into(),
-                operation,
-            })),
+            Ok(value) => {
+                self.commit_eval_transaction();
+                Ok(EvalOutcome::Value(value))
+            }
+            Err(eval::EvalError::Trap(operation)) => {
+                self.commit_eval_transaction();
+                Ok(EvalOutcome::Trap(TrapRequest {
+                    source: source.into(),
+                    operation,
+                }))
+            }
             Err(error) => {
-                let (env, frames, wake_timers, next_frame_id) = checkpoint;
-                self.env = env;
-                self.frames = frames;
-                self.wake_timers = wake_timers;
-                self.next_frame_id = next_frame_id;
+                self.rollback_eval_transaction();
                 Err(error)
             }
         }
@@ -90,6 +418,21 @@ impl Kernel {
                 "external operation requires scheduler ownership".into(),
             )),
         }
+    }
+
+    pub(crate) fn traps_allowed(&self) -> bool {
+        self.trap_allowed
+    }
+
+    pub(crate) fn with_trap_permission<T>(
+        &mut self,
+        allowed: bool,
+        evaluate: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = std::mem::replace(&mut self.trap_allowed, allowed);
+        let result = evaluate(self);
+        self.trap_allowed = previous;
+        result
     }
 
     pub(crate) fn current_source(&self) -> Option<&str> {
@@ -127,6 +470,11 @@ impl Kernel {
             .checked_add(1)
             .ok_or(AllocationError::Exhausted("frame"))?;
         let id = FrameId::new(format!("frame-{sequence}"));
+        self.record_now(
+            self.frames.last().map(|frame| frame.id.clone()),
+            "agent-call",
+            format!("{name}: {request}"),
+        );
         self.frames.push(Frame {
             id: id.clone(),
             name: name.into(),
@@ -144,6 +492,7 @@ impl Kernel {
 
     pub(crate) fn return_from_subagent(&mut self) {
         if let Some(child) = self.frames.pop() {
+            self.record_now(Some(child.id.clone()), "agent-return", child.name.clone());
             for notice in &mut self.notices {
                 notice.target_frames.retain(|target| target != &child.id);
             }
@@ -206,6 +555,7 @@ impl Kernel {
         }
         let id = MessageId::new(format!("msg-{}", uuid::Uuid::new_v4()));
         let targets = self.frames.iter().map(|frame| frame.id.clone()).collect();
+        self.record_now(None, "human", text.to_owned());
         self.push_notice(
             Some(id.clone()),
             text.chars().take(8_000).collect(),
@@ -376,8 +726,39 @@ impl Kernel {
                     .ok_or_else(|| SnapshotError::Invalid("frame sequence is exhausted".into()))?,
             );
         }
+        let mut previous_event = 0_u64;
+        for event in &self.history {
+            if event.id <= previous_event {
+                return Err(SnapshotError::Invalid(
+                    "snapshot history events are not strictly ordered".into(),
+                ));
+            }
+            previous_event = event.id;
+        }
+        self.next_event_id =
+            self.next_event_id
+                .max(previous_event.checked_add(1).ok_or_else(|| {
+                    SnapshotError::Invalid("history event sequence is exhausted".into())
+                })?);
+        for frame in &mut self.frames {
+            history::rebuild_memory_index(&frame.state.memory, &mut frame.state.memory_index);
+        }
         self.definition_origin = BindingOrigin::Agent;
+        self.trap_allowed = false;
+        self.active_hooks.clear();
+        self.deferred_hooks.clear();
+        self.eval_transaction = None;
         Ok(())
+    }
+
+    pub(crate) fn collect_garbage(&mut self) {
+        self.collect_lexical_arena();
+    }
+
+    pub(crate) fn control_notice(&mut self, text: String) -> Result<u64, AllocationError> {
+        self.record_now(None, "control", text.clone());
+        let targets = self.frames.iter().map(|frame| frame.id.clone()).collect();
+        self.push_notice(None, text, targets)
     }
 
     pub(super) fn collect_lexical_arena(&mut self) {

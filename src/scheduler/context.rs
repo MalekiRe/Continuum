@@ -1,5 +1,5 @@
 use super::{MODEL_CONTEXT_LIMIT, ModelRequest};
-use crate::kernel::{CompactedContext, CompactedEntry, Kernel, TranscriptEntry};
+use crate::kernel::{Kernel, SpineNode, TranscriptEntry};
 use std::fmt::Write as _;
 
 const DIRECTIVE: &str = "\nEmit exactly one Lisp form. No prose, tags, or Markdown. Use (begin ...) only for synchronous Lisp operations. bash, model/call, agent/call, agent/return, human/wait, and message/reply must be the final action of an evaluation.\n";
@@ -59,7 +59,7 @@ pub(super) fn build_request(kernel: &Kernel) -> (ModelRequest, Option<u64>) {
     };
     let mut builder =
         ContextBuilder::new(MODEL_CONTEXT_LIMIT.saturating_sub(system.len() + DIRECTIVE.len()));
-    let (notices, watermark) = render_notices(kernel);
+    let (notices, watermark) = render_notices(kernel, 12_000);
     let sections = [
         Section {
             heading: "Current human messages and notices",
@@ -72,7 +72,7 @@ pub(super) fn build_request(kernel: &Kernel) -> (ModelRequest, Option<u64>) {
             budget: 4_000,
         },
         Section {
-            heading: "Context hooks and selected memory",
+            heading: "Context injections and selected memory",
             body: render_guidance(kernel),
             budget: 12_000,
         },
@@ -82,8 +82,8 @@ pub(super) fn build_request(kernel: &Kernel) -> (ModelRequest, Option<u64>) {
             budget: 24_000,
         },
         Section {
-            heading: "Earlier compacted context",
-            body: render_compacted(&frame.state.compacted_context, 6_000),
+            heading: "Chronological history spine",
+            body: crate::kernel::history::render_spine(&frame.state.spine, 8_000),
             budget: 6_000,
         },
         Section {
@@ -104,13 +104,11 @@ pub(super) fn build_request(kernel: &Kernel) -> (ModelRequest, Option<u64>) {
     )
 }
 
-fn render_notices(kernel: &Kernel) -> (String, Option<u64>) {
+fn render_notices(kernel: &Kernel, budget: usize) -> (String, Option<u64>) {
     let frame = kernel.frames.last().expect("active frame");
-    let notices = kernel.notices_for_frame(&frame.id);
     let mut output = String::new();
-    for (index, notice) in notices.iter().enumerate() {
-        let slots = notices.len() - index;
-        let allowance = (12_000usize.saturating_sub(output.len()) / slots).max(1);
+    let mut watermark = None;
+    for notice in kernel.notices_for_frame(&frame.id) {
         let heading = match (&notice.id, notice.handled) {
             (Some(id), false) => format!("- Human message [{id}]: "),
             (Some(id), true) => format!(
@@ -118,12 +116,16 @@ fn render_notices(kernel: &Kernel) -> (String, Option<u64>) {
             ),
             (None, _) => "- ".into(),
         };
-        let body = truncate(&notice.text, allowance.saturating_sub(heading.len() + 1));
+        let remaining = budget.saturating_sub(output.len());
+        if remaining <= heading.len() + 1 {
+            break;
+        }
+        let body = truncate(&notice.text, remaining - heading.len() - 1);
         let _ = writeln!(output, "{heading}{body}");
+        watermark = Some(notice.sequence);
     }
-    (output, notices.last().map(|notice| notice.sequence))
+    (output, watermark)
 }
-
 fn render_stack(kernel: &Kernel) -> String {
     let mut output = String::new();
     let active = kernel.frames.len().saturating_sub(1);
@@ -143,16 +145,28 @@ fn render_stack(kernel: &Kernel) -> String {
 fn render_guidance(kernel: &Kernel) -> String {
     let frame = kernel.frames.last().expect("active frame");
     let mut output = String::new();
-    for hook in &frame.state.context_hooks {
-        let _ = writeln!(output, "Hook: {}", truncate(hook, 2_000));
-    }
-    for memory in &frame.state.memory {
+    for entry in &frame.state.context_entries {
         let _ = writeln!(
             output,
-            "{}: {}",
-            truncate(&memory.key, 200),
-            truncate(&memory.value, 1_000)
+            "{} [{:?}]: {}",
+            truncate(&entry.key, 200),
+            entry.lifetime,
+            truncate(&entry.text, 2_000)
         );
+    }
+    if let Some(root) = kernel.frames.first() {
+        output.push_str(&crate::kernel::history::render_memory(
+            &root.state.memory,
+            &root.state.memory_index,
+            8_000,
+        ));
+    }
+    if kernel.frames.len() > 1 {
+        output.push_str(&crate::kernel::history::render_memory(
+            &frame.state.memory,
+            &frame.state.memory_index,
+            4_000,
+        ));
     }
     output
 }
@@ -214,29 +228,8 @@ fn render_transcript(entries: &[TranscriptEntry], budget: usize) -> String {
     .0
 }
 
-fn render_compacted(context: &CompactedContext, budget: usize) -> String {
-    let (body, shown) = render_recent(
-        context.entries.iter(),
-        budget,
-        |entry| {
-            format!(
-                "[{}] {} => {}\n",
-                entry.timestamp, entry.source, entry.result
-            )
-        },
-        false,
-    );
-    let omitted = context.omitted_turns
-        + u64::try_from(context.entries.len().saturating_sub(shown)).unwrap_or(u64::MAX);
-    if omitted == 0 {
-        return body;
-    }
-    format!("[{omitted} older turns omitted]\n{body}")
-}
-
 pub(super) fn compact_current_frame(kernel: &mut Kernel) {
     const RECENT_BUDGET: usize = 24_000;
-    const COMPACTED_BUDGET: usize = 32_000;
     let Some(frame) = kernel.frames.last_mut() else {
         return;
     };
@@ -245,24 +238,17 @@ pub(super) fn compact_current_frame(kernel: &mut Kernel) {
     while recent > RECENT_BUDGET && frame.state.transcript.len() > 1 {
         let entry = frame.state.transcript.remove(0);
         recent = recent.saturating_sub(size(&entry));
-        frame
-            .state
-            .compacted_context
-            .entries
-            .push_back(CompactedEntry {
-                timestamp: entry.timestamp,
-                source: truncate(&entry.source, 240),
-                result: truncate(&entry.result, 480),
-            });
-    }
-    while frame.state.compacted_context.rendered_len() > COMPACTED_BUDGET {
-        if frame.state.compacted_context.entries.pop_front().is_none() {
-            break;
-        }
-        frame.state.compacted_context.omitted_turns += 1;
+        crate::kernel::history::push_spine(
+            &mut frame.state.spine,
+            SpineNode {
+                level: 0,
+                first_event: entry.event_id,
+                last_event: entry.event_id,
+                summary: truncate(&format!("{} => {}", entry.source, entry.result), 720),
+            },
+        );
     }
 }
-
 pub(super) fn truncate(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.into();

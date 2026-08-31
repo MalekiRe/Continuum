@@ -1,7 +1,10 @@
 mod context;
+mod control;
+pub use control::{ControlDecision, ControlReply, ControlTrigger};
 
 use crate::executor::{ExecutionResult, Executor, ExecutorError};
 use crate::ids::{FrameId, MessageId};
+use crate::jobs::{JobError, JobManager};
 use crate::kernel::{AllocationError, EvalOutcome, Kernel, MessageError, TrapRequest, VmTrap};
 use crate::vm::reader::{self, ReadError};
 use async_trait::async_trait;
@@ -20,26 +23,24 @@ const MODEL_CONTEXT_LIMIT: usize = 62_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
-    #[error("model request interrupted by human input")]
+    #[error("model request interrupted by control input")]
     Cancelled,
-    #[error("OPENROUTER_API_KEY is not set")]
-    MissingApiKey,
-    #[error("model request: {0}")]
+    #[error("local model request: {0}")]
     Request(#[source] reqwest::Error),
-    #[error("model response body: {0}")]
+    #[error("local model response body: {0}")]
     ResponseBody(#[source] reqwest::Error),
-    #[error("model HTTP {status} returned invalid JSON: {source}")]
+    #[error("local model HTTP {status} returned invalid JSON: {source}")]
     InvalidJson {
         status: reqwest::StatusCode,
         #[source]
         source: serde_json::Error,
     },
-    #[error("model HTTP {status}: {message}")]
+    #[error("local model HTTP {status}: {message}")]
     Http {
         status: reqwest::StatusCode,
         message: String,
     },
-    #[error("model response contained no content")]
+    #[error("local model response contained no content")]
     MissingContent,
     #[error("{0}")]
     Client(String),
@@ -54,7 +55,11 @@ pub enum SchedulerError {
     Message(#[from] MessageError),
     #[error(transparent)]
     Allocation(#[from] AllocationError),
-    #[error("Lisp evaluation interrupted by human input")]
+    #[error(transparent)]
+    Job(#[from] JobError),
+    #[error("control error: {0}")]
+    Control(String),
+    #[error("Lisp evaluation interrupted by control input")]
     EvaluationInterrupted,
     #[error("scheduler invariant violated: {0}")]
     Invariant(&'static str),
@@ -79,45 +84,34 @@ pub trait ModelClient: Send + Sync {
     ) -> Result<String, ModelError>;
 }
 
+/// Minimal local model protocol.
+///
+/// POST `{system, context}` and return either `{content}` or an
+/// OpenAI-compatible response containing `choices[0].message.content`.
 #[derive(Debug, Clone)]
-pub struct OpenRouterModel {
-    pub model: String,
-    pub max_tokens: u32,
-    pub timeout: std::time::Duration,
+pub struct LocalModel {
+    pub endpoint: String,
     client: reqwest::Client,
 }
 
-impl Default for OpenRouterModel {
+impl Default for LocalModel {
     fn default() -> Self {
         Self {
-            model: std::env::var("CONTINUUM_MODEL")
-                .unwrap_or_else(|_| "deepseek/deepseek-v4-flash".into()),
-            max_tokens: 600,
-            timeout: std::time::Duration::from_secs(60),
+            endpoint: std::env::var("CONTINUUM_MODEL_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8081/generate".into()),
             client: reqwest::Client::new(),
         }
     }
 }
 
-impl OpenRouterModel {
-    async fn openrouter_request(
-        &self,
-        api_key: String,
-        request: ModelRequest,
-    ) -> Result<String, ModelError> {
+impl LocalModel {
+    async fn request(&self, request: ModelRequest) -> Result<String, ModelError> {
         let response = self
             .client
-            .post("https://openrouter.ai/api/v1/chat/completions")
-            .timeout(self.timeout)
-            .bearer_auth(api_key)
+            .post(&self.endpoint)
             .json(&serde_json::json!({
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": request.system},
-                    {"role": "user", "content": request.context}
-                ],
-                "max_tokens": self.max_tokens,
-                "temperature": 0.4
+                "system": request.system,
+                "context": request.context,
             }))
             .send()
             .await
@@ -129,20 +123,22 @@ impl OpenRouterModel {
         if !status.is_success() {
             let message = body
                 .pointer("/error/message")
-                .and_then(|value| value.as_str())
+                .or_else(|| body.get("error"))
+                .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown error")
-                .to_string();
+                .to_owned();
             return Err(ModelError::Http { status, message });
         }
-        body.pointer("/choices/0/message/content")
-            .and_then(|value| value.as_str())
+        body.get("content")
+            .or_else(|| body.pointer("/choices/0/message/content"))
+            .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .ok_or(ModelError::MissingContent)
     }
 }
 
 #[async_trait]
-impl ModelClient for OpenRouterModel {
+impl ModelClient for LocalModel {
     async fn complete(
         &self,
         request: ModelRequest,
@@ -151,11 +147,10 @@ impl ModelClient for OpenRouterModel {
         if cancellation.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
-        let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| ModelError::MissingApiKey)?;
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(ModelError::Cancelled),
-            result = self.openrouter_request(api_key, request) => result,
+            result = self.request(request) => result,
         }
     }
 }
@@ -275,6 +270,11 @@ pub enum TurnOutcome {
         message_id: MessageId,
         text: String,
     },
+    Cancelled {
+        frame_id: FrameId,
+        reason: String,
+    },
+    Shutdown,
     Idle,
 }
 
@@ -282,19 +282,30 @@ pub struct Scheduler<M: ModelClient> {
     model: M,
     model_runtime: ModelRuntime,
     executor: Executor,
+    jobs: JobManager,
+    control_executor: Executor,
 }
 
 impl<M: ModelClient> Scheduler<M> {
     pub fn new(model: M, executor: Executor) -> Self {
+        let control_executor = executor
+            .independent()
+            .expect("control executor must share a valid workspace");
         Self {
             model,
             model_runtime: ModelRuntime::default(),
+            jobs: JobManager::new(executor.clone()),
+            control_executor,
             executor,
         }
     }
 
     pub fn model_interrupt_handle(&self) -> ModelInterruptHandle {
         self.model_runtime.interrupt_handle()
+    }
+
+    pub fn cancel_background_jobs(&self) -> Result<(), JobError> {
+        self.jobs.cancel_all()
     }
 
     async fn complete_model(&self, request: ModelRequest) -> Result<String, ModelError> {
@@ -327,12 +338,18 @@ impl<M: ModelClient> Scheduler<M> {
                 .waiting_for_human = false;
         }
 
+        kernel
+            .run_stage("stage/before-context", crate::vm::value::Value::Nil)
+            .map_err(|error| SchedulerError::Control(error.to_string()))?;
         context::compact_current_frame(kernel);
         let (request, notice_watermark) = context::build_request(kernel);
         let raw = self.complete_model(request).await?;
-        if let Some(watermark) = notice_watermark {
-            kernel.mark_notices_seen_through(&frame_id, watermark);
-        }
+        kernel
+            .run_stage(
+                "stage/after-generation",
+                crate::vm::value::Value::string(&raw),
+            )
+            .map_err(|error| SchedulerError::Control(error.to_string()))?;
         let source = match normalize_one_form(&raw) {
             Ok(source) => source,
             Err(error) => {
@@ -347,6 +364,15 @@ impl<M: ModelClient> Scheduler<M> {
         };
         if self.model_runtime.take_pending() {
             return Err(ModelError::Cancelled.into());
+        }
+        if let Some(watermark) = notice_watermark {
+            kernel.mark_notices_seen_through(&frame_id, watermark);
+        }
+        if let Some(frame) = kernel.frames.last_mut() {
+            frame
+                .state
+                .context_entries
+                .retain(|entry| entry.lifetime == crate::kernel::ContextLifetime::Frame);
         }
         let outcome = match kernel.eval(&source) {
             Ok(outcome) => outcome,
@@ -391,6 +417,55 @@ impl<M: ModelClient> Scheduler<M> {
                         kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
                     })?;
                 let result = format_execution(&execution);
+                kernel.append_transcript_to(&frame_id, &source, &result);
+                Ok(TurnOutcome::ToolCompleted {
+                    frame_id,
+                    source,
+                    result,
+                })
+            }
+            VmTrap::StartBash { command } => {
+                let id = self.jobs.start(command)?;
+                let result = id.to_string();
+                kernel.append_transcript_to(&frame_id, &source, &result);
+                Ok(TurnOutcome::ToolCompleted {
+                    frame_id,
+                    source,
+                    result,
+                })
+            }
+            VmTrap::BashStatus { id } => {
+                let result = serde_json::to_string(&self.jobs.status(&id)?)
+                    .map_err(|_| SchedulerError::Invariant("cannot serialize job status"))?;
+                kernel.append_transcript_to(&frame_id, &source, &result);
+                Ok(TurnOutcome::ToolCompleted {
+                    frame_id,
+                    source,
+                    result,
+                })
+            }
+            VmTrap::BashCancel { id } => {
+                let result = self.jobs.cancel(&id)?.to_string();
+                kernel.append_transcript_to(&frame_id, &source, &result);
+                Ok(TurnOutcome::ToolCompleted {
+                    frame_id,
+                    source,
+                    result,
+                })
+            }
+            VmTrap::BashCollect { id } => {
+                let result = serde_json::to_string(&self.jobs.collect(&id)?)
+                    .map_err(|_| SchedulerError::Invariant("cannot serialize job result"))?;
+                kernel.append_transcript_to(&frame_id, &source, &result);
+                Ok(TurnOutcome::ToolCompleted {
+                    frame_id,
+                    source,
+                    result,
+                })
+            }
+            VmTrap::BashList => {
+                let result = serde_json::to_string(&self.jobs.list())
+                    .map_err(|_| SchedulerError::Invariant("cannot serialize job list"))?;
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 Ok(TurnOutcome::ToolCompleted {
                     frame_id,
@@ -479,4 +554,9 @@ pub fn normalize_one_form(raw: &str) -> Result<String, NormalizeError> {
 fn format_execution(result: &ExecutionResult) -> String {
     serde_json::to_string(result)
         .unwrap_or_else(|_| "{\"error\":\"cannot serialize execution result\"}".into())
+}
+
+#[doc(hidden)]
+pub fn compact_for_test(kernel: &mut Kernel) {
+    context::compact_current_frame(kernel);
 }

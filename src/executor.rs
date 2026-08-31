@@ -55,7 +55,7 @@ pub enum ExecutorError {
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub working_directory: PathBuf,
-    pub timeout: Duration,
+    pub timeout: Option<Duration>,
     pub output_limit: usize,
 }
 
@@ -63,7 +63,7 @@ impl ExecutorConfig {
     pub fn with_working_directory(working_directory: impl Into<PathBuf>) -> Self {
         Self {
             working_directory: working_directory.into(),
-            timeout: Duration::from_secs(60),
+            timeout: None,
             output_limit: DEFAULT_OUTPUT_LIMIT,
         }
     }
@@ -194,10 +194,14 @@ impl Executor {
         self.run_with_timeout(command, self.config.timeout)
     }
 
+    pub fn independent(&self) -> Result<Self, ExecutorError> {
+        Self::new(self.config.clone())
+    }
+
     pub fn run_with_timeout(
         &self,
         command: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<ExecutionResult, ExecutorError> {
         let started = Instant::now();
         let stdout_progress = Arc::new(AtomicU64::new(0));
@@ -253,7 +257,7 @@ impl Executor {
             if self.active_cancelled() {
                 break (ExecutionOutcome::Cancelled, None);
             }
-            if started.elapsed() >= timeout {
+            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
                 break (ExecutionOutcome::TimedOut, None);
             }
             match run_guard

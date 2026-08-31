@@ -25,6 +25,8 @@ macro_rules! string_id {
 }
 
 string_id!(FrameId);
+string_id!(JobId);
 string_id!(MessageId);
+string_id!(MemoryId);
 string_id!(QualifiedName);
 string_id!(SnapshotId);

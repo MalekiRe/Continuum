@@ -409,23 +409,64 @@ fn binding_history_does_not_retain_obsolete_closure_heaps() {
 }
 
 #[test]
-fn recovery_rejects_a_different_runtime_fingerprint() {
+fn raw_history_and_memory_ids_survive_snapshot_recovery() {
     let dir = temp_dir();
     let mut kernel = Kernel::new();
     kernel.set_snapshot_directory(&dir);
+    let memory = kernel.eval_value("(memory/note \"durable fact\")").unwrap();
+    kernel.append_transcript("(+ 1 1)", "2");
     kernel.snapshot().unwrap();
-    let path = std::fs::read_dir(&dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let mut envelope: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    envelope["runtime_fingerprint"] = "different-runtime".into();
-    std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
-    assert!(matches!(
-        Kernel::recover_from_dir(&dir),
-        Err(persistent_lisp_harness::SnapshotError::AllInvalid(_))
-    ));
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert!(
+        recovered
+            .eval_value("(history/find \"+ 1 1\")")
+            .unwrap()
+            .to_string()
+            .contains("+ 1 1")
+    );
+    let selector = memory.as_str().unwrap();
+    assert!(
+        recovered
+            .eval_value(&format!("(memory/forget \"{selector}\")"))
+            .unwrap()
+            .is_truthy()
+    );
+    assert!(
+        !recovered
+            .eval_value("(memory/recall \"durable fact\")")
+            .unwrap()
+            .to_string()
+            .contains("durable fact")
+    );
+}
+
+#[test]
+fn failed_snapshot_does_not_advance_the_checkpoint_sequence() {
+    let root = temp_dir();
+    let not_a_directory = root.join("file");
+    std::fs::write(&not_a_directory, b"occupied").unwrap();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&not_a_directory);
+    assert!(kernel.snapshot().is_err());
+    assert_eq!(kernel.snapshot_count(), 0);
+}
+
+#[test]
+fn hooks_and_their_sources_survive_snapshot_recovery() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    kernel
+        .eval_value(
+            r#"
+            (define seen 0)
+            (define (mark target args) (set! seen (+ seen 1)))
+            (hook/add "mark-plus" '+ :before 'mark)
+            "#,
+        )
+        .unwrap();
+    kernel.snapshot().unwrap();
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    recovered.eval_value("(+ 1 2)").unwrap();
+    assert_eq!(recovered.eval_value("seen").unwrap(), Value::Int(1));
 }

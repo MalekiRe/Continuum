@@ -275,6 +275,7 @@ fn read_atom(input: &str) -> Result<(Value, &str), ReadError> {
     }
     if (raw.contains('.') || raw.contains('e') || raw.contains('E'))
         && let Ok(value) = raw.parse::<f64>()
+        && value.is_finite()
     {
         return Ok((Value::Float(value), rest));
     }

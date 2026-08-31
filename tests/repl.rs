@@ -743,3 +743,170 @@ fn set_mutates_state_without_creating_definition_history() {
     );
     assert_eq!(kernel.eval_value("counter").unwrap(), Value::Int(1));
 }
+
+#[test]
+fn printed_vectors_and_integral_floats_round_trip() {
+    let mut kernel = Kernel::new();
+    for source in ["[1 2 3]", "1.0", "[1.0 :x \"y\"]"] {
+        let value = kernel.eval_value(source).unwrap();
+        assert_eq!(kernel.eval_value(&value.to_string()).unwrap(), value);
+    }
+    assert!(kernel.eval_value("1e9999").is_err());
+}
+
+#[test]
+fn traps_are_only_allowed_as_the_final_action() {
+    let mut kernel = Kernel::new();
+    assert!(kernel.eval("(define x (bash \"true\"))").is_err());
+    assert!(kernel.eval("(set! x (bash \"true\"))").is_err());
+    assert!(kernel.eval("(bash \"true\") (define x 1)").is_err());
+    assert!(matches!(
+        kernel.eval("(match :run (:run (bash \"true\")))").unwrap(),
+        persistent_lisp_harness::EvalOutcome::Trap(_)
+    ));
+}
+
+#[test]
+fn multi_expression_tail_recursion_is_constant_stack() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval_value("(define (count n) nil (if (= n 0) n (count (- n 1))))")
+        .unwrap();
+    assert_eq!(kernel.eval_value("(count 50000)").unwrap(), Value::Int(0));
+}
+
+#[test]
+fn lisp_evaluation_can_pause_and_resume_without_unwinding() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut kernel = Kernel::new();
+    let handle = kernel.eval_interrupt_handle();
+    let (send, receive) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = kernel
+            .eval_value("(begin (define (loop n) (if (= n 100000) n (loop (+ n 1)))) (loop 0))");
+        send.send(result).unwrap();
+    });
+    while !handle.is_running() {
+        std::thread::yield_now();
+    }
+    assert!(handle.request_pause());
+    assert!(handle.wait_until_paused(Duration::from_secs(2)));
+    assert!(receive.recv_timeout(Duration::from_millis(20)).is_err());
+    handle.resume();
+    assert_eq!(
+        receive
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        Value::Int(100_000)
+    );
+}
+
+#[test]
+fn hooks_wrap_native_and_interpreted_named_calls_in_order() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval_value(
+            r#"
+            (define hook/log "")
+            (define (hook/before target args)
+              (set! hook/log (string-append hook/log "B")))
+            (define (hook/after target args result)
+              (set! hook/log (string-append hook/log "A")))
+            (define (twice x) (* x 2))
+            (hook/add "before-plus" '+ :before 'hook/before)
+            (hook/add "after-plus" '+ :after 'hook/after)
+            (hook/add "before-twice" 'twice :before 'hook/before)
+            (hook/add "after-twice" 'twice :after 'hook/after)
+            "#,
+        )
+        .unwrap();
+    assert_eq!(kernel.eval_value("(+ 1 2)").unwrap(), Value::Int(3));
+    assert_eq!(kernel.eval_value("(twice 4)").unwrap(), Value::Int(8));
+    assert_eq!(
+        kernel.eval_value("hook/log").unwrap(),
+        Value::string("BABA")
+    );
+}
+
+#[test]
+fn hook_self_recursion_is_suppressed_and_faults_roll_back_everything() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval_value(
+            r#"
+            (define count 0)
+            (define (recursive target args)
+              (set! count (+ count 1)))
+            (hook/add "recursive" '+ :before 'recursive)
+            "#,
+        )
+        .unwrap();
+    assert_eq!(kernel.eval_value("(+ 1 2)").unwrap(), Value::Int(3));
+    assert_eq!(kernel.eval_value("count").unwrap(), Value::Int(1));
+
+    kernel
+        .eval_value(
+            r#"
+            (define stable 0)
+            (define (broken target args)
+              (set! stable 99)
+              (memory/note "should roll back")
+              (context/inject "bad" :frame "bad")
+              (wake 1000 "bad")
+              (kernel/error "hook failed"))
+            (hook/add "broken" '* :before 'broken)
+            "#,
+        )
+        .unwrap();
+    assert!(
+        kernel
+            .eval_value("(begin (define ghost 1) (* 2 3))")
+            .is_err()
+    );
+    assert_eq!(kernel.eval_value("stable").unwrap(), Value::Int(0));
+    assert!(kernel.eval_value("ghost").is_err());
+    assert_eq!(kernel.wake_timer_count(), 0);
+    assert_eq!(
+        kernel
+            .eval_value("(memory/recall \"should roll back\")")
+            .unwrap(),
+        Value::List(Vec::new())
+    );
+    assert_eq!(
+        kernel.eval_value("(context/list)").unwrap(),
+        Value::List(Vec::new())
+    );
+    assert_eq!(
+        kernel
+            .eval_value("(history/find \"should roll back\")")
+            .unwrap(),
+        Value::List(Vec::new())
+    );
+}
+
+#[test]
+fn after_hook_runs_before_a_final_trap_is_scheduled() {
+    let mut kernel = Kernel::new();
+    kernel
+        .eval_value(
+            r#"
+            (define (after-bash target args result)
+              (memory/remember "bash-result" result))
+            (hook/add "after-bash" 'bash :after 'after-bash)
+            "#,
+        )
+        .unwrap();
+    assert!(matches!(
+        kernel.eval("(bash \"true\")").unwrap(),
+        persistent_lisp_harness::EvalOutcome::Trap(_)
+    ));
+    assert!(
+        kernel
+            .eval_value("(memory/recall \"scheduled\")")
+            .unwrap()
+            .to_string()
+            .contains("scheduled")
+    );
+}
