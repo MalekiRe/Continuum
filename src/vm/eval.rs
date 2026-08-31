@@ -1,43 +1,40 @@
 use crate::kernel::Kernel;
 use crate::vm::env::{DataFamily, DataVariant, EnvRef};
-use crate::vm::reader;
 use crate::vm::value::*;
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const RUNNING: u8 = 1;
+const PENDING: u8 = 2;
 
 #[derive(Clone, Debug, Default)]
-pub struct EvalControl {
-    cancelled: Arc<AtomicBool>,
-    state: Arc<std::sync::Mutex<EvalState>>,
+pub(crate) struct EvalControl {
+    state: Arc<std::sync::atomic::AtomicU8>,
     turns: Arc<AtomicU64>,
-}
-
-#[derive(Debug, Default)]
-struct EvalState {
-    running: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct EvalInterruptHandle(EvalControl);
 
 impl EvalControl {
-    pub fn interrupt_handle(&self) -> EvalInterruptHandle {
+    pub(crate) fn interrupt_handle(&self) -> EvalInterruptHandle {
         EvalInterruptHandle(self.clone())
     }
 
-    pub fn begin(&self) -> EvalRunGuard {
-        self.state.lock().unwrap().running = true;
+    pub(crate) fn begin(&self) -> EvalRunGuard {
+        self.state.fetch_or(RUNNING, Ordering::AcqRel);
         EvalRunGuard {
             control: self.clone(),
             finished: false,
         }
     }
 
-    pub fn check_safepoint(&self) -> Result<(), EvalError> {
+    pub(crate) fn check_safepoint(&self) -> Result<(), EvalError> {
         let count = self.turns.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(SAFEPOINT_INTERVAL) && self.cancelled.swap(false, Ordering::AcqRel)
+        if count.is_multiple_of(SAFEPOINT_INTERVAL)
+            && self.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0
         {
             return Err(EvalError::Interrupted);
         }
@@ -47,35 +44,37 @@ impl EvalControl {
 
 impl EvalInterruptHandle {
     pub fn request_interrupt(&self) -> bool {
-        let state = self.0.state.lock().unwrap();
-        self.0.cancelled.store(true, Ordering::Release);
-        state.running
+        self.0.state.fetch_or(PENDING, Ordering::AcqRel) & RUNNING != 0
     }
 
     pub fn clear_pending(&self) {
-        let state = self.0.state.lock().unwrap();
-        if !state.running {
-            self.0.cancelled.store(false, Ordering::Release);
-        }
+        let _ = self
+            .0
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & RUNNING == 0).then_some(state & !PENDING)
+            });
     }
 
     pub fn is_running(&self) -> bool {
-        self.0.state.lock().unwrap().running
+        self.0.state.load(Ordering::Acquire) & RUNNING != 0
     }
 }
 
-pub struct EvalRunGuard {
+pub(crate) struct EvalRunGuard {
     control: EvalControl,
     finished: bool,
 }
 
 impl EvalRunGuard {
-    pub fn finish<T>(mut self, result: Result<T, EvalError>) -> Result<T, EvalError> {
-        let mut state = self.control.state.lock().unwrap();
-        let interrupted = self.control.cancelled.swap(false, Ordering::AcqRel);
-        state.running = false;
+    pub(crate) fn finish<T>(mut self, result: Result<T, EvalError>) -> Result<T, EvalError> {
+        let interrupted = self
+            .control
+            .state
+            .fetch_and(!(RUNNING | PENDING), Ordering::AcqRel)
+            & PENDING
+            != 0;
         self.finished = true;
-        drop(state);
         if interrupted && result.is_ok() {
             Err(EvalError::Interrupted)
         } else {
@@ -86,10 +85,9 @@ impl EvalRunGuard {
 
 impl Drop for EvalRunGuard {
     fn drop(&mut self) {
-        if self.finished {
-            return;
+        if !self.finished {
+            self.control.state.fetch_and(!RUNNING, Ordering::AcqRel);
         }
-        self.control.state.lock().unwrap().running = false;
     }
 }
 
@@ -99,7 +97,7 @@ pub const SAFEPOINT_INTERVAL: u64 = 1000;
 /// Result of a single evaluation step.
 /// Step(expr) means evaluate expr next (tail call).
 /// Done(val) means evaluation completed.
-pub enum StepResult {
+enum StepResult {
     Done(Value),
     Step(Value),
 }
@@ -146,7 +144,10 @@ fn eval_step(value: Value, kernel: &mut Kernel) -> Result<StepResult, EvalError>
 }
 
 pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
-    let exprs = reader::read_all(input).map_err(|e| EvalError::SyntaxError(e.to_string()))?;
+    kernel.eval(input)
+}
+
+pub(crate) fn eval_forms(exprs: Vec<Value>, kernel: &mut Kernel) -> Result<Value, EvalError> {
     let mut result = Value::Nil;
     for expr in exprs {
         // Tail-call trampoline steps may move the active arena cursor.
@@ -281,7 +282,7 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
                 format!("user/{}", name)
             };
             let retained = if kernel.current_form_is("define") {
-                kernel.current_source.clone().unwrap_or_default()
+                kernel.current_source().unwrap_or_default().to_owned()
             } else {
                 format!("(define {} {})", name, args[1])
             };
@@ -326,7 +327,10 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
                     .join(" ")
             );
             let retained = if kernel.current_form_is("define") {
-                kernel.current_source.clone().unwrap_or(reconstructed)
+                kernel
+                    .current_source()
+                    .map(str::to_owned)
+                    .unwrap_or(reconstructed)
             } else {
                 reconstructed
             };
@@ -491,14 +495,15 @@ fn parse_bindings(value: &Value, form: &str) -> Result<Vec<(String, Value)>, Eva
         .collect()
 }
 
-fn finish_scoped_body(
-    body: &[Value],
+fn eval_in_new_frame(
     kernel: &mut Kernel,
-    tail_pos: bool,
+    evaluate: impl FnOnce(&mut Kernel) -> Result<Value, EvalError>,
 ) -> Result<Value, EvalError> {
-    let result = eval_begin_tail(body, kernel, tail_pos);
+    let caller = kernel.env.current_environment();
+    kernel.env.push_frame();
+    let result = evaluate(kernel);
     if !matches!(result, Err(EvalError::TailCall(_))) {
-        kernel.env.pop_frame();
+        kernel.env.activate_environment(caller)?;
     }
     result
 }
@@ -514,11 +519,12 @@ fn eval_let_tail(args: &[Value], kernel: &mut Kernel, tail_pos: bool) -> Result<
         .iter()
         .map(|(_, expr)| eval_value_inner(expr.clone(), kernel, false))
         .collect::<Result<Vec<_>, _>>()?;
-    kernel.env.push_frame();
-    for ((name, _), value) in bindings.into_iter().zip(values) {
-        kernel.env.set_lexical(&name, value);
-    }
-    finish_scoped_body(&args[1..], kernel, tail_pos)
+    eval_in_new_frame(kernel, |kernel| {
+        for ((name, _), value) in bindings.into_iter().zip(values) {
+            kernel.env.set_lexical(&name, value);
+        }
+        eval_begin_tail(&args[1..], kernel, tail_pos)
+    })
 }
 
 fn eval_let_star_tail(
@@ -531,17 +537,13 @@ fn eval_let_star_tail(
             .ok_or_else(|| EvalError::InvalidForm("let* requires bindings and body".into()))?,
         "let*",
     )?;
-    kernel.env.push_frame();
-    for (name, expr) in bindings {
-        match eval_value_inner(expr, kernel, false) {
-            Ok(value) => kernel.env.set_lexical(&name, value),
-            Err(error) => {
-                kernel.env.pop_frame();
-                return Err(error);
-            }
+    eval_in_new_frame(kernel, |kernel| {
+        for (name, expr) in bindings {
+            let value = eval_value_inner(expr, kernel, false)?;
+            kernel.env.set_lexical(&name, value);
         }
-    }
-    finish_scoped_body(&args[1..], kernel, tail_pos)
+        eval_begin_tail(&args[1..], kernel, tail_pos)
+    })
 }
 
 fn eval_letrec_tail(
@@ -549,64 +551,40 @@ fn eval_letrec_tail(
     kernel: &mut Kernel,
     tail_pos: bool,
 ) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::InvalidForm(
-            "letrec requires bindings and body".into(),
-        ));
-    }
-
-    let bindings = match &args[0] {
-        Value::List(items) => items,
-        _ => {
-            return Err(EvalError::InvalidForm(
-                "letrec: expected binding list".into(),
-            ));
-        }
+    let Some(Value::List(raw_bindings)) = args.first() else {
+        return Err(EvalError::InvalidForm(if args.is_empty() {
+            "letrec requires bindings and body".into()
+        } else {
+            "letrec: expected binding list".into()
+        }));
     };
-
-    kernel.env.push_frame();
-    for binding in bindings {
-        match binding {
-            Value::List(items) if items.len() == 2 => {
-                let name = match &items[0] {
-                    Value::Symbol(s) => s.clone(),
-                    other => {
-                        return Err(EvalError::InvalidForm(format!(
-                            "letrec: expected symbol, got {}",
-                            other
-                        )));
-                    }
-                };
-                kernel.env.set_lexical(&name, Value::Nil);
-            }
-            other => {
-                return Err(EvalError::InvalidForm(format!(
-                    "letrec: expected (name value) pair, got {}",
+    let bindings = raw_bindings
+        .iter()
+        .map(|binding| match binding {
+            Value::List(items) if items.len() == 2 => match &items[0] {
+                Value::Symbol(name) => Ok((name.clone(), items[1].clone())),
+                other => Err(EvalError::InvalidForm(format!(
+                    "letrec: expected symbol, got {}",
                     other
-                )));
-            }
-        }
-    }
-    for binding in bindings {
-        match binding {
-            Value::List(items) if items.len() == 2 => {
-                let name = match &items[0] {
-                    Value::Symbol(s) => s.clone(),
-                    other => {
-                        return Err(EvalError::InvalidForm(format!(
-                            "letrec: expected symbol, got {}",
-                            other
-                        )));
-                    }
-                };
-                let val = eval_value_inner(items[1].clone(), kernel, false)?;
-                kernel.env.set_lexical(&name, val);
-            }
-            _ => unreachable!(),
-        }
-    }
+                ))),
+            },
+            other => Err(EvalError::InvalidForm(format!(
+                "letrec: expected (name value) pair, got {}",
+                other
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    finish_scoped_body(&args[1..], kernel, tail_pos)
+    eval_in_new_frame(kernel, |kernel| {
+        for (name, _) in &bindings {
+            kernel.env.set_lexical(name, Value::Nil);
+        }
+        for (name, expression) in bindings {
+            let value = eval_value_inner(expression, kernel, false)?;
+            kernel.env.set_lexical(&name, value);
+        }
+        eval_begin_tail(&args[1..], kernel, tail_pos)
+    })
 }
 
 fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
@@ -865,7 +843,7 @@ fn eval_define_data(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalEr
         let constructor = Value::Function(Function::Constructor {
             family: qualified_family.clone(),
             variant: variant.name.clone(),
-            arity: variant.fields.len() as u32,
+            arity: variant.fields.len(),
         });
         kernel.env.define(&constructor_name, constructor)?;
     }
@@ -891,13 +869,12 @@ fn eval_match(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
                 let body = &items[1..];
                 let mut bindings = HashMap::new();
                 if match_pattern(&value, pattern, &mut bindings) {
-                    kernel.env.push_frame();
-                    for (k, v) in &bindings {
-                        kernel.env.set_lexical(k, v.clone());
-                    }
-                    let result = eval_begin_tail(body, kernel, false);
-                    kernel.env.pop_frame();
-                    return result;
+                    return eval_in_new_frame(kernel, |kernel| {
+                        for (name, value) in bindings {
+                            kernel.env.set_lexical(&name, value);
+                        }
+                        eval_begin_tail(body, kernel, false)
+                    });
                 }
             }
             _ => {
@@ -1180,11 +1157,9 @@ fn apply_tail(
     tail_ok: bool,
 ) -> Result<Value, EvalError> {
     match fun {
-        Value::Function(Function::Native {
-            name, arity, func, ..
-        }) => {
+        Value::Function(Function::Native { name, arity }) => {
             if let Arity::Exact(expected) = arity
-                && args.len() as u32 != expected
+                && args.len() != expected as usize
             {
                 return Err(EvalError::ArityMismatch {
                     name,
@@ -1192,17 +1167,20 @@ fn apply_tail(
                     got: args.len(),
                 });
             }
-            (func)(kernel, args).map_err(EvalError::Native)
+            let native = kernel.native(&name).ok_or_else(|| {
+                NativeError::Failed(format!("native function '{}' is not registered", name))
+            })?;
+            native(kernel, args).map_err(EvalError::Native)
         }
         Value::Function(Function::Constructor {
             family,
             variant,
             arity,
         }) => {
-            if args.len() != arity as usize {
+            if args.len() != arity {
                 return Err(EvalError::ArityMismatch {
                     name: format!("{}/{}", family, variant),
-                    expected: arity as usize,
+                    expected: arity,
                     got: args.len(),
                 });
             }

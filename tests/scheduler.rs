@@ -313,8 +313,8 @@ fn wake_timer_delivers_to_its_original_frame() {
             "wake-root",
         )
         .unwrap();
-    kernel.spawn_subagent("child", "wait");
-    assert_eq!(kernel.check_wake_timers(), 1);
+    kernel.spawn_subagent("child", "wait").unwrap();
+    assert_eq!(kernel.check_wake_timers().unwrap(), 1);
     assert!(
         kernel
             .notices_for_frame(&root)
@@ -364,6 +364,55 @@ impl ModelClient for PendingFirstModel {
             Ok("nil".into())
         }
     }
+}
+
+#[derive(Clone)]
+struct PendingTrappedModel {
+    calls: Arc<AtomicUsize>,
+    trapped_request_started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ModelClient for PendingTrappedModel {
+    async fn complete(
+        &self,
+        _request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<String, ModelError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(r#"(model/call "nested request")"#.into())
+        } else {
+            self.trapped_request_started.notify_one();
+            std::future::pending().await
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_turn_can_discard_its_installed_external_trap() {
+    let model = PendingTrappedModel {
+        calls: Arc::new(AtomicUsize::new(0)),
+        trapped_request_started: Arc::new(tokio::sync::Notify::new()),
+    };
+    let executor = Executor::new(ExecutorConfig::with_working_directory(temp_root(
+        "trapped-model-cancel",
+    )))
+    .unwrap();
+    let scheduler = Scheduler::new(model.clone(), executor);
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(temp_root("trapped-model-snapshot"));
+
+    let mut turn = Box::pin(scheduler.run_turn(&mut kernel));
+    tokio::select! {
+        _ = model.trapped_request_started.notified() => {}
+        result = &mut turn => panic!("trapped model request finished unexpectedly: {result:?}"),
+    }
+    drop(turn);
+    assert!(kernel.has_trap());
+
+    kernel.discard_pending_operation();
+    assert!(!kernel.has_trap());
+    kernel.snapshot().unwrap();
 }
 
 #[tokio::test]
@@ -466,7 +515,9 @@ fn worst_case_context_sections_stay_within_the_total_request_budget() {
     let (scheduler, _) = scheduler(&[]);
     let mut kernel = Kernel::new();
     for index in 0..100 {
-        kernel.spawn_subagent(&format!("frame-{index}"), &"task".repeat(5_000));
+        kernel
+            .spawn_subagent(&format!("frame-{index}"), &"task".repeat(5_000))
+            .unwrap();
     }
     for index in 0..32 {
         kernel

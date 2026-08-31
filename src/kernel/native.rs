@@ -42,7 +42,8 @@ pub(crate) fn arithmetic(
 }
 
 impl Kernel {
-    pub fn register_tools(&mut self) {
+    pub(crate) fn register_tools(&mut self) {
+        self.natives.clear();
         // Snapshots may contain natives retired after they were written.
         if let Some(namespace) =
             std::sync::Arc::make_mut(&mut self.env.namespaces).get_mut("kernel")

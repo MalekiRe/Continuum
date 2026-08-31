@@ -160,7 +160,6 @@ pub struct ExecutorStatus {
 
 #[derive(Debug, Clone, Copy)]
 enum ActivePhase {
-    Starting,
     Running { process_group: i32 },
     Draining,
 }
@@ -262,24 +261,15 @@ impl Executor {
         let started = Instant::now();
         let stdout_progress = Arc::new(AtomicU64::new(0));
         let stderr_progress = Arc::new(AtomicU64::new(0));
-        // Declared before the mutex guard so unwinding drops the mutex guard
-        // first. Once armed, this guard releases the reservation and, after a
-        // successful spawn, owns process-group cleanup on every exit path.
-        let mut run_guard = RunGuard::new(self);
-
+        // Declared before the mutex guard so unwind drops the lock before a
+        // fully initialized process guard attempts cleanup.
+        let mut run_guard;
+        // The lock makes spawn and publication one transition: no caller can
+        // observe a reservation without its process-group identity.
         let mut state = self.lock_state();
         if state.active.is_some() {
             return Err(ExecutorError::AlreadyRunning);
         }
-        state.active = Some(ActiveRun {
-            started,
-            phase: ActivePhase::Starting,
-            cancelled: false,
-            stdout_bytes: stdout_progress.clone(),
-            stderr_bytes: stderr_progress.clone(),
-        });
-        run_guard.arm();
-
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
             .arg(command)
@@ -290,9 +280,14 @@ impl Executor {
         unix::configure_process_session(&mut cmd);
         let child = cmd.spawn().map_err(ExecutorError::Spawn)?;
         let process_group = child.id() as i32;
-        state.active.as_mut().expect("reserved active run").phase =
-            ActivePhase::Running { process_group };
-        run_guard.install_process(child, process_group);
+        run_guard = RunGuard::new(self, child, process_group);
+        state.active = Some(ActiveRun {
+            started,
+            phase: ActivePhase::Running { process_group },
+            cancelled: false,
+            stdout_bytes: stdout_progress.clone(),
+            stderr_bytes: stderr_progress.clone(),
+        });
         drop(state);
 
         let stdout = run_guard
@@ -364,25 +359,15 @@ impl Executor {
 
 struct RunGuard<'a> {
     executor: &'a Executor,
-    armed: bool,
     process: Option<(Child, i32)>,
 }
 
 impl<'a> RunGuard<'a> {
-    fn new(executor: &'a Executor) -> Self {
+    fn new(executor: &'a Executor, child: Child, process_group: i32) -> Self {
         Self {
             executor,
-            armed: false,
-            process: None,
+            process: Some((child, process_group)),
         }
-    }
-
-    fn arm(&mut self) {
-        self.armed = true;
-    }
-
-    fn install_process(&mut self, child: Child, process_group: i32) {
-        self.process = Some((child, process_group));
     }
 
     fn child_mut(&mut self) -> &mut Child {
@@ -390,9 +375,6 @@ impl<'a> RunGuard<'a> {
     }
 
     fn begin_draining(&self) {
-        if !self.armed {
-            return;
-        }
         if let Some(active) = self.executor.lock_state().active.as_mut() {
             active.phase = ActivePhase::Draining;
         }
@@ -415,9 +397,7 @@ impl Drop for RunGuard<'_> {
         {
             eprintln!("executor cleanup failed: {failure}");
         }
-        if self.armed {
-            self.executor.lock_state().active = None;
-        }
+        self.executor.lock_state().active = None;
     }
 }
 
@@ -480,15 +460,19 @@ mod tests {
             state: Arc::new(Mutex::new(ExecutorState::default())),
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut guard = RunGuard::new(&executor);
+            let mut command = Command::new("bash");
+            command.arg("-c").arg("exit 0");
+            unix::configure_process_session(&mut command);
+            let child = command.spawn().unwrap();
+            let process_group = child.id() as i32;
+            let _guard = RunGuard::new(&executor, child, process_group);
             executor.lock_state().active = Some(ActiveRun {
                 started: Instant::now(),
-                phase: ActivePhase::Starting,
+                phase: ActivePhase::Running { process_group },
                 cancelled: false,
                 stdout_bytes: Arc::new(AtomicU64::new(0)),
                 stderr_bytes: Arc::new(AtomicU64::new(0)),
             });
-            guard.arm();
             panic!("injected panic");
         }));
         assert!(!executor.is_running());

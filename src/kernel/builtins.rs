@@ -45,11 +45,7 @@ impl Kernel {
                     )));
                 }
             };
-            let qualified = if name.contains('/') {
-                name
-            } else {
-                format!("user/{}", name)
-            };
+            let qualified = super::qualify_user_name(&name);
             Ok(kernel
                 .env
                 .source(&qualified)
@@ -174,11 +170,7 @@ impl Kernel {
             let Value::Symbol(name) = name_value else {
                 return Err("inspect/history: expected symbol".into());
             };
-            let qualified = if name.contains('/') {
-                name.clone()
-            } else {
-                format!("user/{}", name)
-            };
+            let qualified = super::qualify_user_name(name);
             let (namespace, binding) = qualified.split_once('/').unwrap();
             let ns =
                 kernel.env.namespaces.get(namespace).ok_or_else(|| {
@@ -215,11 +207,9 @@ impl Kernel {
                 .last()
                 .map(|frame| frame.id.clone())
                 .ok_or_else(|| "wake: no active frame".to_string())?;
-            kernel.wake_timers.push(crate::kernel::WakeEntry {
-                wake_at,
-                action,
-                frame_id,
-            });
+            kernel
+                .schedule_wake_at(frame_id, wake_at, action)
+                .map_err(|error| error.to_string())?;
             Ok(Value::keyword("scheduled"))
         });
         exact_native!(self, "inspect/find", |kernel, [query_value]| {

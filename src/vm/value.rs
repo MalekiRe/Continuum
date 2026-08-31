@@ -1,6 +1,7 @@
 use crate::vm::env::EnvironmentId;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,26 +78,14 @@ impl From<&str> for NativeError {
 
 pub type NativeFn = fn(&mut crate::kernel::Kernel, Vec<Value>) -> Result<Value, NativeError>;
 
-fn missing_native(_: &mut crate::kernel::Kernel, _: Vec<Value>) -> Result<Value, NativeError> {
-    Err(NativeError::Failed(
-        "native function was not registered after snapshot recovery".into(),
-    ))
-}
-
-fn missing_native_fn() -> NativeFn {
-    missing_native
-}
-
-/// A Lisp function. Native pointers are runtime-only and are restored from the
-/// kernel registry after deserialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A Lisp function. Native implementations live in the kernel registry;
+/// serializable values retain only their identity and arity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Function {
     Native {
         name: String,
         arity: Arity,
-        #[serde(skip, default = "missing_native_fn")]
-        func: NativeFn,
     },
     Interpreted {
         params: Vec<String>,
@@ -106,14 +95,14 @@ pub enum Function {
     Constructor {
         family: String,
         variant: String,
-        arity: u32,
+        arity: usize,
     },
 }
 
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Function::Native { name, arity, .. } => {
+            Function::Native { name, arity } => {
                 write!(f, "#<native-fn {} arity {}>", name, arity)
             }
             Function::Interpreted { params, .. } => write!(f, "#<fn ({})>", params.join(" ")),
@@ -125,7 +114,7 @@ impl fmt::Display for Function {
 }
 
 /// A declarative Lisp macro.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Macro {
     #[serde(rename = "syntax-rules")]
@@ -236,55 +225,8 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
-            (Value::Function(a), Value::Function(b)) => match (a, b) {
-                (
-                    Function::Native {
-                        name: an,
-                        arity: aa,
-                        ..
-                    },
-                    Function::Native {
-                        name: bn,
-                        arity: ba,
-                        ..
-                    },
-                ) => an == bn && aa == ba,
-                (
-                    Function::Interpreted {
-                        params: ap,
-                        body: ab,
-                        env_id: ae,
-                    },
-                    Function::Interpreted {
-                        params: bp,
-                        body: bb,
-                        env_id: be,
-                    },
-                ) => ap == bp && ab == bb && ae == be,
-                (
-                    Function::Constructor {
-                        family: af,
-                        variant: av,
-                        arity: aa,
-                    },
-                    Function::Constructor {
-                        family: bf,
-                        variant: bv,
-                        arity: ba,
-                    },
-                ) => af == bf && av == bv && aa == ba,
-                _ => false,
-            },
-            (
-                Value::Macro(Macro::SyntaxRules {
-                    literals: al,
-                    rules: ar,
-                }),
-                Value::Macro(Macro::SyntaxRules {
-                    literals: bl,
-                    rules: br,
-                }),
-            ) => al == bl && ar == br,
+            (Value::Function(a), Value::Function(b)) => a == b,
+            (Value::Macro(a), Value::Macro(b)) => a == b,
             (
                 Value::Tagged {
                     family: fa,
@@ -333,30 +275,42 @@ impl std::hash::Hash for Value {
                 entries.sort_unstable();
                 entries.hash(state);
             }
-            Value::Function(function) => {
-                10u8.hash(state);
-                match function {
-                    Function::Native { name, arity, .. } => (0u8, name, arity).hash(state),
-                    Function::Interpreted {
-                        params,
-                        body,
-                        env_id,
-                    } => (1u8, params, body, env_id).hash(state),
-                    Function::Constructor {
-                        family,
-                        variant,
-                        arity,
-                    } => (2u8, family, variant, arity).hash(state),
-                }
-            }
-            Value::Macro(Macro::SyntaxRules { literals, rules }) => {
-                (11u8, literals, rules).hash(state)
-            }
+            Value::Function(function) => (10u8, function).hash(state),
+            Value::Macro(macro_) => (11u8, macro_).hash(state),
             Value::Tagged {
                 family,
                 variant,
                 fields,
             } => (12u8, family, variant, fields).hash(state),
+        }
+    }
+}
+
+pub(crate) fn collect_captured_environments<'a>(
+    roots: impl IntoIterator<Item = &'a Value>,
+    captured: &mut HashSet<EnvironmentId>,
+) {
+    let mut pending: Vec<_> = roots.into_iter().collect();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Function(Function::Interpreted { env_id, body, .. }) => {
+                captured.insert(*env_id);
+                pending.extend(body);
+            }
+            Value::List(values) | Value::Vector(values) => pending.extend(values),
+            Value::Map(values) => {
+                for (key, value) in values {
+                    pending.extend([key, value]);
+                }
+            }
+            Value::Macro(Macro::SyntaxRules { rules, .. }) => {
+                for (pattern, template) in rules {
+                    pending.extend(pattern);
+                    pending.push(template);
+                }
+            }
+            Value::Tagged { fields, .. } => pending.extend(fields),
+            _ => {}
         }
     }
 }

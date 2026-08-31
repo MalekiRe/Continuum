@@ -11,8 +11,8 @@ pub use executor::{
 };
 pub use ids::{FrameId, MessageId, QualifiedName, SnapshotId};
 pub use kernel::{
-    FrameStatus, Kernel, MessageError, PendingTrap, ScheduleError, SnapshotError, SnapshotInfo,
-    StackNotice, TranscriptEntry, TrapError, VmTrap,
+    AllocationError, FrameStatus, Kernel, MessageError, PendingTrap, ScheduleError, SnapshotError,
+    SnapshotInfo, StackNotice, TranscriptEntry, TrapError, VmTrap,
 };
 pub use output::OutputSink;
 pub use vm::{

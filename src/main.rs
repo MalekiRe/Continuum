@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use persistent_lisp_harness::{
     EvalInterruptHandle, Executor, ExecutorConfig, Kernel, ModelInterruptHandle, OpenRouterModel,
-    OutputSink, Scheduler, SchedulerError, TurnOutcome,
+    OutputSink, Scheduler, TurnOutcome,
 };
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
@@ -12,12 +12,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-static LOG_BUF: LazyLock<Arc<Mutex<VecDeque<String>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(VecDeque::with_capacity(1000))));
-static CHAT_HISTORY: LazyLock<Arc<Mutex<VecDeque<ChatEntry>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(VecDeque::new())));
+static LOG_BUF: LazyLock<Mutex<VecDeque<String>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(1000)));
+static CHAT_HISTORY: LazyLock<Mutex<VecDeque<ChatEntry>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
-#[derive(Clone, serde::Serialize)]
 struct ChatEntry {
     role: String,
     message: String,
@@ -34,24 +33,17 @@ fn slog(message: impl AsRef<str>) {
     log.push_back(message.to_string());
 }
 
-fn snapshot_files_exist() -> bool {
-    std::fs::read_dir("snapshots")
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-}
-
 fn load_kernel() -> Result<Kernel> {
-    if snapshot_files_exist() {
-        let kernel = Kernel::recover_from_latest()
-            .context("continuity violation: snapshots exist but none recover")?;
-        slog("[kernel] recovered latest valid snapshot");
-        Ok(kernel)
-    } else {
-        slog("[kernel] fresh start");
-        Ok(Kernel::new())
+    match Kernel::recover_from_latest() {
+        Ok(kernel) => {
+            slog("[kernel] recovered latest valid snapshot");
+            Ok(kernel)
+        }
+        Err(persistent_lisp_harness::SnapshotError::NotFound) => {
+            slog("[kernel] fresh start");
+            Ok(Kernel::new())
+        }
+        Err(error) => Err(error).context("continuity violation: snapshots exist but none recover"),
     }
 }
 
@@ -161,7 +153,6 @@ fn content_type(value: &str) -> tiny_http::Header {
 }
 
 fn start_http(intervention: HumanIntervention) {
-    let logs = LOG_BUF.clone();
     thread::spawn(move || {
         let server = tiny_http::Server::http("0.0.0.0:8080").expect("HTTP listen failed");
         slog("[http] listening on http://0.0.0.0:8080");
@@ -176,7 +167,7 @@ fn start_http(intervention: HumanIntervention) {
                 ("GET", "/chat") => tiny_http::Response::from_string(chat)
                     .with_header(content_type("text/html; charset=utf-8")),
                 ("GET", "/thoughts.json") => tiny_http::Response::from_string(
-                    serde_json::to_string(&*logs.lock().unwrap()).unwrap(),
+                    serde_json::to_string(&*LOG_BUF.lock().unwrap()).unwrap(),
                 )
                 .with_header(content_type("application/json")),
                 ("GET", "/chat/history") => tiny_http::Response::from_string(chat_html())
@@ -232,14 +223,11 @@ async fn main() -> Result<()> {
     start_input_thread(intervention.clone());
     start_http(intervention.clone());
 
-    enum RuntimeEvent {
-        Human(Option<String>),
-        Turn(Result<TurnOutcome, SchedulerError>),
-    }
-
     let mut snapshot_timer = Instant::now();
     loop {
-        kernel.check_wake_timers();
+        if let Err(error) = kernel.check_wake_timers() {
+            slog(format!("[wake timers] {error}"));
+        }
         if snapshot_timer.elapsed() >= Duration::from_secs(3600) {
             if let Err(error) = kernel.snapshot() {
                 slog(format!("[snapshot] {}", error));
@@ -247,15 +235,13 @@ async fn main() -> Result<()> {
             snapshot_timer = Instant::now();
         }
 
-        let event = tokio::select! {
+        let outcome = tokio::select! {
             biased;
-            message = rx.recv() => RuntimeEvent::Human(message),
-            outcome = scheduler.run_turn(&mut kernel) => RuntimeEvent::Turn(outcome),
-        };
-        match event {
-            RuntimeEvent::Human(Some(message)) => {
-                // The selected turn future is now dropped. Clear sticky pre-activation
-                // interrupts before starting a fresh turn that includes this message.
+            message = rx.recv() => {
+                let Some(message) = message else { return Ok(()) };
+                // The selected turn future is dropped before its trap and sticky
+                // interruption signals are discarded.
+                kernel.discard_pending_operation();
                 intervention.acknowledge();
                 if matches!(message.as_str(), "!!exit" | "!!quit") {
                     if let Err(error) = kernel.snapshot() {
@@ -264,28 +250,29 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 deliver_human(&mut kernel, message);
+                continue;
             }
-            RuntimeEvent::Human(None) => return Ok(()),
-            RuntimeEvent::Turn(Ok(TurnOutcome::Evaluated { source, result, .. })) => {
+            outcome = scheduler.run_turn(&mut kernel) => outcome,
+        };
+        match outcome {
+            Ok(TurnOutcome::Evaluated { source, result, .. }) => {
                 slog(format!("[lisp] {} => {}", source, result));
             }
-            RuntimeEvent::Turn(Ok(TurnOutcome::ToolCompleted { source, result, .. })) => {
+            Ok(TurnOutcome::ToolCompleted { source, result, .. }) => {
                 slog(format!("[tool] {} => {}", source, result));
             }
-            RuntimeEvent::Turn(Ok(TurnOutcome::Spawned { child_id, .. })) => {
+            Ok(TurnOutcome::Spawned { child_id, .. }) => {
                 slog(format!("[agent] spawned {}", child_id));
             }
-            RuntimeEvent::Turn(Ok(TurnOutcome::Returned { result, .. })) => {
+            Ok(TurnOutcome::Returned { result, .. }) => {
                 slog(format!("[agent] child returned {}", result));
             }
-            RuntimeEvent::Turn(Ok(TurnOutcome::Replied { text, .. })) => {
+            Ok(TurnOutcome::Replied { text, .. }) => {
                 add_chat("agent", text.clone());
                 slog(format!("[agent] {}", text));
             }
-            RuntimeEvent::Turn(Ok(TurnOutcome::Idle)) => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            RuntimeEvent::Turn(Err(error)) => {
+            Ok(TurnOutcome::Idle) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(error) => {
                 slog(format!("[turn] {}", error));
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

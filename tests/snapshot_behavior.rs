@@ -6,6 +6,28 @@ fn temp_dir() -> std::path::PathBuf {
     path
 }
 
+fn rewrite_snapshot(
+    directory: &std::path::Path,
+    id: &persistent_lisp_harness::SnapshotId,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    use sha2::{Digest, Sha256};
+    let path = std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains(id.as_str()))
+        .unwrap();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    mutate(&mut envelope["kernel"]);
+    envelope["checksum"] = hex::encode(Sha256::digest(
+        serde_json::to_vec(&envelope["kernel"]).unwrap(),
+    ))
+    .into();
+    std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+}
+
 #[test]
 fn recovery_chooses_newest_snapshot() {
     let dir = temp_dir();
@@ -138,7 +160,9 @@ fn child_stack_transcripts_and_selected_memory_survive_snapshot() {
     let mut kernel = Kernel::new();
     kernel.set_snapshot_directory(dir.to_string_lossy().into_owned());
     kernel.append_transcript("(+ 1 1)", "2");
-    let child = kernel.spawn_subagent("researcher", "inspect state");
+    let child = kernel
+        .spawn_subagent("researcher", "inspect state")
+        .unwrap();
     kernel
         .eval(r#"(memory/remember "finding" "snapshot-safe")"#)
         .unwrap();
@@ -340,4 +364,164 @@ fn genuine_v2_cloned_closure_heap_migrates_to_the_cell_arena() {
 
     let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
     assert_eq!(recovered.eval("(captured)").unwrap(), Value::Int(42));
+}
+
+#[test]
+fn first_class_native_alias_survives_snapshot_recovery() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    kernel.eval("(define add +)").unwrap();
+    assert_eq!(kernel.eval("(add 2 3)").unwrap(), Value::Int(5));
+    kernel.snapshot().unwrap();
+
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert_eq!(recovered.eval("(add 20 22)").unwrap(), Value::Int(42));
+}
+
+#[test]
+fn missing_snapshot_directory_is_typed_and_not_created() {
+    let dir = std::env::temp_dir().join(format!("continuum-missing-{}", uuid::Uuid::new_v4()));
+    assert!(matches!(
+        Kernel::recover_from_dir(&dir),
+        Err(persistent_lisp_harness::SnapshotError::NotFound)
+    ));
+    assert!(!dir.exists());
+}
+
+#[test]
+fn recovered_snapshot_rebinds_its_storage_directory() {
+    let original = temp_dir();
+    let relocated = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&original);
+    kernel.snapshot().unwrap();
+    let source = std::fs::read_dir(&original)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::copy(&source, relocated.join(source.file_name().unwrap())).unwrap();
+
+    let mut recovered = Kernel::recover_from_dir(&relocated).unwrap();
+    recovered.snapshot().unwrap();
+    assert_eq!(std::fs::read_dir(&original).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&relocated).unwrap().count(), 2);
+}
+
+#[test]
+fn recovery_rejects_a_dangling_lexical_cursor() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    let snapshot = kernel.snapshot().unwrap();
+    rewrite_snapshot(&dir, &snapshot.id, |kernel| {
+        kernel["env"]["current_environment"] = serde_json::json!(999);
+    });
+    assert!(matches!(
+        Kernel::recover_from_dir(&dir),
+        Err(persistent_lisp_harness::SnapshotError::AllInvalid(_))
+    ));
+}
+
+#[test]
+fn recovery_repairs_notice_targets_from_retired_legacy_frames() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    kernel.spawn_subagent("retired", "task").unwrap();
+    let message = kernel.human_message("survive retirement").unwrap();
+    let snapshot = kernel.snapshot().unwrap();
+    rewrite_snapshot(&dir, &snapshot.id, |kernel| {
+        kernel["frames"].as_array_mut().unwrap().pop();
+    });
+
+    let recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert!(recovered.has_pending_message(&message));
+    let targets = &recovered.notices_for_frame(recovered.frames()[0].id())[0].target_frames;
+    assert_eq!(targets, &[recovered.frames()[0].id().clone()]);
+}
+
+#[test]
+fn recovery_rejects_invalid_notice_targets_and_cursors() {
+    for invalid_cursor in [false, true] {
+        let dir = temp_dir();
+        let mut kernel = Kernel::new();
+        kernel.set_snapshot_directory(&dir);
+        kernel.human_message("pending").unwrap();
+        let snapshot = kernel.snapshot().unwrap();
+        rewrite_snapshot(&dir, &snapshot.id, |kernel| {
+            if invalid_cursor {
+                kernel["frames"][0]["notice_cursor"] = serde_json::json!(u64::MAX);
+            } else {
+                kernel["notices"][0]["target_frames"] = serde_json::json!([]);
+            }
+        });
+        assert!(matches!(
+            Kernel::recover_from_dir(&dir),
+            Err(persistent_lisp_harness::SnapshotError::AllInvalid(_))
+        ));
+    }
+}
+
+#[test]
+fn recovery_rejects_a_closure_with_a_missing_captured_environment() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    kernel.eval("(define f (lambda (x) x))").unwrap();
+    let snapshot = kernel.snapshot().unwrap();
+    rewrite_snapshot(&dir, &snapshot.id, |kernel| {
+        kernel["env"]["namespaces"]["user"]["bindings"]["f"]["Function"]["env_id"] =
+            serde_json::json!(999);
+    });
+    assert!(matches!(
+        Kernel::recover_from_dir(&dir),
+        Err(persistent_lisp_harness::SnapshotError::AllInvalid(_))
+    ));
+}
+
+#[test]
+fn recovered_allocator_exhaustion_is_handled_without_overflow() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    let snapshot = kernel.snapshot().unwrap();
+    rewrite_snapshot(&dir, &snapshot.id, |kernel| {
+        kernel["next_notice_sequence"] = serde_json::json!(u64::MAX - 1);
+        kernel["next_frame_id"] = serde_json::json!(u64::MAX - 1);
+    });
+
+    let mut recovered = Kernel::recover_from_dir(&dir).unwrap();
+    recovered.human_message("still allocates safely").unwrap();
+    recovered.spawn_subagent("last", "task").unwrap();
+    assert!(matches!(
+        recovered.spawn_subagent("exhausted", "task"),
+        Err(persistent_lisp_harness::AllocationError::Exhausted("frame"))
+    ));
+}
+
+#[test]
+fn recovery_restores_one_active_top_frame() {
+    let dir = temp_dir();
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(&dir);
+    kernel.spawn_subagent("worker", "task").unwrap();
+    kernel.human_message("redirect parent later").unwrap();
+    assert_eq!(
+        kernel.frames()[0].status(),
+        persistent_lisp_harness::FrameStatus::Waiting
+    );
+    kernel.snapshot().unwrap();
+
+    let recovered = Kernel::recover_from_dir(&dir).unwrap();
+    assert_eq!(
+        recovered.frames()[0].status(),
+        persistent_lisp_harness::FrameStatus::Waiting
+    );
+    assert_eq!(
+        recovered.frames()[1].status(),
+        persistent_lisp_harness::FrameStatus::Running
+    );
 }

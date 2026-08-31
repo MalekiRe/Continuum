@@ -1,5 +1,4 @@
 use crate::vm::value::Value;
-use indexmap::IndexMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
@@ -22,9 +21,9 @@ enum ParserState {
     Vector(Vec<Value>),
     Map {
         pairs: Vec<(Value, Value)>,
-        expect_key: bool,
-        current_key: Option<Value>,
+        pending_key: Option<Value>,
     },
+    Prefix(&'static str),
 }
 
 pub fn read_one(input: &str) -> Result<(Value, &str), ReadError> {
@@ -33,9 +32,8 @@ pub fn read_one(input: &str) -> Result<(Value, &str), ReadError> {
         return Err(ReadError::UnexpectedEof("expected a value".into()));
     }
 
-    let mut stack: Vec<ParserState> = Vec::new();
+    let mut stack = Vec::new();
     let mut rest = input;
-
     loop {
         rest = skip_whitespace_and_comments(rest);
         if rest.is_empty() {
@@ -43,202 +41,137 @@ pub fn read_one(input: &str) -> Result<(Value, &str), ReadError> {
                 Some(ParserState::List(_)) => Err(ReadError::UnmatchedParen),
                 Some(ParserState::Vector(_)) => Err(ReadError::UnmatchedBracket),
                 Some(ParserState::Map { .. }) => Err(ReadError::UnmatchedBrace),
-                None => Err(ReadError::UnexpectedEof("expected a value".into())),
+                Some(ParserState::Prefix(_)) | None => {
+                    Err(ReadError::UnexpectedEof("expected a value".into()))
+                }
             };
         }
 
         let ch = rest.chars().next().unwrap();
-
-        if ch == '(' {
-            stack.push(ParserState::List(Vec::new()));
-            rest = &rest[1..];
-            continue;
-        }
-
-        if ch == '[' {
-            stack.push(ParserState::Vector(Vec::new()));
-            rest = &rest[1..];
-            continue;
-        }
-
-        if ch == '{' {
-            stack.push(ParserState::Map {
-                pairs: Vec::new(),
-                expect_key: true,
-                current_key: None,
-            });
-            rest = &rest[1..];
-            continue;
-        }
-
-        if ch == ')' {
-            match stack.pop() {
+        match ch {
+            '(' => {
+                stack.push(ParserState::List(Vec::new()));
+                rest = &rest[1..];
+                continue;
+            }
+            '[' => {
+                stack.push(ParserState::Vector(Vec::new()));
+                rest = &rest[1..];
+                continue;
+            }
+            '{' => {
+                stack.push(ParserState::Map {
+                    pairs: Vec::new(),
+                    pending_key: None,
+                });
+                rest = &rest[1..];
+                continue;
+            }
+            ')' => match stack.pop() {
                 Some(ParserState::List(items)) => {
-                    let val = Value::List(items);
                     rest = &rest[1..];
-                    if stack.is_empty() {
-                        return Ok((val, rest));
+                    if let Some(value) = complete_value(&mut stack, Value::List(items)) {
+                        return Ok((value, rest));
                     }
-                    append_to_parent(&mut stack, val)?;
                     continue;
                 }
                 _ => return Err(ReadError::InvalidSyntax("unexpected ')'".into())),
-            }
-        }
-
-        if ch == ']' {
-            match stack.pop() {
+            },
+            ']' => match stack.pop() {
                 Some(ParserState::Vector(items)) => {
-                    let val = Value::Vector(items);
                     rest = &rest[1..];
-                    if stack.is_empty() {
-                        return Ok((val, rest));
+                    if let Some(value) = complete_value(&mut stack, Value::Vector(items)) {
+                        return Ok((value, rest));
                     }
-                    append_to_parent(&mut stack, val)?;
                     continue;
                 }
                 _ => return Err(ReadError::InvalidSyntax("unexpected ']'".into())),
-            }
-        }
-
-        if ch == '}' {
-            match stack.pop() {
+            },
+            '}' => match stack.pop() {
                 Some(ParserState::Map {
                     pairs,
-                    expect_key,
-                    current_key,
+                    pending_key: None,
                 }) => {
-                    if !expect_key || current_key.is_some() {
-                        return Err(ReadError::InvalidSyntax(
-                            "map literal requires an even number of forms".into(),
-                        ));
-                    }
-                    let mut map = IndexMap::new();
-                    for (k, v) in pairs {
-                        map.insert(k, v);
-                    }
-                    let val = Value::Map(map);
+                    let value = Value::Map(pairs.into_iter().collect());
                     rest = &rest[1..];
-                    if stack.is_empty() {
-                        return Ok((val, rest));
+                    if let Some(value) = complete_value(&mut stack, value) {
+                        return Ok((value, rest));
                     }
-                    append_to_parent(&mut stack, val)?;
                     continue;
                 }
+                Some(ParserState::Map { .. }) => {
+                    return Err(ReadError::InvalidSyntax(
+                        "map literal requires an even number of forms".into(),
+                    ));
+                }
                 _ => return Err(ReadError::InvalidSyntax("unexpected '}'".into())),
+            },
+            '\'' => {
+                stack.push(ParserState::Prefix("quote"));
+                rest = &rest[1..];
+                continue;
             }
+            '`' => {
+                stack.push(ParserState::Prefix("quasiquote"));
+                rest = &rest[1..];
+                continue;
+            }
+            ',' => {
+                let splicing = rest.as_bytes().get(1) == Some(&b'@');
+                stack.push(ParserState::Prefix(if splicing {
+                    "unquote-splicing"
+                } else {
+                    "unquote"
+                }));
+                rest = &rest[if splicing { 2 } else { 1 }..];
+                continue;
+            }
+            _ => {}
         }
 
-        if ch == '\'' {
-            let (val, new_rest) = read_one(&rest[1..])?;
-            let quoted = Value::list(vec![Value::symbol("quote"), val]);
-            rest = new_rest;
-            if stack.is_empty() {
-                return Ok((quoted, rest));
+        let (value, new_rest) = match ch {
+            '#' => read_dispatch(&rest[1..])?,
+            ':' => {
+                let (name, rest) = read_raw_symbol(&rest[1..])?;
+                (Value::Keyword(name), rest)
             }
-            append_to_parent(&mut stack, quoted)?;
-            continue;
-        }
-
-        if ch == '`' {
-            let (val, new_rest) = read_one(&rest[1..])?;
-            let qq = Value::list(vec![Value::symbol("quasiquote"), val]);
-            rest = new_rest;
-            if stack.is_empty() {
-                return Ok((qq, rest));
-            }
-            append_to_parent(&mut stack, qq)?;
-            continue;
-        }
-
-        if ch == ',' {
-            if rest.len() > 1 && rest.as_bytes()[1] == b'@' {
-                let (val, new_rest) = read_one(&rest[2..])?;
-                let unq = Value::list(vec![Value::symbol("unquote-splicing"), val]);
-                rest = new_rest;
-                if stack.is_empty() {
-                    return Ok((unq, rest));
-                }
-                append_to_parent(&mut stack, unq)?;
-            } else {
-                let (val, new_rest) = read_one(&rest[1..])?;
-                let unq = Value::list(vec![Value::symbol("unquote"), val]);
-                rest = new_rest;
-                if stack.is_empty() {
-                    return Ok((unq, rest));
-                }
-                append_to_parent(&mut stack, unq)?;
-            }
-            continue;
-        }
-
-        if ch == '#' {
-            let (val, new_rest) = read_dispatch(&rest[1..])?;
-            rest = new_rest;
-            if stack.is_empty() {
-                return Ok((val, rest));
-            }
-            append_to_parent(&mut stack, val)?;
-            continue;
-        }
-
-        if ch == ':' {
-            let (name, new_rest) = read_raw_symbol(&rest[1..])?;
-            let val = Value::Keyword(name);
-            rest = new_rest;
-            if stack.is_empty() {
-                return Ok((val, rest));
-            }
-            append_to_parent(&mut stack, val)?;
-            continue;
-        }
-
-        if ch == '"' {
-            let (val, new_rest) = read_string(&rest[1..])?;
-            rest = new_rest;
-            if stack.is_empty() {
-                return Ok((val, rest));
-            }
-            append_to_parent(&mut stack, val)?;
-            continue;
-        }
-
-        let (val, new_rest) = read_atom(rest)?;
+            '"' => read_string(&rest[1..])?,
+            _ => read_atom(rest)?,
+        };
         rest = new_rest;
-        if stack.is_empty() {
-            return Ok((val, rest));
+        if let Some(value) = complete_value(&mut stack, value) {
+            return Ok((value, rest));
         }
-        append_to_parent(&mut stack, val)?;
     }
 }
 
-fn append_to_parent(stack: &mut [ParserState], val: Value) -> Result<(), ReadError> {
-    match stack.last_mut() {
-        Some(ParserState::List(items)) => {
-            items.push(val);
-            Ok(())
-        }
-        Some(ParserState::Vector(items)) => {
-            items.push(val);
-            Ok(())
-        }
-        Some(ParserState::Map {
-            pairs,
-            expect_key,
-            current_key,
-        }) => {
-            if *expect_key {
-                *current_key = Some(val);
-                *expect_key = false;
-            } else {
-                if let Some(key) = current_key.take() {
-                    pairs.push((key, val));
-                }
-                *expect_key = true;
+fn complete_value(stack: &mut Vec<ParserState>, mut value: Value) -> Option<Value> {
+    loop {
+        match stack.last_mut() {
+            Some(ParserState::List(items)) => {
+                items.push(value);
+                return None;
             }
-            Ok(())
+            Some(ParserState::Vector(items)) => {
+                items.push(value);
+                return None;
+            }
+            Some(ParserState::Map { pairs, pending_key }) => {
+                if let Some(key) = pending_key.take() {
+                    pairs.push((key, value));
+                } else {
+                    *pending_key = Some(value);
+                }
+                return None;
+            }
+            Some(ParserState::Prefix(_)) => {
+                let Some(ParserState::Prefix(prefix)) = stack.pop() else {
+                    unreachable!()
+                };
+                value = Value::list(vec![Value::symbol(prefix), value]);
+            }
+            None => return Some(value),
         }
-        None => Ok(()),
     }
 }
 
@@ -285,26 +218,23 @@ fn read_dispatch(input: &str) -> Result<(Value, &str), ReadError> {
             let end = 1 + chars.len_utf8();
             Ok((Value::string(&chars.to_string()), &input[end..]))
         }
-        'x' => {
-            let (raw, rest) = read_raw_symbol(&input[1..])?;
-            i64::from_str_radix(&raw, 16)
-                .map(|n| (Value::Int(n), rest))
-                .map_err(|_| ReadError::InvalidSyntax(format!("invalid hex: #x{}", raw)))
-        }
-        'o' => {
-            let (raw, rest) = read_raw_symbol(&input[1..])?;
-            i64::from_str_radix(&raw, 8)
-                .map(|n| (Value::Int(n), rest))
-                .map_err(|_| ReadError::InvalidSyntax(format!("invalid octal: #o{}", raw)))
-        }
-        'b' => {
-            let (raw, rest) = read_raw_symbol(&input[1..])?;
-            i64::from_str_radix(&raw, 2)
-                .map(|n| (Value::Int(n), rest))
-                .map_err(|_| ReadError::InvalidSyntax(format!("invalid binary: #b{}", raw)))
-        }
+        'x' => read_radix(&input[1..], 16, "hex", "#x"),
+        'o' => read_radix(&input[1..], 8, "octal", "#o"),
+        'b' => read_radix(&input[1..], 2, "binary", "#b"),
         _ => Err(ReadError::UnknownDispatch(format!("#{}", ch))),
     }
+}
+
+fn read_radix<'a>(
+    input: &'a str,
+    radix: u32,
+    name: &str,
+    prefix: &str,
+) -> Result<(Value, &'a str), ReadError> {
+    let (raw, rest) = read_raw_symbol(input)?;
+    i64::from_str_radix(&raw, radix)
+        .map(|value| (Value::Int(value), rest))
+        .map_err(|_| ReadError::InvalidSyntax(format!("invalid {name}: {prefix}{raw}")))
 }
 
 fn read_string(input: &str) -> Result<(Value, &str), ReadError> {

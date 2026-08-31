@@ -148,3 +148,18 @@ fn arbitrary_unicode_input_never_panics_in_reader_or_evaluator() {
         assert!(evaluated.is_ok(), "evaluator panicked for {input:?}");
     }
 }
+
+#[test]
+fn qualified_bindings_require_nonempty_namespace_and_name() {
+    let mut kernel = Kernel::new();
+    assert!(kernel.eval("(define /missing-namespace 1)").is_err());
+    assert!(kernel.eval("(define missing-name/ 1)").is_err());
+}
+
+#[test]
+fn deeply_prefixed_forms_are_read_without_reader_recursion() {
+    let source = format!("{}nil", "'".repeat(20_000));
+    let (value, rest) = reader::read_one(&source).unwrap();
+    assert!(rest.is_empty());
+    std::mem::forget(value); // Recursive Value drop is separate from reader stack safety.
+}

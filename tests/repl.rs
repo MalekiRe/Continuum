@@ -646,3 +646,15 @@ fn interrupt_at_eval_completion_discards_the_completed_value() {
         Err(persistent_lisp_harness::EvalError::Interrupted)
     ));
 }
+
+#[test]
+fn direct_eval_value_restores_scope_after_failing_letrec() {
+    use persistent_lisp_harness::vm::{eval::eval_value, reader::read_one};
+    let mut kernel = persistent_lisp_harness::Kernel::new();
+    let (form, _) = read_one("(letrec ((x missing)) 123)").unwrap();
+    assert!(eval_value(form, &mut kernel).is_err());
+    assert!(matches!(
+        eval_value(persistent_lisp_harness::Value::symbol("x"), &mut kernel),
+        Err(persistent_lisp_harness::EvalError::UndefinedSymbol(name)) if name == "x"
+    ));
+}

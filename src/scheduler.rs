@@ -1,6 +1,6 @@
 use crate::executor::{ExecutionResult, Executor, ExecutorError};
 use crate::ids::{FrameId, MessageId};
-use crate::kernel::{FrameStatus, Kernel, MessageError, TranscriptEntry, VmTrap};
+use crate::kernel::{AllocationError, FrameStatus, Kernel, MessageError, TranscriptEntry, VmTrap};
 use crate::vm::reader::{self, ReadError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -17,42 +17,20 @@ pub struct ModelRequest {
 
 const MODEL_CONTEXT_LIMIT: usize = 62_000;
 
-struct ContextBuilder {
-    text: String,
-    remaining: usize,
-}
-
-impl ContextBuilder {
-    fn new(limit: usize) -> Self {
-        Self {
-            text: String::with_capacity(limit),
-            remaining: limit,
-        }
+fn append_section(text: &mut String, limit: usize, heading: &str, body: &str, budget: usize) {
+    let mut remaining = limit.saturating_sub(text.len());
+    if body.is_empty() || remaining == 0 {
+        return;
     }
-
-    fn section(&mut self, heading: &str, body: &str, budget: usize) {
-        if body.is_empty() || self.remaining == 0 {
-            return;
-        }
-        let prefix = format!("\n# {heading}\n");
-        if prefix.len() >= self.remaining {
-            return;
-        }
-        self.text.push_str(&prefix);
-        self.remaining = self.remaining.saturating_sub(prefix.len());
-        let allowed = budget.min(self.remaining);
-        let rendered = truncate(body, allowed);
-        self.text.push_str(&rendered);
-        self.remaining = self.remaining.saturating_sub(rendered.len());
-        if self.remaining > 0 && !self.text.ends_with('\n') {
-            self.text.push('\n');
-            self.remaining = self.remaining.saturating_sub(1);
-        }
+    let prefix = format!("\n# {heading}\n");
+    if prefix.len() >= remaining {
+        return;
     }
-
-    fn finish(mut self, directive: &str) -> String {
-        self.text.push_str(directive);
-        self.text
+    text.push_str(&prefix);
+    remaining -= prefix.len();
+    text.push_str(&truncate(body, budget.min(remaining)));
+    if text.len() < limit && !text.ends_with('\n') {
+        text.push('\n');
     }
 }
 
@@ -90,6 +68,8 @@ pub enum SchedulerError {
     Executor(#[from] ExecutorError),
     #[error(transparent)]
     Message(#[from] MessageError),
+    #[error(transparent)]
+    Allocation(#[from] AllocationError),
     #[error("Lisp evaluation interrupted by human input")]
     EvaluationInterrupted,
     #[error("scheduler invariant violated: {0}")]
@@ -266,12 +246,12 @@ struct ActiveRequestGuard {
 impl ActiveRequestGuard {
     fn finish<T>(mut self, result: Result<T, ModelError>) -> Result<T, ModelError> {
         let mut active = self.active.lock().unwrap();
-        let interrupted = self.pending.load(Ordering::Acquire) || self.cancellation.is_cancelled();
+        let interrupted =
+            self.pending.swap(false, Ordering::AcqRel) || self.cancellation.is_cancelled();
         *active = None;
         self.finished = true;
         drop(active);
         if interrupted {
-            self.pending.store(false, Ordering::Release);
             Err(ModelError::Cancelled)
         } else {
             result
@@ -423,14 +403,10 @@ impl<M: ModelClient> Scheduler<M> {
         let source = pending.source;
         match pending.operation {
             VmTrap::RunBash { command } => {
-                let execution = match self.executor.run(&command) {
-                    Ok(execution) => execution,
-                    Err(error) => {
-                        kernel.clear_trap();
-                        kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
-                        return Err(error.into());
-                    }
-                };
+                let execution = self.executor.run(&command).inspect_err(|error| {
+                    kernel.clear_trap();
+                    kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
+                })?;
                 let result = format_execution(&execution);
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
@@ -441,20 +417,16 @@ impl<M: ModelClient> Scheduler<M> {
                 })
             }
             VmTrap::CallModel { prompt } => {
-                let result = match self
+                let result = self
                     .complete_model(ModelRequest {
                         system: "Return a concise string result for the calling Lisp agent.".into(),
                         context: prompt,
                     })
                     .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
+                    .inspect_err(|error| {
                         kernel.clear_trap();
                         kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
-                        return Err(error.into());
-                    }
-                };
+                    })?;
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 Ok(TurnOutcome::ToolCompleted {
@@ -465,8 +437,12 @@ impl<M: ModelClient> Scheduler<M> {
             }
             VmTrap::CallAgent { name, request } => {
                 kernel.clear_trap();
+                let child_id = kernel
+                    .spawn_subagent(&name, &request)
+                    .inspect_err(|error| {
+                        kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
+                    })?;
                 kernel.append_transcript_to(&frame_id, &source, &scheduled);
-                let child_id = kernel.spawn_subagent(&name, &request);
                 Ok(TurnOutcome::Spawned {
                     parent_id: frame_id,
                     child_id,
@@ -522,7 +498,10 @@ impl<M: ModelClient> Scheduler<M> {
             truncate(&frame.state.instructions, 16_000)
         };
         let body_budget = MODEL_CONTEXT_LIMIT.saturating_sub(system.len() + directive.len());
-        let mut context = ContextBuilder::new(body_budget);
+        let mut context = String::with_capacity(body_budget + directive.len());
+        let mut section = |heading, body, budget| {
+            append_section(&mut context, body_budget, heading, body, budget)
+        };
 
         let visible_notices = kernel.notices_for_frame(&frame.id);
         let mut notices = String::new();
@@ -547,7 +526,7 @@ impl<M: ModelClient> Scheduler<M> {
             );
             notice_watermark = Some(message.sequence);
         }
-        context.section("Current human messages and notices", &notices, 12_000);
+        section("Current human messages and notices", &notices, 12_000);
 
         let mut stack = String::new();
         for active in &kernel.frames {
@@ -557,7 +536,7 @@ impl<M: ModelClient> Scheduler<M> {
                 active.name, active.id, active.status
             );
         }
-        context.section("Active frame stack", &stack, 4_000);
+        section("Active frame stack", &stack, 4_000);
 
         let mut guidance = String::new();
         for hook in &frame.state.context_hooks {
@@ -571,7 +550,7 @@ impl<M: ModelClient> Scheduler<M> {
                 truncate(&entry.value, 1_000)
             );
         }
-        context.section("Context hooks and selected memory", &guidance, 12_000);
+        section("Context hooks and selected memory", &guidance, 12_000);
 
         let mut recent = String::new();
         for entry in &frame.state.transcript {
@@ -582,9 +561,9 @@ impl<M: ModelClient> Scheduler<M> {
                 truncate(&entry.result, 1_200)
             );
         }
-        context.section("Recent Lisp actions and results", &recent, 24_000);
+        section("Recent Lisp actions and results", &recent, 24_000);
         let compacted = frame.state.compacted_context.render();
-        context.section("Earlier compacted context", &compacted, 6_000);
+        section("Earlier compacted context", &compacted, 6_000);
 
         let mut library = String::new();
         for name in kernel.env.namespace_names() {
@@ -599,15 +578,10 @@ impl<M: ModelClient> Scheduler<M> {
                 let _ = writeln!(library, "- {}/{}", namespace, name);
             }
         }
-        context.section("Library discovery", &library, 4_000);
+        section("Library discovery", &library, 4_000);
 
-        (
-            ModelRequest {
-                system,
-                context: context.finish(directive),
-            },
-            notice_watermark,
-        )
+        context.push_str(directive);
+        (ModelRequest { system, context }, notice_watermark)
     }
 
     fn compact_current_frame(&self, kernel: &mut Kernel) {

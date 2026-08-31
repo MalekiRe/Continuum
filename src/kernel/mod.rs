@@ -1,13 +1,12 @@
 mod builtins;
-pub mod native;
+pub(crate) mod native;
 mod traps;
 use crate::ids::{FrameId, MessageId, SnapshotId};
 use crate::vm::env::{EnvRef, EnvironmentId};
 use crate::vm::eval;
-use crate::vm::value::Function;
-use crate::vm::value::Value;
+use crate::vm::value::{Function, Value, collect_captured_environments};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WakeEntry {
@@ -18,6 +17,12 @@ pub(crate) struct WakeEntry {
 
 fn default_next_notice_sequence() -> u64 {
     1
+}
+
+#[derive(Debug, Clone)]
+struct CurrentForm {
+    source: String,
+    top_level_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,13 +36,15 @@ pub struct Kernel {
     notices: Vec<StackNotice>,
     #[serde(default = "default_next_notice_sequence")]
     next_notice_sequence: u64,
-    /// Current expression source being evaluated (for source retention).
+    /// Current parsed top-level form and exact source (for suspension and retention).
     #[serde(skip)]
-    pub(crate) current_source: Option<String>,
+    current_form: Option<CurrentForm>,
     #[serde(skip)]
     pub(crate) eval_control: eval::EvalControl,
     #[serde(skip)]
     output: crate::output::OutputSink,
+    #[serde(skip)]
+    natives: HashMap<String, crate::vm::value::NativeFn>,
     #[serde(default, rename = "lexical_heap", skip_serializing)]
     legacy_lexical_heap: indexmap::IndexMap<EnvironmentId, Vec<indexmap::IndexMap<String, Value>>>,
 }
@@ -92,7 +99,7 @@ impl FrameState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FrameStatus {
     Running,
     Waiting,
@@ -120,11 +127,19 @@ pub enum ScheduleError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AllocationError {
+    #[error("{0} identifier sequence is exhausted")]
+    Exhausted(&'static str),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MessageError {
     #[error("too many unanswered human messages")]
     TooManyPending,
     #[error("unknown or completed message ID: {0}")]
-    Unknown(String),
+    Unknown(MessageId),
+    #[error(transparent)]
+    Allocation(#[from] AllocationError),
 }
 
 /// A single model action and its evaluated result.
@@ -215,13 +230,11 @@ impl CompactedContext {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FrameState {
-    #[serde(default, rename = "current_continuation", skip_serializing)]
-    legacy_continuation: Option<LegacyContinuation>,
     #[serde(default)]
     pub(crate) transcript: Vec<TranscriptEntry>,
     #[serde(default)]
     pub(crate) compacted_context: CompactedContext,
-    #[serde(default, deserialize_with = "deserialize_pending_trap")]
+    #[serde(skip)]
     pub(crate) pending_trap: Option<PendingTrap>,
     #[serde(default)]
     pub(crate) instructions: String,
@@ -231,15 +244,9 @@ pub struct FrameState {
     pub(crate) memory: Vec<MemoryEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyContinuation {
-    #[serde(default)]
-    saved_source: Option<Vec<Value>>,
-}
-
 /// A frame-owned top-level suspension request. Nested suspension is
 /// deliberately rejected until the evaluator has a serializable stack.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingTrap {
     pub source: String,
     pub operation: VmTrap,
@@ -253,7 +260,7 @@ pub enum TrapError {
     AlreadyPending,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VmTrap {
     CallModel { prompt: String },
     RunBash { command: String },
@@ -263,26 +270,9 @@ pub enum VmTrap {
     Reply { message_id: MessageId, text: String },
 }
 
-fn deserialize_pending_trap<'de, D>(deserializer: D) -> Result<Option<PendingTrap>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let Some(value) = value else { return Ok(None) };
-    if let Ok(pending) = serde_json::from_value::<PendingTrap>(value.clone()) {
-        return Ok(Some(pending));
-    }
-    // v2 snapshots stored the operation directly and the source separately.
-    let operation = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-    Ok(Some(PendingTrap {
-        source: "(resume external operation)".into(),
-        operation,
-    }))
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SnapshotConfig {
-    pub(crate) snapshot_dir: String,
+    pub(crate) snapshot_dir: std::path::PathBuf,
     pub(crate) snapshot_count: u64,
 }
 
@@ -338,18 +328,6 @@ impl SnapshotError {
     }
 }
 
-impl From<String> for SnapshotError {
-    fn from(message: String) -> Self {
-        Self::Invalid(message)
-    }
-}
-
-impl From<&str> for SnapshotError {
-    fn from(message: &str) -> Self {
-        Self::Invalid(message.into())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotEnvelope {
     format_version: u32,
@@ -373,9 +351,10 @@ impl Kernel {
             wake_timers: Vec::new(),
             notices: Vec::new(),
             next_notice_sequence: 1,
-            current_source: None,
+            current_form: None,
             eval_control: eval::EvalControl::default(),
             output: crate::output::OutputSink::default(),
+            natives: HashMap::new(),
             legacy_lexical_heap: indexmap::IndexMap::new(),
             storage: SnapshotConfig::default(),
             next_frame_id: 1,
@@ -396,10 +375,6 @@ impl Kernel {
         kernel.frames.push(root_frame);
         kernel.next_frame_id += 1;
 
-        // Create data directory
-        let _ = std::fs::create_dir_all("data");
-        let _ = std::fs::create_dir_all("snapshots");
-
         kernel
     }
 
@@ -411,15 +386,11 @@ impl Kernel {
         &self.frames
     }
 
-    pub fn active_frame(&self) -> Option<&Frame> {
-        self.frames.last()
-    }
-
     pub fn environment(&self) -> &EnvRef {
         &self.env
     }
 
-    pub fn set_snapshot_directory(&mut self, directory: impl Into<String>) {
+    pub fn set_snapshot_directory(&mut self, directory: impl Into<std::path::PathBuf>) {
         self.storage.snapshot_dir = directory.into();
     }
 
@@ -486,10 +457,20 @@ impl Kernel {
             self.wake_timers.clone(),
             self.next_frame_id,
         );
-        let previous_source = self.current_source.replace(source.to_string());
+        let previous_form = self.current_form.replace(CurrentForm {
+            source: source.into(),
+            top_level_head: None,
+        });
         let evaluation = self.eval_control.begin();
-        let result = evaluation.finish(eval::eval(source, self));
-        self.current_source = previous_source;
+        let expressions = crate::vm::reader::read_all(source)
+            .map_err(|error| eval::EvalError::SyntaxError(error.to_string()));
+        if let Ok([Value::List(items)]) = expressions.as_deref()
+            && let Some(Value::Symbol(head)) = items.first()
+        {
+            self.current_form.as_mut().unwrap().top_level_head = Some(head.clone());
+        }
+        let result = evaluation.finish(expressions.and_then(|forms| eval::eval_forms(forms, self)));
+        self.current_form = previous_form;
 
         if result.is_err() {
             let (env, frames, wake_timers, next_frame_id) = checkpoint;
@@ -504,24 +485,28 @@ impl Kernel {
     /// True only when the current top-level form has the requested head.
     /// Used to reject nested suspension until continuations are explicit.
     pub(crate) fn current_form_is(&self, expected: &str) -> bool {
-        let Some(source) = self.current_source.as_deref() else {
-            return false;
-        };
-        let Ok(forms) = crate::vm::reader::read_all(source) else {
-            return false;
-        };
-        if forms.len() != 1 {
-            return false;
-        }
-        matches!(&forms[0], Value::List(items)
-            if matches!(items.first(), Some(Value::Symbol(head)) if head == expected))
+        self.current_form
+            .as_ref()
+            .and_then(|form| form.top_level_head.as_deref())
+            == Some(expected)
+    }
+
+    pub(crate) fn current_source(&self) -> Option<&str> {
+        self.current_form.as_ref().map(|form| form.source.as_str())
     }
 
     /// Create a child frame for a subagent call.
     /// Returns the child's frame ID.
-    pub fn spawn_subagent(&mut self, name: &str, request: &str) -> FrameId {
-        let id = FrameId::new(format!("frame-{}", self.next_frame_id));
-        self.next_frame_id += 1;
+    pub fn spawn_subagent(
+        &mut self,
+        name: &str,
+        request: &str,
+    ) -> Result<FrameId, AllocationError> {
+        let sequence = self.next_frame_id;
+        self.next_frame_id = sequence
+            .checked_add(1)
+            .ok_or(AllocationError::Exhausted("frame"))?;
+        let id = FrameId::new(format!("frame-{sequence}"));
         if let Some(parent) = self.frames.last_mut() {
             parent.status = FrameStatus::Waiting;
         }
@@ -541,15 +526,44 @@ impl Kernel {
                 ..FrameState::default()
             },
         });
-        id
+        Ok(id)
     }
 
     /// Complete the current subagent frame and return its result to the parent.
     pub(crate) fn return_from_subagent(&mut self) {
-        self.frames.pop();
+        if let Some(child) = self.frames.pop() {
+            for notice in &mut self.notices {
+                notice.target_frames.retain(|target| target != &child.id);
+            }
+            self.retire_notices();
+        }
         if let Some(parent) = self.frames.last_mut() {
             parent.status = FrameStatus::Running;
         }
+    }
+
+    fn ensure_notice_capacity(&mut self, count: u64) -> Result<(), AllocationError> {
+        if self.next_notice_sequence.checked_add(count).is_none() {
+            for frame in &mut self.frames {
+                frame.notice_cursor = u64::try_from(
+                    self.notices
+                        .partition_point(|notice| notice.sequence <= frame.notice_cursor),
+                )
+                .map_err(|_| AllocationError::Exhausted("notice"))?;
+            }
+            for (index, notice) in self.notices.iter_mut().enumerate() {
+                notice.sequence =
+                    u64::try_from(index + 1).map_err(|_| AllocationError::Exhausted("notice"))?;
+            }
+            self.next_notice_sequence = u64::try_from(self.notices.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or(AllocationError::Exhausted("notice"))?;
+        }
+        self.next_notice_sequence
+            .checked_add(count)
+            .ok_or(AllocationError::Exhausted("notice"))?;
+        Ok(())
     }
 
     /// Deliver a human message as an interrupt to the current frame.
@@ -558,7 +572,8 @@ impl Kernel {
         id: Option<MessageId>,
         text: String,
         target_frames: Vec<FrameId>,
-    ) -> u64 {
+    ) -> Result<u64, AllocationError> {
+        self.ensure_notice_capacity(1)?;
         let sequence = self.next_notice_sequence;
         self.next_notice_sequence += 1;
         self.notices.push(StackNotice {
@@ -568,7 +583,7 @@ impl Kernel {
             target_frames,
             handled: false,
         });
-        sequence
+        Ok(sequence)
     }
 
     pub fn human_message(&mut self, text: &str) -> Result<MessageId, MessageError> {
@@ -587,10 +602,7 @@ impl Kernel {
             Some(id.clone()),
             text.chars().take(8_000).collect(),
             targets,
-        );
-        for frame in &mut self.frames {
-            frame.status = FrameStatus::Running;
-        }
+        )?;
         Ok(id)
     }
 
@@ -605,7 +617,7 @@ impl Kernel {
             .notices
             .iter_mut()
             .find(|notice| notice.id.as_ref() == Some(id) && !notice.handled)
-            .ok_or_else(|| MessageError::Unknown(id.to_string()))?;
+            .ok_or_else(|| MessageError::Unknown(id.clone()))?;
         notice.handled = true;
         self.retire_notices();
         Ok(())
@@ -731,7 +743,7 @@ impl Kernel {
         }
     }
 
-    fn migrate_legacy_messages(&mut self) {
+    fn migrate_legacy_messages(&mut self) -> Result<(), AllocationError> {
         fn convert(text: String) -> LegacyMessage {
             if let Some(rest) = text.strip_prefix("Human message [")
                 && let Some((id, body)) = rest.split_once("]: ")
@@ -746,17 +758,6 @@ impl Kernel {
 
         let mut migrated: Vec<(LegacyMessage, Vec<FrameId>)> = Vec::new();
         for frame in &mut self.frames {
-            if let Some(legacy) = frame.state.legacy_continuation.take()
-                && let Some(pending) = frame.state.pending_trap.as_mut()
-                && pending.source == "(resume external operation)"
-                && let Some(forms) = legacy.saved_source
-            {
-                pending.source = forms
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-            }
             let mut messages = std::mem::take(&mut frame.legacy_messages);
             if let Some(text) = frame.pending_message.take() {
                 messages.push(convert(text));
@@ -784,77 +785,140 @@ impl Kernel {
                 .iter()
                 .any(|notice| notice.id == message.id && notice.text == message.text)
             {
-                self.push_notice(message.id, message.text, targets);
+                self.push_notice(message.id, message.text, targets)?;
             }
         }
+        Ok(())
     }
 
     /// Check and fire scheduled wake timers.
-    pub fn check_wake_timers(&mut self) -> usize {
+    pub fn check_wake_timers(&mut self) -> Result<usize, AllocationError> {
         let now = chrono::Utc::now();
         let fired: Vec<_> = self
             .wake_timers
             .extract_if(.., |entry| entry.wake_at <= now)
+            .filter(|entry| self.frames.iter().any(|frame| frame.id == entry.frame_id))
             .collect();
+        let required = u64::try_from(fired.len()).map_err(|_| AllocationError::Exhausted("notice"));
+        if let Err(error) = required.and_then(|count| self.ensure_notice_capacity(count)) {
+            self.wake_timers.extend(fired);
+            return Err(error);
+        }
         let count = fired.len();
         for entry in fired {
-            if let Some(frame) = self
-                .frames
-                .iter_mut()
-                .find(|frame| frame.id == entry.frame_id)
+            self.push_notice(None, entry.action, vec![entry.frame_id])?;
+        }
+        Ok(count)
+    }
+
+    fn repair_retired_frame_references(&mut self) {
+        let frame_ids: HashSet<_> = self.frames.iter().map(|frame| frame.id.clone()).collect();
+        for notice in &mut self.notices {
+            let mut unique = HashSet::new();
+            notice
+                .target_frames
+                .retain(|target| frame_ids.contains(target) && unique.insert(target.clone()));
+        }
+        self.wake_timers
+            .retain(|entry| frame_ids.contains(&entry.frame_id));
+    }
+
+    fn validate_recovered(&mut self) -> Result<(), SnapshotError> {
+        if self.frames.is_empty() {
+            return Err(SnapshotError::Invalid("snapshot has no frames".into()));
+        }
+        self.env
+            .validate_captured_environments()
+            .map_err(SnapshotError::Invalid)?;
+        let mut frame_ids = HashSet::new();
+        if self
+            .frames
+            .iter()
+            .any(|frame| !frame_ids.insert(frame.id.clone()))
+        {
+            return Err(SnapshotError::Invalid(
+                "snapshot has duplicate frame IDs".into(),
+            ));
+        }
+        let mut message_ids = HashSet::new();
+        let mut previous_sequence = 0;
+        for notice in &self.notices {
+            let mut targets = HashSet::new();
+            if notice.target_frames.is_empty()
+                || notice
+                    .target_frames
+                    .iter()
+                    .any(|target| !frame_ids.contains(target) || !targets.insert(target))
             {
-                frame.status = FrameStatus::Running;
-                self.push_notice(None, entry.action, vec![entry.frame_id]);
+                return Err(SnapshotError::Invalid(
+                    "snapshot notice has invalid target frames".into(),
+                ));
+            }
+            if notice.sequence <= previous_sequence {
+                return Err(SnapshotError::Invalid(
+                    "snapshot notice sequence is duplicate or unordered".into(),
+                ));
+            }
+            previous_sequence = notice.sequence;
+            if !notice.handled
+                && let Some(id) = &notice.id
+                && !message_ids.insert(id.clone())
+            {
+                return Err(SnapshotError::Invalid(
+                    "snapshot has duplicate pending message IDs".into(),
+                ));
             }
         }
-        count
+        let greatest_seen = self
+            .frames
+            .iter()
+            .map(|frame| frame.notice_cursor)
+            .fold(previous_sequence, u64::max);
+        self.next_notice_sequence =
+            self.next_notice_sequence
+                .max(greatest_seen.checked_add(1).ok_or_else(|| {
+                    SnapshotError::Invalid("snapshot notice sequence is exhausted".into())
+                })?);
+        if self
+            .wake_timers
+            .iter()
+            .any(|entry| !frame_ids.contains(&entry.frame_id))
+        {
+            return Err(SnapshotError::Invalid(
+                "snapshot wake timer targets an unknown frame".into(),
+            ));
+        }
+        if let Some(maximum) = self
+            .frames
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .id
+                    .as_str()
+                    .strip_prefix("frame-")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .max()
+        {
+            self.next_frame_id =
+                self.next_frame_id
+                    .max(maximum.checked_add(1).ok_or_else(|| {
+                        SnapshotError::Invalid("snapshot frame sequence is exhausted".into())
+                    })?);
+        }
+        Ok(())
     }
 
     fn collect_lexical_arena(&mut self) {
-        fn visit(value: &Value, environments: &mut HashSet<EnvironmentId>) {
-            match value {
-                Value::Function(Function::Interpreted { env_id, body, .. }) => {
-                    environments.insert(*env_id);
-                    for value in body {
-                        visit(value, environments);
-                    }
-                }
-                Value::List(values) | Value::Vector(values) => {
-                    for value in values {
-                        visit(value, environments);
-                    }
-                }
-                Value::Map(values) => {
-                    for (key, value) in values {
-                        visit(key, environments);
-                        visit(value, environments);
-                    }
-                }
-                Value::Macro(crate::vm::value::Macro::SyntaxRules { rules, .. }) => {
-                    for (pattern, template) in rules {
-                        for value in pattern {
-                            visit(value, environments);
-                        }
-                        visit(template, environments);
-                    }
-                }
-                Value::Tagged { fields, .. } => {
-                    for value in fields {
-                        visit(value, environments);
-                    }
-                }
-                _ => {}
-            }
-        }
-
         let mut reachable = HashSet::from([EnvironmentId::ROOT, self.env.current_environment()]);
         for namespace in self.env.namespaces.values() {
             for value in namespace.bindings.values() {
-                visit(value, &mut reachable);
+                collect_captured_environments([value], &mut reachable);
             }
             for history in namespace.history.values() {
                 for record in history {
-                    visit(&record.value, &mut reachable);
+                    collect_captured_environments([&record.value], &mut reachable);
                 }
             }
         }
@@ -864,7 +928,7 @@ impl Kernel {
                 ..
             }) = &frame.state.pending_trap
             {
-                visit(value, &mut reachable);
+                collect_captured_environments([value], &mut reachable);
             }
         }
 
@@ -880,7 +944,7 @@ impl Kernel {
                 }
                 for cell in environment.bindings.values() {
                     if let Some(value) = self.env.lexical.cells.get(cell) {
-                        visit(value, &mut reachable);
+                        collect_captured_environments([value], &mut reachable);
                     }
                 }
                 pending.extend(reachable.difference(&scanned).copied());
@@ -914,11 +978,19 @@ impl Kernel {
         }
         let now = chrono::Utc::now();
         let timestamp = now.to_rfc3339();
-        let id = SnapshotId::new(format!("snap-{}", now.format("%Y%m%d-%H%M%S-%6f")));
+        let id = SnapshotId::new(format!(
+            "snap-{}-{}",
+            now.format("%Y%m%d-%H%M%S-%6f"),
+            uuid::Uuid::new_v4()
+        ));
 
         let mut saved = self.clone();
         saved.collect_lexical_arena();
-        saved.storage.snapshot_count += 1;
+        saved.storage.snapshot_count = saved
+            .storage
+            .snapshot_count
+            .checked_add(1)
+            .ok_or_else(|| SnapshotError::Invalid("snapshot counter is exhausted".into()))?;
         let kernel = serde_json::to_value(&saved)
             .map_err(|error| SnapshotError::json("snapshot serialization", error))?;
         let payload = serde_json::to_vec(&kernel)
@@ -933,7 +1005,7 @@ impl Kernel {
         };
         let bytes = serde_json::to_vec(&envelope)
             .map_err(|error| SnapshotError::json("snapshot envelope", error))?;
-        let directory = std::path::PathBuf::from(&self.storage.snapshot_dir);
+        let directory = self.storage.snapshot_dir.clone();
         std::fs::create_dir_all(&directory)
             .map_err(|error| SnapshotError::io("create snapshot directory", error))?;
         atomic_write(&directory.join(format!("snapshot-{}.json", id)), &bytes)?;
@@ -954,11 +1026,9 @@ impl Kernel {
 
     pub fn recover_from_dir(directory: impl AsRef<std::path::Path>) -> Result<Self, SnapshotError> {
         let directory = directory.as_ref();
-        std::fs::create_dir_all(directory)
-            .map_err(|error| SnapshotError::io("create snapshot directory", error))?;
         let files = snapshot_files(directory)?;
         if files.is_empty() {
-            return Err("no snapshots found".into());
+            return Err(SnapshotError::NotFound);
         }
 
         let mut failures = Vec::new();
@@ -966,20 +1036,39 @@ impl Kernel {
             match recover_snapshot_file(&path) {
                 Ok(mut kernel) => {
                     kernel.migrate_legacy_lexical_heap();
+                    kernel.repair_retired_frame_references();
+                    kernel.current_form = None;
+                    if let Err(error) = kernel.validate_recovered() {
+                        failures.push(format!("{}: {}", path.display(), error));
+                        continue;
+                    }
+                    if let Err(error) = kernel.migrate_legacy_messages() {
+                        failures.push(format!("{}: {}", path.display(), error));
+                        continue;
+                    }
+                    if let Err(error) = kernel.validate_recovered() {
+                        failures.push(format!("{}: {}", path.display(), error));
+                        continue;
+                    }
                     kernel.register_tools();
-                    kernel.current_source = None;
-                    kernel.migrate_legacy_messages();
                     let notice = format!(
                         "Restarted from {}; any in-flight external operation was interrupted",
                         path.display()
                     );
                     let targets = kernel.frames.iter().map(|frame| frame.id.clone()).collect();
-                    for frame in &mut kernel.frames {
-                        // External work is never inferred or re-executed after recovery.
-                        frame.state.pending_trap = None;
-                        frame.status = FrameStatus::Running;
+                    let active = kernel.frames.len() - 1;
+                    for (index, frame) in kernel.frames.iter_mut().enumerate() {
+                        frame.status = if index == active {
+                            FrameStatus::Running
+                        } else {
+                            FrameStatus::Waiting
+                        };
                     }
-                    kernel.push_notice(None, notice, targets);
+                    if let Err(error) = kernel.push_notice(None, notice, targets) {
+                        failures.push(format!("{}: {}", path.display(), error));
+                        continue;
+                    }
+                    kernel.storage.snapshot_dir = directory.to_path_buf();
                     return Ok(kernel);
                 }
                 Err(error) => failures.push(format!("{}: {}", path.display(), error)),
@@ -996,10 +1085,10 @@ impl Kernel {
         arity: crate::vm::value::Arity,
         func: crate::vm::value::NativeFn,
     ) {
+        self.natives.insert(qualified_name.into(), func);
         let val = Value::Function(Function::Native {
-            name: qualified_name.to_string(),
+            name: qualified_name.into(),
             arity,
-            func,
         });
         let full_name = if qualified_name.contains('/') {
             qualified_name.to_string()
@@ -1007,6 +1096,10 @@ impl Kernel {
             format!("kernel/{}", qualified_name)
         };
         self.env.force_define(&full_name, val);
+    }
+
+    pub(crate) fn native(&self, name: &str) -> Option<crate::vm::value::NativeFn> {
+        self.natives.get(name).copied()
     }
 
     pub fn inspect_namespace(&self, name: &str) -> Option<Vec<String>> {
@@ -1029,7 +1122,7 @@ impl Kernel {
     }
 
     pub(crate) fn set_trap(&mut self, operation: VmTrap) -> Result<(), TrapError> {
-        let source = self.current_source.clone().unwrap_or_default();
+        let source = self.current_source().unwrap_or_default().to_owned();
         let frame = self.frames.last_mut().ok_or(TrapError::NoActiveFrame)?;
         if frame.state.pending_trap.is_some() {
             return Err(TrapError::AlreadyPending);
@@ -1067,6 +1160,11 @@ impl Kernel {
         self.frames.last()?.state.pending_trap.clone()
     }
 
+    /// Discard an in-flight external operation after its owning turn is cancelled.
+    pub fn discard_pending_operation(&mut self) {
+        self.clear_trap();
+    }
+
     pub(crate) fn clear_trap(&mut self) {
         if let Some(frame) = self.frames.last_mut() {
             frame.state.pending_trap = None;
@@ -1077,7 +1175,7 @@ impl Kernel {
         self.frames.last_mut()?.state.pending_trap.take()
     }
 }
-fn qualify_user_name(name: &str) -> String {
+pub(crate) fn qualify_user_name(name: &str) -> String {
     if name.contains('/') {
         name.into()
     } else {
@@ -1122,22 +1220,32 @@ fn sync_directory(path: &std::path::Path) -> Result<(), SnapshotError> {
 }
 
 fn snapshot_files(directory: &std::path::Path) -> Result<Vec<std::path::PathBuf>, SnapshotError> {
-    let mut files: Vec<_> = std::fs::read_dir(directory)
-        .map_err(|error| SnapshotError::io("read snapshot directory", error))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-                && ["full-", "inc-", "snapshot-"]
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix))
-        })
-        .collect();
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SnapshotError::NotFound
+        } else {
+            SnapshotError::io("read snapshot directory", error)
+        }
+    })?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| SnapshotError::io("read snapshot directory entry", error))?
+            .path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+            && ["full-", "inc-", "snapshot-"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            files.push(path);
+        }
+    }
     files.sort_by_key(|path| std::cmp::Reverse(snapshot_sort_key(path)));
     Ok(files)
 }
@@ -1191,7 +1299,7 @@ fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, SnapshotError
     let kernel_value = legacy
         .get("kernel")
         .cloned()
-        .ok_or_else(|| "missing kernel field".to_string())?;
+        .ok_or_else(|| SnapshotError::Invalid("missing kernel field".into()))?;
     let meta_path = path.with_extension("meta");
     let meta: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&meta_path)
@@ -1201,10 +1309,10 @@ fn recover_snapshot_file(path: &std::path::Path) -> Result<Kernel, SnapshotError
     let expected = meta
         .get("checksum")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "legacy metadata missing checksum".to_string())?;
+        .ok_or_else(|| SnapshotError::Invalid("legacy metadata missing checksum".into()))?;
     let actual = sha256(&bytes);
     if expected != actual {
-        return Err("legacy checksum mismatch".into());
+        return Err(SnapshotError::Invalid("legacy checksum mismatch".into()));
     }
     serde_json::from_value(kernel_value)
         .map_err(|error| SnapshotError::json("deserialize legacy kernel", error))
