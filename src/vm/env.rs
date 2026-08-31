@@ -437,17 +437,11 @@ impl EnvRef {
             .find_cell(self.current_environment, symbol)
             .and_then(|cell| self.lexical.cells.get(&cell))
             .or_else(|| {
-                self.namespaces
-                    .get("user")
-                    .and_then(|namespace| namespace.get(symbol))
-            })
-            .or_else(|| {
-                self.namespaces
-                    .get("kernel")
-                    .and_then(|namespace| namespace.get(symbol))
+                ["user", "kernel"]
+                    .into_iter()
+                    .find_map(|namespace| self.namespaces.get(namespace)?.get(symbol))
             })
     }
-
     pub fn define(&mut self, qualified_name: &str, value: Value) -> Result<(), EnvError> {
         let (namespace, name) = qualified_parts(qualified_name)?;
         let ns_name = namespace.to_string();

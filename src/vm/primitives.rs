@@ -64,30 +64,22 @@ impl Kernel {
             kernel.write_output(&format!("{value}\n"));
             Ok((*value).clone())
         });
-        exact_native!(self, "kernel/nil?", |_kernel, [value]| Ok(Value::Bool(
-            matches!(value, Value::Nil)
-        )));
-        exact_native!(self, "kernel/number?", |_kernel, [value]| {
-            Ok(Value::Bool(matches!(
-                value,
-                Value::Int(_) | Value::Float(_)
-            )))
-        });
-        exact_native!(self, "kernel/symbol?", |_kernel, [value]| Ok(Value::Bool(
-            matches!(value, Value::Symbol(_))
-        )));
-        exact_native!(self, "kernel/string?", |_kernel, [value]| Ok(Value::Bool(
-            matches!(value, Value::String(_))
-        )));
+        macro_rules! predicate {
+            ($name:literal, $pattern:pat) => {
+                exact_native!(self, $name, |_kernel, [value]| Ok(Value::Bool(matches!(
+                    value, $pattern
+                ))));
+            };
+        }
+        predicate!("kernel/nil?", Value::Nil);
+        predicate!("kernel/number?", Value::Int(_) | Value::Float(_));
+        predicate!("kernel/symbol?", Value::Symbol(_));
+        predicate!("kernel/string?", Value::String(_));
         exact_native!(self, "kernel/list?", |_kernel, [value]| Ok(Value::Bool(
             value.is_list()
         )));
-        exact_native!(self, "kernel/function?", |_kernel, [value]| Ok(
-            Value::Bool(matches!(value, Value::Function(_)))
-        ));
-        exact_native!(self, "kernel/keyword?", |_kernel, [value]| Ok(Value::Bool(
-            matches!(value, Value::Keyword(_))
-        )));
+        predicate!("kernel/function?", Value::Function(_));
+        predicate!("kernel/keyword?", Value::Keyword(_));
         exact_native!(self, "string-append", |_kernel, [left, right]| {
             Ok(Value::string(&format!(
                 "{}{}",

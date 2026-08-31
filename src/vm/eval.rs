@@ -1,4 +1,4 @@
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, qualify_user_name};
 use crate::vm::env::{DataFamily, DataVariant, EnvRef};
 use crate::vm::value::*;
 use indexmap::IndexMap;
@@ -148,30 +148,10 @@ pub fn eval(input: &str, kernel: &mut Kernel) -> Result<Value, EvalError> {
 }
 
 pub(crate) fn eval_forms(exprs: Vec<Value>, kernel: &mut Kernel) -> Result<Value, EvalError> {
-    let mut result = Value::Nil;
-    for expr in exprs {
-        // Tail-call trampoline steps may move the active arena cursor.
-        // A completed top-level form must always restore its caller scope.
-        let caller_environment = kernel.env.current_environment();
-        let mut current = expr;
-        loop {
-            match eval_step(current, kernel) {
-                Ok(StepResult::Done(value)) => {
-                    result = value;
-                    kernel.env.activate_environment(caller_environment)?;
-                    break;
-                }
-                Ok(StepResult::Step(next)) => current = next,
-                Err(error) => {
-                    kernel.env.activate_environment(caller_environment)?;
-                    return Err(error);
-                }
-            }
-        }
-    }
-    Ok(result)
+    exprs
+        .into_iter()
+        .try_fold(Value::Nil, |_, expression| eval_any(expression, kernel))
 }
-
 fn eval_value_inner(val: Value, kernel: &mut Kernel, tail_pos: bool) -> Result<Value, EvalError> {
     // Safepoint: check if kernel wants to interrupt
     kernel.eval_control.check_safepoint()?;
@@ -248,6 +228,30 @@ pub fn eval_value(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
 
 // ---- Special forms ----
 
+fn expect_symbol(value: &Value, form: &str, expected: &str) -> Result<String, EvalError> {
+    let Value::Symbol(name) = value else {
+        return Err(EvalError::InvalidForm(format!(
+            "{form}: expected {expected}, got {value}"
+        )));
+    };
+    Ok(name.clone())
+}
+
+fn expect_symbols(values: &[Value], form: &str, expected: &str) -> Result<Vec<String>, EvalError> {
+    values
+        .iter()
+        .map(|value| expect_symbol(value, form, expected))
+        .collect()
+}
+
+fn interpreted_function(params: Vec<String>, body: Vec<Value>, kernel: &Kernel) -> Value {
+    Value::Function(Function::Interpreted {
+        params,
+        body,
+        env_id: kernel.capture_lexical_env(),
+    })
+}
+
 /// Evaluate a value, handling TailCall by following the trampoline.
 fn eval_any(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
     let caller_environment = kernel.env.current_environment();
@@ -264,11 +268,10 @@ fn eval_any(val: Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
 }
 
 fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
-    if args.is_empty() {
+    let Some(target) = args.first() else {
         return Err(EvalError::InvalidForm("define requires arguments".into()));
-    }
-
-    match &args[0] {
+    };
+    let (name, value, retained) = match target {
         Value::Symbol(name) => {
             if args.len() != 2 {
                 return Err(EvalError::InvalidForm(format!(
@@ -276,53 +279,28 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
                     args.len()
                 )));
             }
-            let qualified = if name.contains('/') {
-                name.clone()
-            } else {
-                format!("user/{}", name)
-            };
             let retained = if kernel.current_form_is("define") {
                 kernel.current_source().unwrap_or_default().to_owned()
             } else {
-                format!("(define {} {})", name, args[1])
+                format!("(define {name} {})", args[1])
             };
-            let val = eval_any(args[1].clone(), kernel)?;
-            kernel.env.define(&qualified, val)?;
-            kernel.store_source(&qualified, &retained);
-            Ok(Value::Symbol(name.clone()))
+            (name.clone(), eval_any(args[1].clone(), kernel)?, retained)
         }
-        Value::List(params) => {
-            if params.is_empty() {
+        Value::List(signature) => {
+            let Some(name) = signature.first() else {
                 return Err(EvalError::InvalidForm(
                     "define: function definition needs a name".into(),
                 ));
-            }
-            let name = match &params[0] {
-                Value::Symbol(n) => n.clone(),
-                other => {
-                    return Err(EvalError::InvalidForm(format!(
-                        "define: expected symbol for function name, got {}",
-                        other
-                    )));
-                }
             };
-            let param_names: Vec<String> = params[1..]
-                .iter()
-                .map(|parameter| match parameter {
-                    Value::Symbol(name) => Ok(name.clone()),
-                    other => Err(EvalError::InvalidForm(format!(
-                        "define: expected symbol parameter, got {}",
-                        other
-                    ))),
-                })
-                .collect::<Result<_, _>>()?;
+            let name = expect_symbol(name, "define", "symbol for function name")?;
+            let params = expect_symbols(&signature[1..], "define", "symbol parameter")?;
             let body = args[1..].to_vec();
             let reconstructed = format!(
                 "(define ({} {}) {})",
                 name,
-                param_names.join(" "),
+                params.join(" "),
                 body.iter()
-                    .map(|v| format!("{}", v))
+                    .map(|value| value.to_string())
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -330,115 +308,54 @@ fn eval_define(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> 
                 kernel
                     .current_source()
                     .map(str::to_owned)
-                    .unwrap_or(reconstructed)
+                    .unwrap_or_else(|| reconstructed.clone())
             } else {
                 reconstructed
             };
-            let lambda = eval_lambda_simple(param_names, body, kernel)?;
-            let qualified = if name.contains('/') {
-                name.clone()
-            } else {
-                format!("user/{}", name)
-            };
-            kernel.env.define(&qualified, lambda)?;
-            kernel.store_source(&qualified, &retained);
-            Ok(Value::Symbol(name))
+            (name, interpreted_function(params, body, kernel), retained)
         }
-        other => Err(EvalError::InvalidForm(format!(
-            "define: expected symbol or list, got {}",
-            other
-        ))),
-    }
+        other => {
+            return Err(EvalError::InvalidForm(format!(
+                "define: expected symbol or list, got {other}"
+            )));
+        }
+    };
+    let qualified = qualify_user_name(&name);
+    kernel.env.define(&qualified, value)?;
+    kernel.store_source(&qualified, &retained);
+    Ok(Value::Symbol(name))
 }
-
 fn eval_undefine(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() != 1 {
         return Err(EvalError::InvalidForm(
             "undefine requires exactly one symbol argument".into(),
         ));
     }
-    let name = match &args[0] {
-        Value::Symbol(s) => s.clone(),
-        other => {
-            return Err(EvalError::InvalidForm(format!(
-                "undefine: expected symbol, got {}",
-                other
-            )));
-        }
-    };
-
-    // Check if this is a data family — if so, remove all constructors atomically
-    // The family name is the full path (e.g., "my/Foo" not just "Foo")
+    let name = expect_symbol(&args[0], "undefine", "symbol")?;
     if kernel.env.is_data_family(&name) {
-        // Undefine the data family, removing all constructors atomically
         kernel.env.undefine_data_family(&name)?;
         return Ok(Value::Symbol(name));
     }
-
-    // Regular undefine
-    let qualified = if name.contains('/') {
-        name
-    } else {
-        format!("user/{}", name)
-    };
-    kernel.env.undefine(&qualified)?;
+    kernel.env.undefine(&qualify_user_name(&name))?;
     Ok(Value::Nil)
 }
-
 fn eval_lambda(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
-    if args.is_empty() {
+    let Some(parameter_list) = args.first() else {
         return Err(EvalError::InvalidForm(
             "lambda requires parameters and body".into(),
         ));
-    }
-    let param_list = &args[0];
-    let body = args[1..].to_vec();
-
-    let param_names = match param_list {
-        Value::List(items) => {
-            let mut names = Vec::new();
-            for p in items {
-                match p {
-                    Value::Symbol(s) => names.push(s.clone()),
-                    other => {
-                        return Err(EvalError::InvalidForm(format!(
-                            "lambda: expected symbol parameter, got {}",
-                            other
-                        )));
-                    }
-                }
-            }
-            names
-        }
-        _ => {
-            return Err(EvalError::InvalidForm(format!(
-                "lambda: expected parameter list, got {}",
-                param_list
-            )));
-        }
     };
-
-    let env_id = kernel.capture_lexical_env();
-    Ok(Value::Function(Function::Interpreted {
-        params: param_names,
-        body,
-        env_id,
-    }))
+    let Value::List(parameters) = parameter_list else {
+        return Err(EvalError::InvalidForm(format!(
+            "lambda: expected parameter list, got {parameter_list}"
+        )));
+    };
+    Ok(interpreted_function(
+        expect_symbols(parameters, "lambda", "symbol parameter")?,
+        args[1..].to_vec(),
+        kernel,
+    ))
 }
-
-fn eval_lambda_simple(
-    params: Vec<String>,
-    body: Vec<Value>,
-    kernel: &mut Kernel,
-) -> Result<Value, EvalError> {
-    let env_id = kernel.capture_lexical_env();
-    Ok(Value::Function(Function::Interpreted {
-        params,
-        body,
-        env_id,
-    }))
-}
-
 fn eval_if_tail(args: &[Value], kernel: &mut Kernel, tail_pos: bool) -> Result<Value, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::InvalidForm("if expects 2 or 3 arguments".into()));
@@ -458,18 +375,14 @@ fn eval_begin_tail(
     kernel: &mut Kernel,
     tail_pos: bool,
 ) -> Result<Value, EvalError> {
-    if args.is_empty() {
+    let Some((last, preceding)) = args.split_last() else {
         return Ok(Value::Nil);
+    };
+    for expression in preceding {
+        eval_value_inner(expression.clone(), kernel, false)?;
     }
-    // All expressions except the last: no tail position
-    for arg in args.iter().take(args.len() - 1) {
-        let _ = eval_value_inner(arg.clone(), kernel, false)?;
-    }
-    // Last expression: pass through tail_pos
-    let result = eval_value_inner(args.last().unwrap().clone(), kernel, tail_pos)?;
-    Ok(result)
+    eval_value_inner(last.clone(), kernel, tail_pos)
 }
-
 fn parse_bindings(value: &Value, form: &str) -> Result<Vec<(String, Value)>, EvalError> {
     let Value::List(bindings) = value else {
         return Err(EvalError::InvalidForm(format!(
@@ -551,30 +464,11 @@ fn eval_letrec_tail(
     kernel: &mut Kernel,
     tail_pos: bool,
 ) -> Result<Value, EvalError> {
-    let Some(Value::List(raw_bindings)) = args.first() else {
-        return Err(EvalError::InvalidForm(if args.is_empty() {
-            "letrec requires bindings and body".into()
-        } else {
-            "letrec: expected binding list".into()
-        }));
-    };
-    let bindings = raw_bindings
-        .iter()
-        .map(|binding| match binding {
-            Value::List(items) if items.len() == 2 => match &items[0] {
-                Value::Symbol(name) => Ok((name.clone(), items[1].clone())),
-                other => Err(EvalError::InvalidForm(format!(
-                    "letrec: expected symbol, got {}",
-                    other
-                ))),
-            },
-            other => Err(EvalError::InvalidForm(format!(
-                "letrec: expected (name value) pair, got {}",
-                other
-            ))),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let bindings = parse_bindings(
+        args.first()
+            .ok_or_else(|| EvalError::InvalidForm("letrec requires bindings and body".into()))?,
+        "letrec",
+    )?;
     eval_in_new_frame(kernel, |kernel| {
         for (name, _) in &bindings {
             kernel.env.set_lexical(name, Value::Nil);
@@ -586,60 +480,35 @@ fn eval_letrec_tail(
         eval_begin_tail(&args[1..], kernel, tail_pos)
     })
 }
-
 fn eval_set(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::InvalidForm("set! expects 2 arguments".into()));
     }
-    let name = match &args[0] {
-        Value::Symbol(s) => s.clone(),
-        other => {
-            return Err(EvalError::InvalidForm(format!(
-                "set!: expected symbol, got {}",
-                other
-            )));
-        }
-    };
-    let val = eval_any(args[1].clone(), kernel)?;
-
-    // Mutate the shared cell found along the active lexical chain.
-    if kernel.env.set_existing_lexical(&name, val.clone()) {
+    let name = expect_symbol(&args[0], "set!", "symbol")?;
+    let value = eval_any(args[1].clone(), kernel)?;
+    if kernel.env.set_existing_lexical(&name, value.clone()) {
         return Ok(Value::Nil);
     }
-
-    // Check namespaces
-    if name.contains('/') {
-        if kernel.env.lookup(&name).is_some() {
-            kernel.env.define(&name, val)?;
-            return Ok(Value::Nil);
-        }
-    } else {
-        let qualified = format!("user/{}", name);
-        if kernel.env.lookup(&qualified).is_some() {
-            kernel.env.define(&qualified, val)?;
-            return Ok(Value::Nil);
-        }
+    let qualified = qualify_user_name(&name);
+    if kernel.env.lookup(&qualified).is_some() {
+        kernel.env.define(&qualified, value)?;
+        return Ok(Value::Nil);
     }
-
     Err(EvalError::UndefinedSymbol(name))
 }
-
 fn eval_quote(args: &[Value]) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::InvalidForm("quote requires an argument".into()));
-    }
-    Ok(args[0].clone())
+    args.first()
+        .cloned()
+        .ok_or_else(|| EvalError::InvalidForm("quote requires an argument".into()))
 }
 
 fn eval_quasiquote(args: &[Value], kernel: &mut Kernel) -> Result<Value, EvalError> {
-    if args.is_empty() {
-        return Err(EvalError::InvalidForm(
-            "quasiquote requires an argument".into(),
-        ));
-    }
-    expand_quasiquote(&args[0], kernel)
+    expand_quasiquote(
+        args.first()
+            .ok_or_else(|| EvalError::InvalidForm("quasiquote requires an argument".into()))?,
+        kernel,
+    )
 }
-
 fn expand_quasiquote(val: &Value, kernel: &mut Kernel) -> Result<Value, EvalError> {
     match val {
         Value::List(items) if !items.is_empty() => {

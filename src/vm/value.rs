@@ -40,31 +40,21 @@ impl Serialize for Arity {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredArity {
+    Exact(u32),
+    Named(String),
+}
+
 impl<'de> Deserialize<'de> for Arity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl serde::de::Visitor<'_> for Visitor {
-            type Value = Arity;
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an exact arity or 'variadic'")
-            }
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Arity, E> {
-                let value = u32::try_from(value).map_err(|_| E::custom("arity exceeds u32"))?;
-                Ok(if value == u32::MAX {
-                    Arity::Variadic
-                } else {
-                    Arity::Exact(value)
-                })
-            }
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Arity, E> {
-                if value == "variadic" {
-                    Ok(Arity::Variadic)
-                } else {
-                    Err(E::custom("invalid arity"))
-                }
-            }
+        match StoredArity::deserialize(deserializer)? {
+            StoredArity::Exact(u32::MAX) => Ok(Self::Variadic),
+            StoredArity::Exact(count) => Ok(Self::Exact(count)),
+            StoredArity::Named(name) if name == "variadic" => Ok(Self::Variadic),
+            StoredArity::Named(_) => Err(serde::de::Error::custom("invalid arity")),
         }
-        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -173,6 +163,22 @@ pub enum Value {
     },
 }
 
+fn write_values(
+    formatter: &mut fmt::Formatter<'_>,
+    open: &str,
+    values: &[Value],
+    close: &str,
+) -> fmt::Result {
+    formatter.write_str(open)?;
+    if let Some((first, rest)) = values.split_first() {
+        write!(formatter, "{first}")?;
+        for value in rest {
+            write!(formatter, " {value}")?;
+        }
+    }
+    formatter.write_str(close)
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -183,26 +189,8 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "{:?}", s),
             Value::Symbol(s) => write!(f, "{}", s),
             Value::Keyword(k) => write!(f, ":{}", k),
-            Value::List(items) => {
-                write!(f, "(")?;
-                for (i, v) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{}", v)?;
-                }
-                write!(f, ")")
-            }
-            Value::Vector(items) => {
-                write!(f, "#(")?;
-                for (i, v) in items.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, " ")?;
-                    }
-                    write!(f, "{}", v)?;
-                }
-                write!(f, ")")
-            }
+            Value::List(items) => write_values(f, "(", items, ")"),
+            Value::Vector(items) => write_values(f, "#(", items, ")"),
             Value::Map(map) => {
                 write!(f, "{{")?;
                 let mut first = true;
@@ -267,24 +255,20 @@ impl PartialEq for Value {
 
 impl std::hash::Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
         match self {
-            Value::Nil => 0u8.hash(state),
-            Value::Bool(b) => (1u8, b).hash(state),
-            Value::Int(n) => (2u8, n).hash(state),
-            Value::Float(n) => (3u8, n.to_bits()).hash(state),
-            Value::String(s) => (4u8, s).hash(state),
-            Value::Symbol(s) => (5u8, s).hash(state),
-            Value::Keyword(k) => (6u8, k).hash(state),
-            Value::List(items) => (7u8, items).hash(state),
-            Value::Vector(items) => (8u8, items).hash(state),
+            Value::Nil => {}
+            Value::Bool(value) => value.hash(state),
+            Value::Int(value) => value.hash(state),
+            Value::Float(value) => value.to_bits().hash(state),
+            Value::String(value) | Value::Symbol(value) | Value::Keyword(value) => {
+                value.hash(state)
+            }
+            Value::List(values) | Value::Vector(values) => values.hash(state),
             Value::Map(map) => {
-                // IndexMap equality is independent of insertion order, so the
-                // hash must be canonical too. Hash each entry, sort the entry
-                // digests, then feed that stable sequence to the caller.
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::Hasher;
-                9u8.hash(state);
-                let mut entries: Vec<u64> = map
+                let mut entries: Vec<_> = map
                     .iter()
                     .map(|(key, value)| {
                         let mut entry = DefaultHasher::new();
@@ -296,13 +280,13 @@ impl std::hash::Hash for Value {
                 entries.sort_unstable();
                 entries.hash(state);
             }
-            Value::Function(function) => (10u8, function).hash(state),
-            Value::Macro(macro_) => (11u8, macro_).hash(state),
+            Value::Function(function) => function.hash(state),
+            Value::Macro(macro_) => macro_.hash(state),
             Value::Tagged {
                 family,
                 variant,
                 fields,
-            } => (12u8, family, variant, fields).hash(state),
+            } => (family, variant, fields).hash(state),
         }
     }
 }
@@ -334,6 +318,17 @@ pub(crate) fn collect_captured_environments<'a>(
             _ => {}
         }
     }
+}
+
+macro_rules! value_ref {
+    ($name:ident, $variant:ident, $type:ty) => {
+        pub fn $name(&self) -> Option<&$type> {
+            match self {
+                Self::$variant(value) => Some(value),
+                _ => None,
+            }
+        }
+    };
 }
 
 impl Value {
@@ -418,40 +413,11 @@ impl Value {
         }
     }
 
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Value::String(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    pub fn as_symbol(&self) -> Option<&str> {
-        match self {
-            Value::Symbol(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    pub fn as_list(&self) -> Option<&[Value]> {
-        match self {
-            Value::List(values) => Some(values),
-            _ => None,
-        }
-    }
-
-    pub fn as_vector(&self) -> Option<&[Value]> {
-        match self {
-            Value::Vector(values) => Some(values),
-            _ => None,
-        }
-    }
-
-    pub fn as_map(&self) -> Option<&IndexMap<Value, Value>> {
-        match self {
-            Value::Map(values) => Some(values),
-            _ => None,
-        }
-    }
+    value_ref!(as_str, String, str);
+    value_ref!(as_symbol, Symbol, str);
+    value_ref!(as_list, List, [Value]);
+    value_ref!(as_vector, Vector, [Value]);
+    value_ref!(as_map, Map, IndexMap<Value, Value>);
 
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
