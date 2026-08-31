@@ -681,19 +681,13 @@ fn format_execution(result: &ExecutionResult) -> String {
 
 fn truncate(value: &str, max: usize) -> String {
     if value.len() <= max {
-        return value.to_string();
+        return value.into();
     }
     const ELLIPSIS: &str = "…";
-    if max < ELLIPSIS.len() {
-        let mut end = max.min(value.len());
-        while end > 0 && !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        return value[..end].to_string();
-    }
-    let mut end = (max - ELLIPSIS.len()).min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{}", &value[..end], ELLIPSIS)
+    let suffix = if max >= ELLIPSIS.len() { ELLIPSIS } else { "" };
+    let limit = max.saturating_sub(suffix.len()).min(value.len());
+    let end = (0..=limit)
+        .rfind(|&index| value.is_char_boundary(index))
+        .unwrap_or_default();
+    format!("{}{suffix}", &value[..end])
 }
