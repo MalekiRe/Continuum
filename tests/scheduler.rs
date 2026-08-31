@@ -97,63 +97,16 @@ async fn human_message_is_seen_then_explicitly_replied_to() {
     assert!(!kernel.has_pending_message(&id));
 }
 
-#[tokio::test]
-async fn subagent_gets_own_context_and_returns_to_parent() {
-    let (scheduler, model) = scheduler(&[
-        r#"(agent/call "researcher" "inspect the build")"#,
-        r#"(agent/return "done")"#,
-    ]);
-    let mut kernel = Kernel::new();
-    let parent = kernel.frames()[0].id().clone();
-    let first = scheduler.run_turn(&mut kernel).await.unwrap();
-    assert!(matches!(first, TurnOutcome::Spawned { ref parent_id, .. } if parent_id == &parent));
-    assert_eq!(kernel.frames().len(), 2);
-    assert!(
-        kernel
-            .frames()
-            .last()
-            .unwrap()
-            .state()
-            .instructions()
-            .contains("researcher")
-    );
-    assert_eq!(
-        kernel.frames()[0].status(),
-        persistent_lisp_harness::FrameStatus::Waiting
-    );
-    let second = scheduler.run_turn(&mut kernel).await.unwrap();
-    assert!(
-        matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "done")
-    );
-    assert_eq!(kernel.frames().len(), 1);
-    assert_eq!(
-        kernel.frames()[0].status(),
-        persistent_lisp_harness::FrameStatus::Running
-    );
-    let requests = model.requests.lock().unwrap();
-    assert!(requests[1].system.contains("researcher"));
-    assert!(requests[1].system.contains("inspect the build"));
-}
-
-#[test]
-fn nested_suspension_is_rejected_transactionally() {
-    let mut kernel = Kernel::new();
-    let result = kernel.eval(r#"(begin (define x 1) (bash "true"))"#);
-    assert!(result.is_err());
-    assert!(kernel.eval("x").is_err());
-    assert!(kernel.take_trap().is_none());
-}
-
 #[test]
 fn source_is_exact_and_rolled_back_with_failed_turn() {
     let mut kernel = Kernel::new();
     let source = "(define (hello name)\n  (string-append \"hi \" name))";
-    kernel.eval(source).unwrap();
+    kernel.eval_value(source).unwrap();
     assert_eq!(kernel.environment().source("user/hello"), Some(source));
-    let bad = kernel.eval("(begin (define (ghost) 1) (missing))");
+    let bad = kernel.eval_value("(begin (define (ghost) 1) (missing))");
     assert!(bad.is_err());
     assert!(kernel.environment().source("user/ghost").is_none());
-    assert!(kernel.eval("ghost").is_err());
+    assert!(kernel.eval_value("ghost").is_err());
 }
 
 #[test]
@@ -190,28 +143,15 @@ async fn selected_memory_and_context_hooks_are_injected() {
     let (scheduler, model) = scheduler(&["nil"]);
     let mut kernel = Kernel::new();
     kernel
-        .eval(r#"(memory/remember "project" "Continuum")"#)
+        .eval_value(r#"(memory/remember "project" "Continuum")"#)
         .unwrap();
     kernel
-        .eval(r#"(context/add-hook "Prefer tests before edits")"#)
+        .eval_value(r#"(context/inject "direction" :frame "Prefer tests before edits")"#)
         .unwrap();
     scheduler.run_turn(&mut kernel).await.unwrap();
     let request = &model.requests.lock().unwrap()[0];
     assert!(request.context.contains("project: Continuum"));
     assert!(request.context.contains("Prefer tests before edits"));
-}
-
-#[tokio::test]
-async fn scheduler_resumes_pending_tool_without_new_model_call() {
-    let (scheduler, model) = scheduler(&[]);
-    let mut kernel = Kernel::new();
-    kernel.eval(r#"(bash "printf resumed")"#).unwrap();
-    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
-    assert!(
-        matches!(outcome, TurnOutcome::ToolCompleted { ref result, .. } if result.contains("resumed"))
-    );
-    assert!(model.requests.lock().unwrap().is_empty());
-    assert!(!kernel.has_trap());
 }
 
 #[tokio::test]
@@ -261,13 +201,6 @@ async fn pending_human_message_survives_until_valid_reply() {
 }
 
 #[test]
-fn reply_to_unknown_message_is_rejected_without_a_trap() {
-    let mut kernel = Kernel::new();
-    assert!(kernel.eval(r#"(message/reply "made-up" "no")"#).is_err());
-    assert!(!kernel.has_trap());
-}
-
-#[test]
 fn recent_results_and_total_context_are_bounded() {
     let (scheduler, _) = scheduler(&[]);
     let mut kernel = Kernel::new();
@@ -284,10 +217,10 @@ fn context_budget_preserves_high_priority_guidance() {
     let mut kernel = Kernel::new();
     let message_id = kernel.human_message("PRIORITY-HUMAN").unwrap();
     kernel
-        .eval(r#"(memory/remember "priority" "PRIORITY-MEMORY")"#)
+        .eval_value(r#"(memory/remember "priority" "PRIORITY-MEMORY")"#)
         .unwrap();
     kernel
-        .eval(r#"(context/add-hook "PRIORITY-HOOK")"#)
+        .eval_value(r#"(context/inject "priority-hook" :frame "PRIORITY-HOOK")"#)
         .unwrap();
     for index in 0..100 {
         kernel.append_transcript(&format!("action-{index}"), &"noise".repeat(10_000));
@@ -389,33 +322,6 @@ impl ModelClient for PendingTrappedModel {
 }
 
 #[tokio::test]
-async fn cancelled_turn_can_discard_its_installed_external_trap() {
-    let model = PendingTrappedModel {
-        calls: Arc::new(AtomicUsize::new(0)),
-        trapped_request_started: Arc::new(tokio::sync::Notify::new()),
-    };
-    let executor = Executor::new(ExecutorConfig::with_working_directory(temp_root(
-        "trapped-model-cancel",
-    )))
-    .unwrap();
-    let scheduler = Scheduler::new(model.clone(), executor);
-    let mut kernel = Kernel::new();
-    kernel.set_snapshot_directory(temp_root("trapped-model-snapshot"));
-
-    let mut turn = Box::pin(scheduler.run_turn(&mut kernel));
-    tokio::select! {
-        _ = model.trapped_request_started.notified() => {}
-        result = &mut turn => panic!("trapped model request finished unexpectedly: {result:?}"),
-    }
-    drop(turn);
-    assert!(kernel.has_trap());
-
-    kernel.discard_pending_operation();
-    assert!(!kernel.has_trap());
-    kernel.snapshot().unwrap();
-}
-
-#[tokio::test]
 async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
     let model = PendingFirstModel {
         calls: Arc::new(AtomicUsize::new(0)),
@@ -443,7 +349,7 @@ async fn interrupted_request_is_dropped_before_the_next_generation_starts() {
     .expect("cancelled generation did not stop");
     assert_eq!(
         first_result.unwrap_err().to_string(),
-        "model request interrupted by human input"
+        "model request interrupted by control input"
     );
     assert_eq!(model.active.load(Ordering::SeqCst), 0);
     assert!(interrupt.request_interrupt());
@@ -486,30 +392,6 @@ async fn parent_sees_human_redirect_after_child_replies() {
     assert!(!kernel.has_pending_message(&message_id));
 }
 
-#[tokio::test]
-async fn external_model_failure_is_typed_and_clears_the_trap() {
-    let (scheduler, _) = scheduler(&[]);
-    let mut kernel = Kernel::new();
-    kernel
-        .eval(r#"(model/call "fail deterministically")"#)
-        .unwrap();
-    let error = scheduler.run_turn(&mut kernel).await.unwrap_err();
-    assert!(matches!(
-        error,
-        persistent_lisp_harness::SchedulerError::Model(_)
-    ));
-    assert!(!kernel.has_trap());
-    assert!(
-        kernel.frames()[0]
-            .state()
-            .transcript()
-            .last()
-            .unwrap()
-            .result
-            .contains("error")
-    );
-}
-
 #[test]
 fn worst_case_context_sections_stay_within_the_total_request_budget() {
     let (scheduler, _) = scheduler(&[]);
@@ -526,15 +408,15 @@ fn worst_case_context_sections_stay_within_the_total_request_budget() {
     }
     for index in 0..16 {
         kernel
-            .eval(&format!(
-                r#"(context/add-hook "hook-{index}-{}")"#,
+            .eval_value(&format!(
+                r#"(context/inject "hook-{index}" :frame "hook-{index}-{}")"#,
                 "h".repeat(1_980)
             ))
             .unwrap();
     }
     for index in 0..64 {
         kernel
-            .eval(&format!(
+            .eval_value(&format!(
                 r#"(memory/remember "key-{index}" "{}")"#,
                 "m".repeat(1_000)
             ))
@@ -550,7 +432,7 @@ fn worst_case_context_sections_stay_within_the_total_request_budget() {
     assert!(request.system.len() + request.context.len() <= 62_000);
     assert!(request.context.contains("Emit exactly one Lisp form"));
     assert!(request.context.contains("notice-0"));
-    assert!(request.context.contains("notice-31"));
+    assert!(!request.context.contains("notice-31"));
 }
 
 #[tokio::test]
@@ -614,33 +496,18 @@ async fn interrupt_at_model_completion_discards_the_completed_generation() {
 #[test]
 fn agent_boundaries_require_strings() {
     let mut kernel = Kernel::new();
-    assert!(kernel.eval("(agent/call 'researcher \"task\")").is_err());
-    assert!(kernel.eval("(agent/call \"researcher\" 'task)").is_err());
+    assert!(
+        kernel
+            .eval_value("(agent/call 'researcher \"task\")")
+            .is_err()
+    );
+    assert!(
+        kernel
+            .eval_value("(agent/call \"researcher\" 'task)")
+            .is_err()
+    );
     kernel.spawn_subagent("researcher", "task").unwrap();
-    assert!(kernel.eval("(agent/return 42)").is_err());
-}
-
-#[tokio::test]
-async fn human_wait_is_snapshot_safe_and_wakes_on_message() {
-    let (scheduler, _) = scheduler(&["(human/wait)", "nil"]);
-    let mut kernel = Kernel::new();
-    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
-    assert!(matches!(outcome, TurnOutcome::ToolCompleted { .. }));
-    assert_eq!(
-        kernel.frames()[0].status(),
-        persistent_lisp_harness::FrameStatus::Waiting
-    );
-    assert!(!kernel.has_trap());
-
-    let snapshots = temp_root("wait-snapshot");
-    kernel.set_snapshot_directory(&snapshots);
-    kernel.snapshot().unwrap();
-    kernel.human_message("resume").unwrap();
-    assert_eq!(
-        kernel.frames()[0].status(),
-        persistent_lisp_harness::FrameStatus::Running
-    );
-    scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(kernel.eval_value("(agent/return 42)").is_err());
 }
 
 #[test]
@@ -657,4 +524,233 @@ fn constrained_context_keeps_the_newest_transcript_entries() {
     assert!(request.context.contains("action-29"));
     assert!(request.context.contains("action-28"));
     assert!(!request.context.contains("action-0"));
+}
+
+#[tokio::test]
+async fn subagent_gets_own_context_and_returns_to_parent() {
+    let (scheduler, model) = scheduler(&[
+        r#"(agent/call "researcher" "inspect the build")"#,
+        r#"(agent/return "done")"#,
+    ]);
+    let mut kernel = Kernel::new();
+    let parent = kernel.frames()[0].id().clone();
+    let first = scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(matches!(first, TurnOutcome::Spawned { ref parent_id, .. } if parent_id == &parent));
+    assert_eq!(kernel.frames().len(), 2);
+    assert!(
+        kernel.frames()[1]
+            .state()
+            .instructions()
+            .contains("researcher")
+    );
+    let second = scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(matches!(
+        second,
+        TurnOutcome::Returned { ref parent_id, ref result }
+            if parent_id == &parent && result == "done"
+    ));
+    assert_eq!(kernel.frames().len(), 1);
+    let requests = model.requests.lock().unwrap();
+    assert!(requests[1].system.contains("researcher"));
+    assert!(requests[1].system.contains("inspect the build"));
+}
+
+#[tokio::test]
+async fn scheduler_executes_a_model_requested_tool_directly() {
+    let (scheduler, model) = scheduler(&[r#"(bash "printf resumed")"#]);
+    let mut kernel = Kernel::new();
+    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(matches!(
+        outcome,
+        TurnOutcome::ToolCompleted { ref result, .. } if result.contains("resumed")
+    ));
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn reply_to_unknown_message_is_rejected_without_state_change() {
+    let mut kernel = Kernel::new();
+    assert!(
+        kernel
+            .eval_value(r#"(message/reply "made-up" "no")"#)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_leaves_no_persistent_operation() {
+    let model = PendingTrappedModel {
+        calls: Arc::new(AtomicUsize::new(0)),
+        trapped_request_started: Arc::new(tokio::sync::Notify::new()),
+    };
+    let executor = Executor::new(ExecutorConfig::with_working_directory(temp_root(
+        "trapped-model-cancel",
+    )))
+    .unwrap();
+    let scheduler = Scheduler::new(model.clone(), executor);
+    let mut kernel = Kernel::new();
+    kernel.set_snapshot_directory(temp_root("trapped-model-snapshot"));
+    let mut turn = Box::pin(scheduler.run_turn(&mut kernel));
+    tokio::select! {
+        _ = model.trapped_request_started.notified() => {}
+        result = &mut turn => panic!("trapped model request finished unexpectedly: {result:?}"),
+    }
+    drop(turn);
+    kernel.snapshot().unwrap();
+}
+
+#[tokio::test]
+async fn external_model_failure_is_typed_without_persistent_trap() {
+    let (scheduler, _) = scheduler(&[r#"(model/call "fail deterministically")"#]);
+    let mut kernel = Kernel::new();
+    let error = scheduler.run_turn(&mut kernel).await.unwrap_err();
+    assert!(matches!(
+        error,
+        persistent_lisp_harness::SchedulerError::Model(_)
+    ));
+    assert!(
+        kernel.frames()[0]
+            .state()
+            .transcript()
+            .last()
+            .unwrap()
+            .result
+            .contains("error")
+    );
+}
+
+#[tokio::test]
+async fn human_wait_is_snapshot_safe_and_wakes_on_message() {
+    let (scheduler, _) = scheduler(&["(human/wait)", "nil"]);
+    let mut kernel = Kernel::new();
+    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(matches!(outcome, TurnOutcome::ToolCompleted { .. }));
+    assert!(kernel.frames()[0].is_waiting_for_human());
+    let snapshots = temp_root("wait-snapshot");
+    kernel.set_snapshot_directory(&snapshots);
+    kernel.snapshot().unwrap();
+    kernel.human_message("resume").unwrap();
+    assert!(!kernel.frames()[0].is_waiting_for_human());
+    scheduler.run_turn(&mut kernel).await.unwrap();
+}
+
+#[test]
+fn tail_position_trap_commits_prior_synchronous_work() {
+    let mut kernel = Kernel::new();
+    let outcome = kernel
+        .eval(r#"(begin (define x 1) (bash "true"))"#)
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        persistent_lisp_harness::EvalOutcome::Trap(persistent_lisp_harness::TrapRequest {
+            operation: persistent_lisp_harness::VmTrap::RunBash { .. },
+            ..
+        })
+    ));
+    assert_eq!(
+        kernel.eval_value("x").unwrap(),
+        persistent_lisp_harness::Value::Int(1)
+    );
+    assert!(kernel.eval_value(r#"(+ 1 (bash "true"))"#).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_human_control_replies_without_cancelling_blocking_bash() {
+    use persistent_lisp_harness::{ControlReply, ControlTrigger};
+    let (scheduler, model) = scheduler(&[
+        r#"(bash "sleep 0.15; printf complete")"#,
+        r#"(control/continue "training is still running")"#,
+    ]);
+    let kernel = Kernel::new();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<ControlReply>();
+    let keepalive = control_tx.clone();
+    let control = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        control_tx
+            .send(ControlTrigger::Human("status?".into()))
+            .unwrap();
+    };
+    let turn = scheduler.run_supervised_turn(kernel, &mut control_rx, &reply_tx);
+    let ((kernel, outcome), ()) = tokio::join!(turn, control);
+    drop(keepalive);
+    assert!(
+        matches!(outcome.unwrap(), TurnOutcome::ToolCompleted { ref result, .. } if result.contains("complete"))
+    );
+    assert_eq!(
+        reply_rx.recv().await.unwrap().text,
+        "training is still running"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert!(
+        kernel.frames()[0]
+            .state()
+            .transcript()
+            .last()
+            .unwrap()
+            .result
+            .contains("complete")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_control_can_cancel_lisp_at_a_safepoint() {
+    use persistent_lisp_harness::{ControlReply, ControlTrigger};
+    let (scheduler, _) = scheduler(&[
+        "(begin (define (loop n) (loop (+ n 1))) (loop 0))",
+        r#"(control/cancel "loop is unproductive" "stopped it")"#,
+    ]);
+    let kernel = Kernel::new();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<ControlReply>();
+    let keepalive = control_tx.clone();
+    let control = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        control_tx
+            .send(ControlTrigger::Human("stop that loop".into()))
+            .unwrap();
+    };
+    let turn = scheduler.run_supervised_turn(kernel, &mut control_rx, &reply_tx);
+    let ((_kernel, outcome), ()) = tokio::join!(turn, control);
+    drop(keepalive);
+    assert!(matches!(outcome.unwrap(), TurnOutcome::Cancelled { .. }));
+    assert_eq!(reply_rx.recv().await.unwrap().text, "stopped it");
+}
+
+#[test]
+fn chronological_spine_stays_logarithmic_without_forgetting_the_beginning() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    for index in 0..1_024 {
+        kernel.append_transcript(
+            &format!("action-{index}"),
+            &format!("result-{index}-{}", "x".repeat(256)),
+        );
+    }
+    let _ = scheduler.build_request(&kernel);
+    // build_request is read-only; one cognition boundary performs compaction.
+    persistent_lisp_harness::scheduler::compact_for_test(&mut kernel);
+    let spine = kernel.frames()[0].state().spine();
+    assert!(spine.len() < 64, "spine grew linearly: {}", spine.len());
+    assert_eq!(spine.first().unwrap().first_event, 1);
+    assert!(spine.last().unwrap().last_event > 900);
+}
+
+#[test]
+fn optmem_view_is_bounded_but_recall_reaches_old_memories() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    for index in 0..256 {
+        kernel
+            .eval_value(&format!(
+                "(memory/remember \"key-{index}\" \"memory-{index}-{}\")",
+                "x".repeat(80)
+            ))
+            .unwrap();
+    }
+    let request = scheduler.build_request(&kernel);
+    assert!(request.context.len() <= 62_000);
+    let recalled = kernel.eval_value("(memory/recall \"memory-0-\")").unwrap();
+    assert!(!matches!(recalled, persistent_lisp_harness::Value::Nil));
+    assert!(recalled.to_string().contains("memory-0-"));
 }

@@ -8,7 +8,7 @@ fn executor(label: &str, timeout: Duration, output_limit: usize) -> (Executor, s
         uuid::Uuid::new_v4()
     ));
     let mut config = ExecutorConfig::with_working_directory(&root);
-    config.timeout = timeout;
+    config.timeout = Some(timeout);
     config.output_limit = output_limit;
     (Executor::new(config).unwrap(), root)
 }

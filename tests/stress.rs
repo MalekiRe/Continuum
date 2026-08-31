@@ -4,23 +4,29 @@ use persistent_lisp_harness::{Kernel, Value};
 fn deep_tail_recursion_uses_constant_rust_stack() {
     let mut kernel = Kernel::new();
     kernel
-        .eval(r#"(define (count n) (if (= n 0) "done" (count (- n 1))))"#)
+        .eval_value(r#"(define (count n) (if (= n 0) "done" (count (- n 1))))"#)
         .unwrap();
-    assert_eq!(kernel.eval("(count 50000)").unwrap(), Value::string("done"));
+    assert_eq!(
+        kernel.eval_value("(count 50000)").unwrap(),
+        Value::string("done")
+    );
 }
 
 #[test]
 fn mutual_tail_recursion_uses_constant_rust_stack() {
     let mut kernel = Kernel::new();
     kernel
-        .eval(
+        .eval_value(
             r#"
         (define (even? n) (if (= n 0) #t (odd? (- n 1))))
         (define (odd? n) (if (= n 0) #f (even? (- n 1))))
     "#,
         )
         .unwrap();
-    assert_eq!(kernel.eval("(even? 20000)").unwrap(), Value::Bool(true));
+    assert_eq!(
+        kernel.eval_value("(even? 20000)").unwrap(),
+        Value::Bool(true)
+    );
 }
 
 #[test]
@@ -28,14 +34,14 @@ fn closures_remain_correct_in_a_large_environment() {
     let mut kernel = Kernel::new();
     for i in 0..100 {
         kernel
-            .eval(&format!("(define (helper{} x) (+ x {}))", i, i))
+            .eval_value(&format!("(define (helper{} x) (+ x {}))", i, i))
             .unwrap();
     }
     kernel
-        .eval("(define (make-adder n) (lambda (x) (+ x n)))")
+        .eval_value("(define (make-adder n) (lambda (x) (+ x n)))")
         .unwrap();
-    kernel.eval("(define add9 (make-adder 9))").unwrap();
-    assert_eq!(kernel.eval("(add9 33)").unwrap(), Value::Int(42));
+    kernel.eval_value("(define add9 (make-adder 9))").unwrap();
+    assert_eq!(kernel.eval_value("(add9 33)").unwrap(), Value::Int(42));
 }
 
 #[test]
@@ -44,21 +50,21 @@ fn reader_and_evaluator_handle_deep_expressions() {
     let expression = (2..200).fold("1".to_string(), |inner, value| {
         format!("(+ {} {})", value, inner)
     });
-    assert_eq!(kernel.eval(&expression).unwrap(), Value::Int(19_900));
+    assert_eq!(kernel.eval_value(&expression).unwrap(), Value::Int(19_900));
 }
 
 #[test]
 fn repeated_failures_do_not_corrupt_committed_state() {
     let mut kernel = Kernel::new();
-    kernel.eval("(define user/stable 42)").unwrap();
+    kernel.eval_value("(define user/stable 42)").unwrap();
     for i in 0..100 {
         assert!(
             kernel
-                .eval(&format!("(begin (define user/transient {}) (missing))", i))
+                .eval_value(&format!("(begin (define user/transient {}) (missing))", i))
                 .is_err()
         );
-        assert_eq!(kernel.eval("stable").unwrap(), Value::Int(42));
-        assert!(kernel.eval("transient").is_err());
+        assert_eq!(kernel.eval_value("stable").unwrap(), Value::Int(42));
+        assert!(kernel.eval_value("transient").is_err());
     }
 }
 
@@ -70,9 +76,9 @@ fn large_tagged_data_family_remains_usable() {
         definition.push_str(&format!(" (Variant{} x y)", i));
     }
     definition.push(')');
-    kernel.eval(&definition).unwrap();
+    kernel.eval_value(&definition).unwrap();
     assert!(matches!(
-        kernel.eval("(many/Status/Variant49 1 2)").unwrap(),
+        kernel.eval_value("(many/Status/Variant49 1 2)").unwrap(),
         Value::Tagged { .. }
     ));
 }

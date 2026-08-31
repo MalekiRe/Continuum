@@ -1,6 +1,6 @@
 mod unix;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,7 +55,7 @@ pub enum ExecutorError {
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub working_directory: PathBuf,
-    pub timeout: Duration,
+    pub timeout: Option<Duration>,
     pub output_limit: usize,
 }
 
@@ -63,7 +63,7 @@ impl ExecutorConfig {
     pub fn with_working_directory(working_directory: impl Into<PathBuf>) -> Self {
         Self {
             working_directory: working_directory.into(),
-            timeout: Duration::from_secs(60),
+            timeout: None,
             output_limit: DEFAULT_OUTPUT_LIMIT,
         }
     }
@@ -83,71 +83,12 @@ pub struct CapturedOutput {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub exit_code: i32,
     pub outcome: ExecutionOutcome,
     pub output: CapturedOutput,
     pub elapsed_ms: u128,
-}
-
-// The executor's Rust API uses typed outcome/output fields, while the tool wire
-// format deliberately remains compatible with existing transcripts and clients.
-#[derive(Serialize, Deserialize)]
-struct ExecutionResultWire<T> {
-    exit_code: i32,
-    stdout: T,
-    stderr: T,
-    timed_out: bool,
-    cancelled: bool,
-    truncated: bool,
-    elapsed_ms: u128,
-}
-
-impl Serialize for ExecutionResult {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        ExecutionResultWire {
-            exit_code: self.exit_code,
-            stdout: &self.output.stdout,
-            stderr: &self.output.stderr,
-            timed_out: self.outcome == ExecutionOutcome::TimedOut,
-            cancelled: self.outcome == ExecutionOutcome::Cancelled,
-            truncated: self.output.truncated,
-            elapsed_ms: self.elapsed_ms,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for ExecutionResult {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ExecutionResultWire::<String>::deserialize(deserializer)?;
-        // Old results could represent both flags at once. Cancellation takes
-        // precedence when migrating that invalid state into the typed model.
-        let outcome = if wire.cancelled {
-            ExecutionOutcome::Cancelled
-        } else if wire.timed_out {
-            ExecutionOutcome::TimedOut
-        } else {
-            ExecutionOutcome::Exited
-        };
-        Ok(Self {
-            exit_code: wire.exit_code,
-            outcome,
-            output: CapturedOutput {
-                stdout: wire.stdout,
-                stderr: wire.stderr,
-                truncated: wire.truncated,
-            },
-            elapsed_ms: wire.elapsed_ms,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,10 +194,14 @@ impl Executor {
         self.run_with_timeout(command, self.config.timeout)
     }
 
+    pub fn independent(&self) -> Result<Self, ExecutorError> {
+        Self::new(self.config.clone())
+    }
+
     pub fn run_with_timeout(
         &self,
         command: &str,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<ExecutionResult, ExecutorError> {
         let started = Instant::now();
         let stdout_progress = Arc::new(AtomicU64::new(0));
@@ -312,7 +257,7 @@ impl Executor {
             if self.active_cancelled() {
                 break (ExecutionOutcome::Cancelled, None);
             }
-            if started.elapsed() >= timeout {
+            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
                 break (ExecutionOutcome::TimedOut, None);
             }
             match run_guard
@@ -488,46 +433,5 @@ mod tests {
         let error = read_bounded(FailingReader(false), 10, progress.clone()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(progress.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn result_wire_format_remains_flat_and_boolean_compatible() {
-        let result = ExecutionResult {
-            exit_code: -1,
-            outcome: ExecutionOutcome::TimedOut,
-            output: CapturedOutput {
-                stdout: "out".into(),
-                stderr: "err".into(),
-                truncated: true,
-            },
-            elapsed_ms: 12,
-        };
-        assert_eq!(
-            serde_json::to_value(&result).unwrap(),
-            serde_json::json!({
-                "exit_code": -1,
-                "stdout": "out",
-                "stderr": "err",
-                "timed_out": true,
-                "cancelled": false,
-                "truncated": true,
-                "elapsed_ms": 12
-            })
-        );
-    }
-
-    #[test]
-    fn legacy_overlapping_flags_deserialize_to_one_outcome() {
-        let result: ExecutionResult = serde_json::from_value(serde_json::json!({
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": "",
-            "timed_out": true,
-            "cancelled": true,
-            "truncated": false,
-            "elapsed_ms": 1
-        }))
-        .unwrap();
-        assert_eq!(result.outcome, ExecutionOutcome::Cancelled);
     }
 }

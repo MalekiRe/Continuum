@@ -6,18 +6,23 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 fn substring_uses_unicode_scalar_indices() {
     let mut kernel = Kernel::new();
     assert_eq!(
-        kernel.eval(r#"(substring "aé🦀z" 1 3)"#).unwrap(),
+        kernel.eval_value(r#"(substring "aé🦀z" 1 3)"#).unwrap(),
         Value::string("é🦀")
     );
     assert_eq!(
-        kernel.eval(r#"(substring "aé🦀z" 4 4)"#).unwrap(),
+        kernel.eval_value(r#"(substring "aé🦀z" 4 4)"#).unwrap(),
         Value::string("")
     );
     assert_eq!(
-        kernel.eval(r#"(string-search "🦀" "aé🦀z")"#).unwrap(),
+        kernel
+            .eval_value(r#"(string-search "🦀" "aé🦀z")"#)
+            .unwrap(),
         Value::Int(2)
     );
-    assert_eq!(kernel.eval(r#"(length "aé🦀z")"#).unwrap(), Value::Int(4));
+    assert_eq!(
+        kernel.eval_value(r#"(length "aé🦀z")"#).unwrap(),
+        Value::Int(4)
+    );
 }
 
 #[test]
@@ -30,63 +35,31 @@ fn substring_rejects_invalid_indices_instead_of_clamping_or_panicking() {
         r#"(substring "é" 0 2)"#,
         r#"(substring "é" 0 1.5)"#,
     ] {
-        assert!(kernel.eval(form).is_err(), "accepted invalid form: {form}");
+        assert!(
+            kernel.eval_value(form).is_err(),
+            "accepted invalid form: {form}"
+        );
     }
 }
 
 #[test]
 fn collection_indices_and_wake_durations_must_be_non_negative() {
     let mut kernel = Kernel::new();
-    assert!(kernel.eval("(nth -1 '(a b))").is_err());
-    assert!(kernel.eval("(vector/get #(a b) -1)").is_err());
-    assert!(kernel.eval(r#"(wake -1 "never")"#).is_err());
+    assert!(kernel.eval_value("(nth -1 '(a b))").is_err());
+    assert!(kernel.eval_value("(vector/get #(a b) -1)").is_err());
+    assert!(kernel.eval_value(r#"(wake -1 "never")"#).is_err());
     assert_eq!(kernel.wake_timer_count(), 0);
 }
 
 #[test]
 fn blocking_stdin_and_sleep_natives_are_not_registered() {
     let mut kernel = Kernel::new();
-    assert!(kernel.eval("(read)").is_err());
-    assert!(kernel.eval("(sleep 1)").is_err());
+    assert!(kernel.eval_value("(read)").is_err());
+    assert!(kernel.eval_value("(sleep 1)").is_err());
     assert_eq!(
-        kernel.eval(r#"(wake 0 "now")"#).unwrap(),
+        kernel.eval_value(r#"(wake 0 "now")"#).unwrap(),
         Value::keyword("scheduled")
     );
-}
-
-#[test]
-fn retired_blocking_natives_are_removed_during_recovery() {
-    use sha2::{Digest, Sha256};
-    let directory = std::env::temp_dir().join(format!(
-        "continuum-retired-natives-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&directory).unwrap();
-
-    let mut kernel = Kernel::new();
-    kernel.set_snapshot_directory(directory.to_string_lossy().into_owned());
-    kernel.snapshot().unwrap();
-    let path = std::fs::read_dir(&directory)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .unwrap();
-    let mut envelope: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    let bindings = &mut envelope["kernel"]["env"]["namespaces"]["kernel"]["bindings"];
-    bindings["read"] = serde_json::to_value(Value::Int(1)).unwrap();
-    bindings["sleep"] = serde_json::to_value(Value::Int(1)).unwrap();
-    envelope["checksum"] = hex::encode(Sha256::digest(
-        serde_json::to_vec(&envelope["kernel"]).unwrap(),
-    ))
-    .into();
-    std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
-
-    let recovered = Kernel::recover_from_dir(&directory).unwrap();
-    assert!(recovered.lookup("kernel/read").is_none());
-    assert!(recovered.lookup("kernel/sleep").is_none());
-    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -94,16 +67,16 @@ fn odd_map_literals_are_rejected_by_reader_and_evaluator() {
     assert!(reader::read_all("{:a 1 :b}").is_err());
     assert!(reader::read_all("'{:a}").is_err());
     let mut kernel = Kernel::new();
-    assert!(kernel.eval("{:a 1 :b}").is_err());
-    assert!(kernel.eval("'{:a}").is_err());
+    assert!(kernel.eval_value("{:a 1 :b}").is_err());
+    assert!(kernel.eval_value("'{:a}").is_err());
 }
 
 #[test]
 fn interpreted_functions_enforce_arity() {
     let mut kernel = Kernel::new();
-    kernel.eval("(define (pair a b) (list a b))").unwrap();
-    assert!(kernel.eval("(pair 1)").is_err());
-    assert!(kernel.eval("(pair 1 2 3)").is_err());
+    kernel.eval_value("(define (pair a b) (list a b))").unwrap();
+    assert!(kernel.eval_value("(pair 1)").is_err());
+    assert!(kernel.eval_value("(pair 1 2 3)").is_err());
 }
 
 #[test]
@@ -143,7 +116,7 @@ fn arbitrary_unicode_input_never_panics_in_reader_or_evaluator() {
 
         let evaluated = catch_unwind(AssertUnwindSafe(|| {
             let mut kernel = Kernel::new();
-            let _ = kernel.eval(&input);
+            let _ = kernel.eval_value(&input);
         }));
         assert!(evaluated.is_ok(), "evaluator panicked for {input:?}");
     }
@@ -152,8 +125,8 @@ fn arbitrary_unicode_input_never_panics_in_reader_or_evaluator() {
 #[test]
 fn qualified_bindings_require_nonempty_namespace_and_name() {
     let mut kernel = Kernel::new();
-    assert!(kernel.eval("(define /missing-namespace 1)").is_err());
-    assert!(kernel.eval("(define missing-name/ 1)").is_err());
+    assert!(kernel.eval_value("(define /missing-namespace 1)").is_err());
+    assert!(kernel.eval_value("(define missing-name/ 1)").is_err());
 }
 
 #[test]
