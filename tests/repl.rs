@@ -658,3 +658,40 @@ fn direct_eval_value_restores_scope_after_failing_letrec() {
         Err(persistent_lisp_harness::EvalError::UndefinedSymbol(name)) if name == "x"
     ));
 }
+
+#[test]
+fn rhs_tail_calls_restore_the_enclosing_lexical_scope() {
+    let mut kernel = Kernel::new();
+    kernel.eval("(define (id x) x)").unwrap();
+    assert_eq!(
+        kernel
+            .eval("(let ((a 1)) (begin (set! a (id 2)) a))")
+            .unwrap(),
+        Value::Int(2)
+    );
+    assert_eq!(
+        kernel
+            .eval("(let ((a 3)) (begin (define user/from-local (id a)) a))")
+            .unwrap(),
+        Value::Int(3)
+    );
+}
+
+#[test]
+fn registered_native_bindings_are_immutable() {
+    let mut kernel = Kernel::new();
+    for name in [
+        "agent/call",
+        "message/reply",
+        "model/call",
+        "memory/remember",
+        "source/get",
+    ] {
+        assert!(kernel.eval(&format!("(define {name} 1)")).is_err());
+        assert!(kernel.eval(&format!("(undefine {name})")).is_err());
+        assert_eq!(
+            kernel.eval(&format!("(function? {name})")).unwrap(),
+            Value::Bool(true)
+        );
+    }
+}

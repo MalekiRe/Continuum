@@ -154,8 +154,10 @@ fn content_type(value: &str) -> tiny_http::Header {
 
 fn start_http(intervention: HumanIntervention) {
     thread::spawn(move || {
-        let server = tiny_http::Server::http("0.0.0.0:8080").expect("HTTP listen failed");
-        slog("[http] listening on http://0.0.0.0:8080");
+        let address =
+            std::env::var("CONTINUUM_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+        let server = tiny_http::Server::http(&address).expect("HTTP listen failed");
+        slog(format!("[http] listening on http://{address}"));
         let thoughts = include_str!("../web/thoughts.html");
         let chat = include_str!("../web/chat.html");
         for mut request in server.incoming_requests() {

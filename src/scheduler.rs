@@ -403,10 +403,14 @@ impl<M: ModelClient> Scheduler<M> {
         let source = pending.source;
         match pending.operation {
             VmTrap::RunBash { command } => {
-                let execution = self.executor.run(&command).inspect_err(|error| {
-                    kernel.clear_trap();
-                    kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
-                })?;
+                let executor = self.executor.clone();
+                let execution = tokio::task::spawn_blocking(move || executor.run(&command))
+                    .await
+                    .map_err(|_| SchedulerError::Invariant("Bash executor task panicked"))?
+                    .inspect_err(|error| {
+                        kernel.clear_trap();
+                        kernel.append_transcript_to(&frame_id, &source, &format!("error: {error}"));
+                    })?;
                 let result = format_execution(&execution);
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
@@ -449,7 +453,11 @@ impl<M: ModelClient> Scheduler<M> {
                 })
             }
             VmTrap::ReturnAgent { value } => {
-                let result = format!("{}", value);
+                let crate::vm::value::Value::String(result) = value else {
+                    return Err(SchedulerError::Invariant(
+                        "agent returned a non-string value",
+                    ));
+                };
                 kernel.clear_trap();
                 kernel.append_transcript_to(&frame_id, &source, &result);
                 kernel.return_from_subagent();
@@ -468,6 +476,7 @@ impl<M: ModelClient> Scheduler<M> {
                 Ok(TurnOutcome::Replied { message_id, text })
             }
             VmTrap::AwaitHuman => {
+                kernel.clear_trap();
                 let frame = kernel.frames.last_mut().ok_or(SchedulerError::Invariant(
                     "human wait without an active frame",
                 ))?;
@@ -552,17 +561,9 @@ impl<M: ModelClient> Scheduler<M> {
         }
         section("Context hooks and selected memory", &guidance, 12_000);
 
-        let mut recent = String::new();
-        for entry in &frame.state.transcript {
-            let _ = writeln!(
-                recent,
-                "> {}\n{}",
-                truncate(&entry.source, 600),
-                truncate(&entry.result, 1_200)
-            );
-        }
+        let recent = render_recent_transcript(&frame.state.transcript, 24_000);
         section("Recent Lisp actions and results", &recent, 24_000);
-        let compacted = frame.state.compacted_context.render();
+        let compacted = render_recent_compacted(&frame.state.compacted_context, 6_000);
         section("Earlier compacted context", &compacted, 6_000);
 
         let mut library = String::new();
@@ -624,6 +625,53 @@ pub fn normalize_one_form(raw: &str) -> Result<String, NormalizeError> {
         return Err(NormalizeError::FormCount(forms.len()));
     }
     Ok(trimmed.to_string())
+}
+
+fn render_recent_transcript(entries: &[TranscriptEntry], budget: usize) -> String {
+    let mut selected = Vec::new();
+    let mut used = 0;
+    for entry in entries.iter().rev() {
+        let rendered = format!(
+            "> {}\n{}\n",
+            truncate(&entry.source, 600),
+            truncate(&entry.result, 1_200)
+        );
+        if used + rendered.len() > budget {
+            if selected.is_empty() {
+                selected.push(truncate(&rendered, budget));
+            }
+            break;
+        }
+        used += rendered.len();
+        selected.push(rendered);
+    }
+    selected.reverse();
+    selected.concat()
+}
+
+fn render_recent_compacted(context: &crate::kernel::CompactedContext, budget: usize) -> String {
+    let mut selected = Vec::new();
+    let mut used = 0;
+    for entry in context.entries.iter().rev() {
+        let rendered = format!(
+            "[{}] {} => {}\n",
+            entry.timestamp, entry.source, entry.result
+        );
+        if used + rendered.len() > budget {
+            break;
+        }
+        used += rendered.len();
+        selected.push(rendered);
+    }
+    selected.reverse();
+    let omitted = context.omitted_turns
+        + u64::try_from(context.entries.len().saturating_sub(selected.len())).unwrap_or(u64::MAX);
+    let mut rendered = String::new();
+    if omitted > 0 {
+        let _ = writeln!(rendered, "[{omitted} older turns omitted]");
+    }
+    rendered.push_str(&selected.concat());
+    rendered
 }
 
 fn format_execution(result: &ExecutionResult) -> String {

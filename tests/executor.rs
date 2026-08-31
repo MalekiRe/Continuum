@@ -176,3 +176,24 @@ fn running_status_reports_output_progress() {
     assert!(executor.cancel().unwrap());
     assert!(handle.join().unwrap().outcome == ExecutionOutcome::Cancelled);
 }
+
+#[test]
+fn command_environment_is_scrubbed_and_workspace_scoped() {
+    let (executor, root) = executor("environment", Duration::from_secs(2), 1024);
+    let result = executor
+        .run(r#"printf '%s\n%s\n%s' "$HOME" "$PATH" "${CARGO_MANIFEST_DIR-unset}""#)
+        .unwrap();
+    let lines: Vec<_> = result.output.stdout.lines().collect();
+    let expected_home = std::fs::canonicalize(root)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        lines,
+        [
+            expected_home.as_str(),
+            "/usr/local/bin:/usr/bin:/bin",
+            "unset",
+        ]
+    );
+}

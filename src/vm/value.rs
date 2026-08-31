@@ -4,6 +4,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 
+mod map_entries {
+    use super::Value;
+    use indexmap::IndexMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(map: &IndexMap<Value, Value>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<IndexMap<Value, Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<(Value, Value)>::deserialize(deserializer)
+            .map(|entries| entries.into_iter().collect())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Arity {
     Exact(u32),
@@ -142,7 +163,7 @@ pub enum Value {
     Keyword(String),
     List(Vec<Value>),
     Vector(Vec<Value>),
-    Map(IndexMap<Value, Value>),
+    Map(#[serde(with = "map_entries")] IndexMap<Value, Value>),
     Function(Function),
     Macro(Macro),
     Tagged {

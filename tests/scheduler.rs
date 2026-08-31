@@ -123,7 +123,7 @@ async fn subagent_gets_own_context_and_returns_to_parent() {
     );
     let second = scheduler.run_turn(&mut kernel).await.unwrap();
     assert!(
-        matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "\"done\"")
+        matches!(second, TurnOutcome::Returned { ref parent_id, ref result } if parent_id == &parent && result == "done")
     );
     assert_eq!(kernel.frames().len(), 1);
     assert_eq!(
@@ -471,7 +471,7 @@ async fn parent_sees_human_redirect_after_child_replies() {
     {
         let mut replies = model.replies.lock().unwrap();
         replies.push("nil".into());
-        replies.push("(agent/return :done)".into());
+        replies.push("(agent/return \"done\")".into());
         replies.push(reply);
     }
     scheduler.run_turn(&mut kernel).await.unwrap();
@@ -609,4 +609,52 @@ async fn interrupt_at_model_completion_discards_the_completed_generation() {
         persistent_lisp_harness::SchedulerError::Model(ModelError::Cancelled)
     ));
     assert!(kernel.frames()[0].state().transcript().is_empty());
+}
+
+#[test]
+fn agent_boundaries_require_strings() {
+    let mut kernel = Kernel::new();
+    assert!(kernel.eval("(agent/call 'researcher \"task\")").is_err());
+    assert!(kernel.eval("(agent/call \"researcher\" 'task)").is_err());
+    kernel.spawn_subagent("researcher", "task").unwrap();
+    assert!(kernel.eval("(agent/return 42)").is_err());
+}
+
+#[tokio::test]
+async fn human_wait_is_snapshot_safe_and_wakes_on_message() {
+    let (scheduler, _) = scheduler(&["(human/wait)", "nil"]);
+    let mut kernel = Kernel::new();
+    let outcome = scheduler.run_turn(&mut kernel).await.unwrap();
+    assert!(matches!(outcome, TurnOutcome::ToolCompleted { .. }));
+    assert_eq!(
+        kernel.frames()[0].status(),
+        persistent_lisp_harness::FrameStatus::Waiting
+    );
+    assert!(!kernel.has_trap());
+
+    let snapshots = temp_root("wait-snapshot");
+    kernel.set_snapshot_directory(&snapshots);
+    kernel.snapshot().unwrap();
+    kernel.human_message("resume").unwrap();
+    assert_eq!(
+        kernel.frames()[0].status(),
+        persistent_lisp_harness::FrameStatus::Running
+    );
+    scheduler.run_turn(&mut kernel).await.unwrap();
+}
+
+#[test]
+fn constrained_context_keeps_the_newest_transcript_entries() {
+    let (scheduler, _) = scheduler(&[]);
+    let mut kernel = Kernel::new();
+    for index in 0..30 {
+        kernel.append_transcript(
+            &format!("action-{index}"),
+            &format!("result-{index}-{}", "x".repeat(1_500)),
+        );
+    }
+    let request = scheduler.build_request(&kernel);
+    assert!(request.context.contains("action-29"));
+    assert!(request.context.contains("action-28"));
+    assert!(!request.context.contains("action-0"));
 }

@@ -26,8 +26,9 @@ impl Kernel {
             if kernel.frames.len() <= 1 {
                 return Err("agent/return: root frame has no parent".into());
             }
+            let value = value.require_string("agent/return", 1)?;
             kernel.suspend(VmTrap::ReturnAgent {
-                value: (*value).clone(),
+                value: Value::string(value),
             })
         });
         exact_native!(self, "message/reply", |kernel, [message_id, text]| {
@@ -67,19 +68,9 @@ impl Kernel {
         });
         exact_native!(self, "agent/call", |kernel, [name, request]| {
             kernel.require_top_level("agent/call", true)?;
-            let name = match name {
-                Value::String(name) | Value::Symbol(name) => name.clone(),
-                other => {
-                    return Err(NativeError::Failed(format!(
-                        "agent/call: expected agent name, got {}",
-                        other
-                    )));
-                }
-            };
-            kernel.suspend(VmTrap::CallAgent {
-                name,
-                request: request.coerce_text(),
-            })
+            let name = name.require_string("agent/call", 1)?.to_owned();
+            let request = request.require_string("agent/call", 2)?.to_owned();
+            kernel.suspend(VmTrap::CallAgent { name, request })
         });
     }
 }
