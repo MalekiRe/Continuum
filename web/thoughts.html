@@ -14,7 +14,9 @@ body{background:#0d1117;color:#c9d1d9;font:14px/1.5 monospace;margin:0;padding:2
 <body><div id="log"></div>
 <script>
 const el=document.getElementById('log');
-async function poll(){try{let r=await fetch('/thoughts.json');let d=await r.json();el.textContent=d.join('\n');el.scrollTop=el.scrollHeight}catch(e){}setTimeout(poll,500)}
-poll()
+async function refresh(){try{let r=await fetch('/thoughts.json');let d=await r.json();el.textContent=d.join('\n');el.scrollTop=el.scrollHeight}catch(e){}}
+let version=0;
+async function watch(){for(;;){try{let r=await fetch('/events?since='+version);version=Number(await r.text());await refresh()}catch(e){await new Promise(resolve=>setTimeout(resolve,500))}}}
+refresh();watch();
 </script>
 </body></html>

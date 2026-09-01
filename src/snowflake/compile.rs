@@ -366,7 +366,7 @@ impl Compiler<'_> {
                 self.current().constant(arguments[0].clone())?;
             }
             "if" => self.compile_if(arguments, tail)?,
-            "begin" => self.sequence(arguments, tail)?,
+            "begin" | "progn" => self.sequence(arguments, tail)?,
             "lambda" => {
                 let Some((parameters, body)) = arguments.split_first() else {
                     return Err(error(0, "lambda expects parameters and a body"));

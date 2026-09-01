@@ -66,6 +66,7 @@ pub enum RuntimeError {
 }
 
 type Starter = Arc<dyn Fn(&EffectRequest) -> ExternalRun + Send + Sync>;
+type Observer = Arc<dyn Fn(&str, &TranscriptEntry) + Send + Sync>;
 
 struct RunGuard(tokio::task::JoinHandle<()>, Arc<AtomicU8>);
 
@@ -83,6 +84,7 @@ pub struct Runtime {
     control: Arc<AtomicU8>,
     images: ImageStore,
     starter: Starter,
+    observer: Option<Observer>,
     sender: mpsc::UnboundedSender<Command>,
     commands: mpsc::UnboundedReceiver<Command>,
     shutdown: Option<tokio::time::Instant>,
@@ -111,10 +113,15 @@ impl Runtime {
             control: Arc::new(AtomicU8::new(0)),
             images,
             starter: Arc::new(starter),
+            observer: None,
             sender,
             commands,
             shutdown: None,
         }
+    }
+
+    pub fn observe(&mut self, observer: impl Fn(&str, &TranscriptEntry) + Send + Sync + 'static) {
+        self.observer = Some(Arc::new(observer));
     }
 
     pub fn handle(&self) -> RuntimeHandle {
@@ -341,16 +348,14 @@ impl Runtime {
                     parent.resume(Ok(Value::String(result)))?;
                     self.resume_lisp(parent);
                 } else {
-                    self.world
-                        .state
-                        .agents
-                        .last_mut()
-                        .ok_or(RuntimeError::Invariant("returned agent has no parent"))?
-                        .transcript
-                        .push(TranscriptEntry {
+                    let current = self.current()?;
+                    self.record(
+                        current,
+                        TranscriptEntry {
                             source: format!("(agent/result {})", child.name),
                             result,
-                        });
+                        },
+                    );
                     self.active = Active::Idle;
                 }
                 Ok(())
@@ -407,16 +412,17 @@ impl Runtime {
     fn context(&self) -> Result<String, RuntimeError> {
         let agent = &self.world.state.agents[self.current()?];
         let mut text = format!(
-            "{}\nEmit exactly one raw Lisp form. Continue taking actions after replies. Effects are expressions: (bash STRING), (model STRING), (agent NAME REQUEST), (reply ID TEXT), and child-only (return TEXT). Core values are integers, strings, booleans, nil, and lists.\n",
+            "{}\nEmit exactly one raw Lisp form and no prose. Continue taking actions after replies. Supported special forms are quote, if, begin, lambda, define, set!, let, let*, and letrec; use begin, never progn. Effects are ordinary expressions: (bash STRING), (model STRING), (agent NAME REQUEST), (reply INTEGER-ID TEXT), and child-only (return TEXT). Core values are integers, strings, booleans, nil, and lists. Never invent a human-message ID or call reply unless a PENDING HUMAN MESSAGE line is present.\n",
             agent.instructions
         );
+        if agent.inbox.is_empty() {
+            text.push_str("There are NO pending human messages. Do not call reply.\n");
+        }
         for id in &agent.inbox {
             if let Some(message) = self.world.state.messages.get(id) {
                 text.push_str(&format!(
-                    "Human message [{}]: {}{}\n",
-                    id.0,
-                    message.text,
-                    if message.answered { " (answered)" } else { "" }
+                    "PENDING HUMAN MESSAGE {}: {}\nAnswer it using the unquoted integer exactly as (reply {} \"your response\").\n",
+                    id.0, message.text, id.0
                 ));
             }
         }
@@ -426,11 +432,16 @@ impl Runtime {
         Ok(text)
     }
 
+    fn record(&mut self, current: usize, entry: TranscriptEntry) {
+        if let Some(observer) = &self.observer {
+            observer(&self.world.state.agents[current].name, &entry);
+        }
+        self.world.state.agents[current].transcript.push(entry);
+    }
+
     fn finish(&mut self, source: String, result: String) -> Result<(), RuntimeError> {
         let current = self.current()?;
-        self.world.state.agents[current]
-            .transcript
-            .push(TranscriptEntry { source, result });
+        self.record(current, TranscriptEntry { source, result });
         self.active = Active::Idle;
         Ok(())
     }

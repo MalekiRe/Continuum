@@ -1,118 +1,121 @@
-//! Continuum: a model inhabiting a persistent Lisp world.
+//! Continuum: the Snowflake bytecode harness and its small local shell.
 
 use anyhow::{Context, Result};
-use persistent_lisp_harness::{
-    EvalInterruptHandle, Executor, ExecutorConfig, Kernel, ModelInterruptHandle, OpenRouterModel,
-    OutputSink, Scheduler, TurnOutcome,
-};
+use persistent_lisp_harness::snowflake::image::{ImageError, ImageStore};
+use persistent_lisp_harness::snowflake::runtime::{Command, Runtime, RuntimeHandle};
+use persistent_lisp_harness::snowflake::world::{Agent, TranscriptEntry, World};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::path::PathBuf;
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 
-static LOG_BUF: LazyLock<Mutex<VecDeque<String>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(1000)));
-static CHAT_HISTORY: LazyLock<Mutex<VecDeque<ChatEntry>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::new()));
+static LOGS: LazyLock<Mutex<VecDeque<String>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(1_000)));
+static CHAT: LazyLock<Mutex<VecDeque<ChatEntry>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(1_000)));
+static EVENTS: LazyLock<(Mutex<u64>, Condvar)> = LazyLock::new(|| (Mutex::new(0), Condvar::new()));
 
 struct ChatEntry {
-    role: String,
-    message: String,
+    role: &'static str,
+    text: String,
     timestamp: String,
 }
 
-fn slog(message: impl AsRef<str>) {
-    let message = message.as_ref();
-    println!("{}", message);
-    let mut log = LOG_BUF.lock().unwrap();
-    if log.len() == 1000 {
-        log.pop_front();
+fn bounded_push<T>(queue: &mut VecDeque<T>, value: T) {
+    if queue.len() == 1_000 {
+        queue.pop_front();
     }
-    log.push_back(message.to_string());
+    queue.push_back(value);
 }
 
-fn load_kernel() -> Result<Kernel> {
-    match Kernel::recover_from_latest() {
-        Ok(kernel) => {
-            slog("[kernel] recovered latest valid snapshot");
-            Ok(kernel)
+fn publish() {
+    let (generation, changed) = &*EVENTS;
+    let mut generation = generation.lock().unwrap();
+    *generation = generation.wrapping_add(1);
+    changed.notify_all();
+}
+
+fn log(message: impl Into<String>) {
+    let message = message.into();
+    println!("{message}");
+    bounded_push(&mut LOGS.lock().unwrap(), message);
+    publish();
+}
+
+fn chat(role: &'static str, text: impl Into<String>) {
+    bounded_push(
+        &mut CHAT.lock().unwrap(),
+        ChatEntry {
+            role,
+            text: text.into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+    publish();
+}
+
+fn observe(agent: &str, entry: &TranscriptEntry) {
+    log(format!("[{agent}] {} => {}", entry.source, entry.result));
+    if entry.source.contains("(reply ") && !entry.result.starts_with("error:") {
+        chat("agent", entry.result.clone());
+    }
+}
+
+fn seed_history(world: &World) {
+    for message in world.state.messages.values() {
+        chat("user", message.text.clone());
+    }
+    for agent in &world.state.agents {
+        for entry in &agent.transcript {
+            observe(&agent.name, entry);
         }
-        Err(persistent_lisp_harness::SnapshotError::NotFound) => {
-            slog("[kernel] fresh start");
-            Ok(Kernel::new())
-        }
-        Err(error) => Err(error).context("continuity violation: snapshots exist but none recover"),
     }
 }
 
 fn root_instructions() -> String {
-    r#"You are Continuum, a persistent agent inhabiting a live Lisp machine.
-Choose exactly one useful Lisp action per turn. Its evaluated result returns in your next context.
-Continue taking useful actions indefinitely, including after replying to a human; do not wait for another prompt.
-Use definitions to build reusable namespaced tools. Inspect before guessing.
-Use (bash "command") only as a top-level form. It runs in your fixed agent workspace.
-Use (model/call "prompt") only as a top-level form for a focused model subtask.
-Use (agent/call "name" "task") only as a top-level form to create a child agent.
-A child finishes with top-level (agent/return value).
-Respond to a pending human message with top-level (message/reply "message-id" "text").
-Do not emit prose or Markdown: emit one Lisp form."#
+    "You are Continuum, a persistent autonomous agent inhabiting a Lisp bytecode machine. \
+     Work indefinitely, inspect before guessing, build useful definitions, and answer every pending \
+     human message with (reply ID TEXT). Effects may be nested inside ordinary Lisp expressions."
         .into()
 }
 
-fn add_chat(role: &str, message: impl Into<String>) {
-    let mut history = CHAT_HISTORY.lock().unwrap();
-    if history.len() == 1_000 {
-        history.pop_front();
-    }
-    history.push_back(ChatEntry {
-        role: role.into(),
-        message: message.into(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    });
-}
-
-fn deliver_human(kernel: &mut Kernel, text: String) {
-    add_chat("user", text.clone());
-    match kernel.human_message(&text) {
-        Ok(id) => slog(format!("[human:{}] queued for active frames", id)),
-        Err(error) => slog(format!("[human] rejected: {}", error)),
+fn load_world(directory: &PathBuf) -> Result<World> {
+    match ImageStore::new(directory).load() {
+        Ok(world) => {
+            log("[image] recovered latest Snowflake image");
+            Ok(world)
+        }
+        Err(ImageError::NotFound) => {
+            log("[image] starting a fresh Snowflake world");
+            Ok(World::default())
+        }
+        Err(error) => Err(error).context("Snowflake continuity violation"),
     }
 }
 
 #[derive(Clone)]
-struct HumanIntervention {
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
-    executor: Executor,
-    model: ModelInterruptHandle,
-    eval: EvalInterruptHandle,
-    gate: Arc<Mutex<()>>,
-}
+struct Intervention(RuntimeHandle);
 
-impl HumanIntervention {
+impl Intervention {
     fn submit(&self, message: String) -> bool {
-        let _intervention = self.gate.lock().unwrap();
-        self.eval.request_interrupt();
-        self.model.request_interrupt();
-        if let Err(error) = self.executor.cancel() {
-            slog(format!("[executor] cancellation failed: {error}"));
+        if matches!(message.as_str(), "!!exit" | "!!quit") {
+            return self.0.send(Command::Shutdown).is_ok();
         }
-        self.tx.send(message).is_ok()
-    }
-
-    fn acknowledge(&self) {
-        let _intervention = self.gate.lock().unwrap();
-        self.model.clear_pending();
-        self.eval.clear_pending();
+        if self.0.send(Command::HumanMessage(message.clone())).is_err() {
+            return false;
+        }
+        chat("user", message);
+        let _ = self.0.send(Command::Snapshot);
+        true
     }
 }
 
-fn start_input_thread(intervention: HumanIntervention) {
+fn start_input(intervention: Intervention) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
-            let line = line.trim().to_string();
-            if !line.is_empty() && !intervention.submit(line) {
+            let message = line.trim().to_owned();
+            if !message.is_empty() && !intervention.submit(message) {
                 break;
             }
         }
@@ -129,20 +132,14 @@ fn escape_html(value: &str) -> String {
 }
 
 fn chat_html() -> String {
-    CHAT_HISTORY
-        .lock()
+    CHAT.lock()
         .unwrap()
         .iter()
         .map(|entry| {
-            let class = if entry.role == "user" {
-                "msg user"
-            } else {
-                "msg agent"
-            };
             format!(
-                r#"<div class="{}"><div>{}</div><div class="meta">{}</div></div>"#,
-                class,
-                escape_html(&entry.message),
+                r#"<div class="msg {}"><div>{}</div><div class="meta">{}</div></div>"#,
+                entry.role,
+                escape_html(&entry.text),
                 escape_html(&entry.timestamp)
             )
         })
@@ -153,28 +150,56 @@ fn content_type(value: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes("Content-Type", value).unwrap()
 }
 
-fn start_http(intervention: HumanIntervention) {
+fn control(handle: &RuntimeHandle, name: &str) -> bool {
+    let command = match name {
+        "/control/snapshot" => Command::Snapshot,
+        "/control/cancel-lisp" => Command::CancelLisp,
+        "/control/cancel-external" => Command::CancelExternal,
+        "/control/shutdown" => Command::Shutdown,
+        _ => return false,
+    };
+    handle.send(command).is_ok()
+}
+
+fn start_http(intervention: Intervention) {
     thread::spawn(move || {
         let address =
             std::env::var("CONTINUUM_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
         let server = tiny_http::Server::http(&address).expect("HTTP listen failed");
-        slog(format!("[http] listening on http://{address}"));
+        log(format!("[http] listening on http://{address}"));
         let thoughts = include_str!("../web/thoughts.html");
-        let chat = include_str!("../web/chat.html");
+        let chat_page = include_str!("../web/chat.html");
         for mut request in server.incoming_requests() {
             let method = request.method().as_str();
-            let url = request.url();
-            let response = match (method, url) {
+            let url = request.url().to_owned();
+            if method == "GET" && url.starts_with("/events") {
+                let seen = url
+                    .split_once("since=")
+                    .and_then(|(_, value)| value.parse().ok())
+                    .unwrap_or(0);
+                thread::spawn(move || {
+                    let (generation, changed) = &*EVENTS;
+                    let mut generation = generation.lock().unwrap();
+                    while *generation <= seen {
+                        generation = changed.wait(generation).unwrap();
+                    }
+                    let response = tiny_http::Response::from_string(generation.to_string())
+                        .with_header(content_type("text/plain"));
+                    let _ = request.respond(response);
+                });
+                continue;
+            }
+            let response = match (method, url.as_str()) {
                 ("GET", "/" | "/thoughts") => tiny_http::Response::from_string(thoughts)
                     .with_header(content_type("text/html; charset=utf-8")),
-                ("GET", "/chat") => tiny_http::Response::from_string(chat)
+                ("GET", "/chat") => tiny_http::Response::from_string(chat_page)
                     .with_header(content_type("text/html; charset=utf-8")),
                 ("GET", "/thoughts.json") => tiny_http::Response::from_string(
-                    serde_json::to_string(&*LOG_BUF.lock().unwrap()).unwrap(),
+                    serde_json::to_string(&*LOGS.lock().unwrap()).unwrap(),
                 )
                 .with_header(content_type("application/json")),
                 ("GET", "/chat/history") => tiny_http::Response::from_string(chat_html())
-                    .with_header(content_type("text/html")),
+                    .with_header(content_type("text/html; charset=utf-8")),
                 ("POST", "/chat/send") => {
                     let mut body = String::new();
                     let _ = request
@@ -188,7 +213,10 @@ fn start_http(intervention: HumanIntervention) {
                         intervention.submit(message);
                     }
                     tiny_http::Response::from_string(chat_html())
-                        .with_header(content_type("text/html"))
+                        .with_header(content_type("text/html; charset=utf-8"))
+                }
+                ("POST", path) if control(&intervention.0, path) => {
+                    tiny_http::Response::from_string("ok")
                 }
                 _ => tiny_http::Response::from_string("not found").with_status_code(404),
             };
@@ -200,85 +228,25 @@ fn start_http(intervention: HumanIntervention) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
-    slog("Continuum v0.2 — persistent context → model Lisp action → result");
-    let mut kernel = load_kernel()?;
-    let eval_interrupt = kernel.eval_interrupt_handle();
-    kernel.set_output_sink(OutputSink::new(|message| {
-        slog(message.trim_end_matches('\n'))
-    }));
-    kernel.set_root_instructions_if_empty(root_instructions());
-
-    let workspace = std::env::var_os("CONTINUUM_AGENT_ROOT")
+    let directory = std::env::var_os("CONTINUUM_SNOWFLAKE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new("data/workspace").to_path_buf());
-    let executor = Executor::new(ExecutorConfig::with_working_directory(workspace))
-        .context("initialize Bash executor")?;
-    let scheduler = Scheduler::new(OpenRouterModel::default(), executor.clone());
-    let model_interrupt = scheduler.model_interrupt_handle();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let intervention = HumanIntervention {
-        tx,
-        executor,
-        model: model_interrupt,
-        eval: eval_interrupt,
-        gate: Arc::new(Mutex::new(())),
-    };
-    start_input_thread(intervention.clone());
-    start_http(intervention.clone());
-
-    let mut snapshot_timer = Instant::now();
-    loop {
-        if let Err(error) = kernel.check_wake_timers() {
-            slog(format!("[wake timers] {error}"));
-        }
-        if snapshot_timer.elapsed() >= Duration::from_secs(3600) {
-            if let Err(error) = kernel.snapshot() {
-                slog(format!("[snapshot] {}", error));
-            }
-            snapshot_timer = Instant::now();
-        }
-
-        let outcome = tokio::select! {
-            biased;
-            message = rx.recv() => {
-                let Some(message) = message else { return Ok(()) };
-                // The selected turn future is dropped before its trap and sticky
-                // interruption signals are discarded.
-                kernel.discard_pending_operation();
-                intervention.acknowledge();
-                if matches!(message.as_str(), "!!exit" | "!!quit") {
-                    if let Err(error) = kernel.snapshot() {
-                        eprintln!("[snapshot] {}", error);
-                    }
-                    return Ok(());
-                }
-                deliver_human(&mut kernel, message);
-                continue;
-            }
-            outcome = scheduler.run_turn(&mut kernel) => outcome,
-        };
-        match outcome {
-            Ok(TurnOutcome::Evaluated { source, result, .. }) => {
-                slog(format!("[lisp] {} => {}", source, result));
-            }
-            Ok(TurnOutcome::ToolCompleted { source, result, .. }) => {
-                slog(format!("[tool] {} => {}", source, result));
-            }
-            Ok(TurnOutcome::Spawned { child_id, .. }) => {
-                slog(format!("[agent] spawned {}", child_id));
-            }
-            Ok(TurnOutcome::Returned { result, .. }) => {
-                slog(format!("[agent] child returned {}", result));
-            }
-            Ok(TurnOutcome::Replied { text, .. }) => {
-                add_chat("agent", text.clone());
-                slog(format!("[agent] {}", text));
-            }
-            Ok(TurnOutcome::Idle) => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(error) => {
-                slog(format!("[turn] {}", error));
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
+        .unwrap_or_else(|| PathBuf::from("data/snowflake"));
+    let mut world = load_world(&directory)?;
+    if world.state.agents.is_empty() {
+        world
+            .state
+            .agents
+            .push(Agent::new("Continuum".into(), root_instructions()));
+    } else if world.state.agents[0].instructions.is_empty() {
+        world.state.agents[0].instructions = root_instructions();
     }
+    seed_history(&world);
+
+    let mut runtime = Runtime::new(world, ImageStore::new(&directory));
+    runtime.observe(observe);
+    let intervention = Intervention(runtime.handle());
+    start_input(intervention.clone());
+    start_http(intervention);
+    log("Continuum Snowflake ABI 2 — bytecode runtime online");
+    runtime.run().await.context("Snowflake runtime stopped")
 }

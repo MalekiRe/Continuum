@@ -324,12 +324,11 @@ pub fn start(effect: &EffectRequest) -> ExternalRun {
     let cancel_token = cancellation.clone();
     match effect.clone() {
         EffectRequest::Bash(command) => {
-            let executor = std::env::current_dir()
-                .map_err(|error| error.to_string())
-                .and_then(|directory| {
-                    Executor::new(ExecutorConfig::with_working_directory(directory))
-                        .map_err(|error| error.to_string())
-                });
+            let directory = std::env::var_os("CONTINUUM_AGENT_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("data/workspace"));
+            let executor = Executor::new(ExecutorConfig::with_working_directory(directory))
+                .map_err(|error| error.to_string());
             let cancel_executor = executor.as_ref().ok().cloned();
             let future = Box::pin(async move {
                 let executor = executor.map_err(EffectError)?;
