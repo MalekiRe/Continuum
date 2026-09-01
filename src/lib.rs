@@ -3,6 +3,7 @@ pub mod ids;
 pub mod kernel;
 pub mod output;
 pub mod scheduler;
+pub mod snowflake;
 pub mod vm;
 
 pub use executor::{
