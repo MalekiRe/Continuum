@@ -54,12 +54,46 @@ pub enum ModelError {
     Http {
         status: reqwest::StatusCode,
         message: String,
+        retry_after: Option<std::time::Duration>,
     },
     #[error("model response contained no content ({0})")]
     MissingContent(String),
     #[error("{0}")]
     Client(String),
 }
+impl ModelError {
+    fn retry_delay(&self, attempt: u32) -> Option<std::time::Duration> {
+        match self {
+            Self::Request(error) if error.is_connect() => {
+                Some(std::time::Duration::from_millis(200))
+            }
+            Self::Http {
+                status,
+                retry_after,
+                ..
+            } if *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
+                Some(retry_after.unwrap_or(std::time::Duration::from_secs(1 << attempt)))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<std::time::Duration> {
+    let value = value.to_str().ok()?;
+    let delay = if let Ok(seconds) = value.parse() {
+        std::time::Duration::from_secs(seconds)
+    } else {
+        (chrono::DateTime::parse_from_rfc2822(value)
+            .ok()?
+            .with_timezone(&chrono::Utc)
+            - chrono::Utc::now())
+        .to_std()
+        .unwrap_or_default()
+    };
+    Some(delay)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error(transparent)]
@@ -96,8 +130,15 @@ pub trait ModelClient: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModelCompletion {
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct OpenRouterModel {
     pub model: String,
+    pub reasoning_effort: String,
     pub timeout: std::time::Duration,
     client: reqwest::Client,
 }
@@ -107,6 +148,8 @@ impl Default for OpenRouterModel {
         Self {
             model: std::env::var("CONTINUUM_MODEL")
                 .unwrap_or_else(|_| "deepseek/deepseek-v4-flash".into()),
+            reasoning_effort: std::env::var("CONTINUUM_REASONING_EFFORT")
+                .unwrap_or_else(|_| "high".into()),
             timeout: std::time::Duration::from_secs(60),
             client: reqwest::Client::new(),
         }
@@ -118,11 +161,12 @@ impl OpenRouterModel {
         &self,
         api_key: String,
         request: ModelRequest,
-    ) -> Result<String, ModelError> {
-        let response = self
+    ) -> Result<ModelCompletion, ModelError> {
+        let mut response = self
             .client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .timeout(self.timeout)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .bearer_auth(api_key)
             .json(&serde_json::json!({
                 "model": self.model,
@@ -130,29 +174,60 @@ impl OpenRouterModel {
                     {"role": "system", "content": request.system},
                     {"role": "user", "content": request.context}
                 ],
-                "temperature": 0.4
+                "temperature": 0.4,
+                "reasoning": {"effort": self.reasoning_effort, "exclude": false},
+                "provider": {"sort": "throughput", "allow_fallbacks": true, "require_parameters": true}
             }))
             .send()
             .await
             .map_err(ModelError::Request)?;
         let status = response.status();
-        let raw = response.text().await.map_err(ModelError::ResponseBody)?;
-        let body: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|source| ModelError::InvalidJson { status, source })?;
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(parse_retry_after);
+        let mut raw = Vec::new();
+        let transport_error = loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => raw.extend_from_slice(&chunk),
+                Ok(None) => break None,
+                Err(error) => break Some(error),
+            }
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&raw);
         if !status.is_success() {
-            let message = body
-                .pointer("/error/message")
+            let message = parsed
+                .as_ref()
+                .ok()
+                .and_then(|body| body.pointer("/error/message"))
                 .and_then(|value| value.as_str())
-                .unwrap_or("unknown error")
+                .unwrap_or_else(|| std::str::from_utf8(&raw).unwrap_or("non-JSON response"))
                 .to_string();
-            return Err(ModelError::Http { status, message });
+            return Err(ModelError::Http {
+                status,
+                message,
+                retry_after,
+            });
         }
+        let body = match parsed {
+            Ok(body) => body,
+            Err(source) => {
+                if let Some(error) = transport_error {
+                    return Err(ModelError::ResponseBody(error));
+                }
+                return Err(ModelError::InvalidJson { status, source });
+            }
+        };
         if let Some(content) = body
             .pointer("/choices/0/message/content")
             .and_then(|value| value.as_str())
             .filter(|content| !content.trim().is_empty())
         {
-            return Ok(content.to_owned());
+            let message = &body["choices"][0]["message"];
+            return Ok(ModelCompletion {
+                content: content.to_owned(),
+                reasoning: extract_reasoning(message),
+            });
         }
         let finish_reason = body
             .pointer("/choices/0/finish_reason")
@@ -167,6 +242,84 @@ impl OpenRouterModel {
     }
 }
 
+fn extract_reasoning(message: &serde_json::Value) -> Option<String> {
+    for field in ["reasoning", "reasoning_content"] {
+        if let Some(reasoning) = message.get(field).and_then(|value| value.as_str())
+            && !reasoning.trim().is_empty()
+        {
+            return Some(reasoning.to_owned());
+        }
+    }
+    let reasoning = message
+        .get("reasoning_details")?
+        .as_array()?
+        .iter()
+        .filter_map(|detail| {
+            detail
+                .get("text")
+                .or_else(|| detail.get("summary"))?
+                .as_str()
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    (!reasoning.trim().is_empty()).then_some(reasoning)
+}
+
+impl OpenRouterModel {
+    pub async fn complete_detailed(
+        &self,
+        request: ModelRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ModelCompletion, ModelError> {
+        if cancellation.is_cancelled() {
+            return Err(ModelError::Cancelled);
+        }
+        let started = std::time::Instant::now();
+        let api_key = match std::env::var("OPENROUTER_API_KEY") {
+            Ok(key) => key,
+            Err(_) => {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                    () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
+                return Err(ModelError::MissingApiKey);
+            }
+        };
+        for attempt in 0..2 {
+            let result = tokio::select! {
+                biased;
+                result = self.openrouter_request(api_key.clone(), request.clone()) => result,
+                () = cancellation.cancelled() => return Err(ModelError::Cancelled),
+            };
+            let retry = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.retry_delay(attempt));
+            if attempt == 1 || retry.is_none() {
+                if result.is_err() {
+                    let delay = std::time::Duration::from_secs(2).saturating_sub(started.elapsed());
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
+                return result;
+            }
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(ModelError::Cancelled),
+                () = tokio::time::sleep(retry.unwrap()) => {}
+            }
+        }
+        unreachable!("two model attempts either returned or retried")
+    }
+}
+
 #[async_trait]
 impl ModelClient for OpenRouterModel {
     async fn complete(
@@ -174,15 +327,9 @@ impl ModelClient for OpenRouterModel {
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> Result<String, ModelError> {
-        if cancellation.is_cancelled() {
-            return Err(ModelError::Cancelled);
-        }
-        let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| ModelError::MissingApiKey)?;
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => Err(ModelError::Cancelled),
-            result = self.openrouter_request(api_key, request) => result,
-        }
+        self.complete_detailed(request, cancellation)
+            .await
+            .map(|completion| completion.content)
     }
 }
 
@@ -685,4 +832,71 @@ fn truncate(value: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}{}", &value[..end], ELLIPSIS)
+}
+
+#[cfg(test)]
+mod model_response_tests {
+    use super::extract_reasoning;
+
+    #[test]
+    fn extracts_plain_and_structured_reasoning() {
+        let plain = serde_json::json!({"reasoning": "think"});
+        assert_eq!(extract_reasoning(&plain).as_deref(), Some("think"));
+        let details = serde_json::json!({"reasoning_details": [
+            {"type": "reasoning.summary", "summary": "summary"},
+            {"type": "reasoning.text", "text": "details"},
+            {"type": "reasoning.encrypted", "data": "secret"}
+        ]});
+        assert_eq!(
+            extract_reasoning(&details).as_deref(),
+            Some("summary\ndetails")
+        );
+    }
+
+    #[test]
+    fn retry_after_is_honored_only_for_explicit_retryable_responses() {
+        let limited = super::ModelError::Http {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            message: "slow down".into(),
+            retry_after: Some(std::time::Duration::from_secs(7)),
+        };
+        assert_eq!(
+            limited.retry_delay(0),
+            Some(std::time::Duration::from_secs(7))
+        );
+        let bad = super::ModelError::Http {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "bad".into(),
+            retry_after: None,
+        };
+        assert_eq!(bad.retry_delay(0), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let seconds = reqwest::header::HeaderValue::from_static("7");
+        assert_eq!(
+            super::parse_retry_after(&seconds),
+            Some(std::time::Duration::from_secs(7))
+        );
+        let date = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc2822();
+        let date = reqwest::header::HeaderValue::from_str(&date).unwrap();
+        let delay = super::parse_retry_after(&date).unwrap();
+        assert!(delay >= std::time::Duration::from_secs(118));
+        assert!(delay <= std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn empty_or_encrypted_reasoning_is_not_fabricated() {
+        assert_eq!(
+            extract_reasoning(&serde_json::json!({"reasoning": "  "})),
+            None
+        );
+        assert_eq!(
+            extract_reasoning(&serde_json::json!({
+                "reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]
+            })),
+            None
+        );
+    }
 }

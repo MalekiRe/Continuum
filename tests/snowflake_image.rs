@@ -191,7 +191,10 @@ fn images_require_exactly_one_owner_for_each_unanswered_message() {
         MessageId(0),
         Message {
             text: "pending".into(),
-            answered: false,
+            created_at: "now".into(),
+            reply: None,
+            reply_at: None,
+            reply_order: None,
         },
     );
     world.state.next_message = 1;
@@ -210,12 +213,76 @@ fn images_require_exactly_one_owner_for_each_unanswered_message() {
         Err(ImageError::Invalid(_))
     ));
     world.state.agents[1].inbox.clear();
+    world.state.agents[0].inbox.clear();
+    let message = world.state.messages.get_mut(&MessageId(0)).unwrap();
+    message.reply = Some("done".into());
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
     world
         .state
         .messages
         .get_mut(&MessageId(0))
         .unwrap()
-        .answered = true;
+        .reply_at = Some("later".into());
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    world
+        .state
+        .messages
+        .get_mut(&MessageId(0))
+        .unwrap()
+        .reply_order = Some((1, 0));
+    store.save(&world, None).unwrap();
+    world
+        .state
+        .messages
+        .get_mut(&MessageId(0))
+        .unwrap()
+        .reply_order = Some((1, 1));
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    world
+        .state
+        .messages
+        .get_mut(&MessageId(0))
+        .unwrap()
+        .reply_order = Some((0, 0));
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    world
+        .state
+        .messages
+        .get_mut(&MessageId(0))
+        .unwrap()
+        .reply_order = Some((1, 0));
+    world.state.messages.insert(
+        MessageId(1),
+        Message {
+            text: "also done".into(),
+            created_at: "now".into(),
+            reply: Some("done".into()),
+            reply_at: Some("later".into()),
+            reply_order: Some((2, 0)),
+        },
+    );
+    world.state.next_message = 2;
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    world.state.messages.shift_remove(&MessageId(1));
+    world.state.next_message = 1;
+    let message = world.state.messages.get_mut(&MessageId(0)).unwrap();
+    message.reply = None;
+    world.state.agents[0].inbox.push(MessageId(0));
     assert!(matches!(
         store.save(&world, None),
         Err(ImageError::Invalid(_))

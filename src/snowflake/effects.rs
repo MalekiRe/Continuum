@@ -1,10 +1,13 @@
 use crate::executor::{ExecutionOutcome, Executor, ExecutorConfig};
-use crate::scheduler::{ModelClient, ModelRequest, OpenRouterModel};
+use crate::scheduler::{ModelRequest, OpenRouterModel};
 use crate::snowflake::value::{HostId, MessageId, Value};
 use crate::snowflake::world::World;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+pub type ThinkingObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectRequest {
@@ -51,14 +54,12 @@ impl ExternalRun {
 const ADD: HostId = HostId(0);
 const SUBTRACT: HostId = HostId(1);
 const MULTIPLY: HostId = HostId(2);
-const DIVIDE: HostId = HostId(3);
 const EQUAL: HostId = HostId(4);
 const LESS: HostId = HostId(5);
 const LIST: HostId = HostId(7);
 const CONS: HostId = HostId(8);
 const FIRST: HostId = HostId(9);
 const REST: HostId = HostId(10);
-const LENGTH: HostId = HostId(11);
 const STRING_APPEND: HostId = HostId(12);
 const BASH: HostId = HostId(13);
 const MODEL: HostId = HostId(14);
@@ -70,14 +71,12 @@ const HOSTS: &[(&str, HostId)] = &[
     ("+", ADD),
     ("-", SUBTRACT),
     ("*", MULTIPLY),
-    ("/", DIVIDE),
     ("=", EQUAL),
     ("<", LESS),
     ("list", LIST),
     ("cons", CONS),
     ("first", FIRST),
     ("rest", REST),
-    ("length", LENGTH),
     ("string-append", STRING_APPEND),
     ("bash", BASH),
     ("model", MODEL),
@@ -116,7 +115,6 @@ pub fn call(
         ADD => arithmetic_fold("+", &arguments, 0, i64::checked_add)?,
         MULTIPLY => arithmetic_fold("*", &arguments, 1, i64::checked_mul)?,
         SUBTRACT => numeric_subtract(&arguments)?,
-        DIVIDE => numeric_divide(&arguments)?,
         EQUAL => {
             exact("=", &arguments, 2)?;
             Value::Bool(arguments[0] == arguments[1])
@@ -140,19 +138,6 @@ pub fn call(
             exact("rest", &arguments, 1)?;
             let list = expect_list("rest", &arguments[0])?;
             Value::List(list.get(1..).unwrap_or_default().to_vec())
-        }
-        LENGTH => {
-            exact("length", &arguments, 1)?;
-            let length = match &arguments[0] {
-                Value::List(values) => values.len(),
-                Value::String(value) => value.chars().count(),
-                _ => {
-                    return Err(EffectError(
-                        "length expects a list, vector, or string".into(),
-                    ));
-                }
-            };
-            Value::Int(i64::try_from(length).map_err(|_| EffectError("length overflow".into()))?)
         }
         STRING_APPEND => {
             let mut result = String::new();
@@ -204,7 +189,7 @@ pub fn call(
                 .messages
                 .get(&id)
                 .ok_or_else(|| EffectError("reply message does not exist".into()))?;
-            if message.answered {
+            if message.reply.is_some() {
                 return Err(EffectError("reply message was already answered".into()));
             }
             return Ok(HostResult::Terminal(TerminalEffect::Reply {
@@ -276,14 +261,6 @@ fn numeric_subtract(arguments: &[Value]) -> Result<Value, EffectError> {
     Ok(Value::Int(result))
 }
 
-fn numeric_divide(arguments: &[Value]) -> Result<Value, EffectError> {
-    exact("/", arguments, 2)?;
-    integer("/", &arguments[0])?
-        .checked_div(integer("/", &arguments[1])?)
-        .map(Value::Int)
-        .ok_or_else(|| EffectError("invalid integer division".into()))
-}
-
 fn compare(name: &str, arguments: &[Value]) -> Result<Value, EffectError> {
     exact(name, arguments, 2)?;
     Ok(Value::Bool(
@@ -319,7 +296,7 @@ pub fn display(value: &Value) -> String {
     }
 }
 
-pub fn start(effect: &EffectRequest) -> ExternalRun {
+pub fn start_observed(effect: &EffectRequest, thinking: ThinkingObserver) -> ExternalRun {
     let cancellation = CancellationToken::new();
     let cancel_token = cancellation.clone();
     match effect.clone() {
@@ -327,8 +304,9 @@ pub fn start(effect: &EffectRequest) -> ExternalRun {
             let directory = std::env::var_os("CONTINUUM_AGENT_ROOT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("data/workspace"));
-            let executor = Executor::new(ExecutorConfig::with_working_directory(directory))
-                .map_err(|error| error.to_string());
+            let mut config = ExecutorConfig::with_working_directory(directory);
+            config.output_limit = 32 * 1024;
+            let executor = Executor::new(config).map_err(|error| error.to_string());
             let cancel_executor = executor.as_ref().ok().cloned();
             let future = Box::pin(async move {
                 let executor = executor.map_err(EffectError)?;
@@ -383,21 +361,24 @@ pub fn start(effect: &EffectRequest) -> ExternalRun {
                     ))),
                 }
             });
-            ExternalRun {
-                future,
-                cancel: Box::new(move || {
-                    cancel_token.cancel();
-                    if let Some(executor) = &cancel_executor {
-                        let _ = executor.cancel();
-                    }
-                }),
-            }
+            ExternalRun::new(future, move || {
+                cancel_token.cancel();
+                if let Some(executor) = &cancel_executor {
+                    let _ = executor.cancel();
+                }
+            })
         }
         EffectRequest::Model(context) => {
             let future_token = cancellation.clone();
             let future = Box::pin(async move {
-                OpenRouterModel::default()
-                    .complete(
+                let model = OpenRouterModel::default();
+                let started = std::time::Instant::now();
+                thinking(&format!(
+                    "Model request started with {} reasoning.",
+                    model.reasoning_effort
+                ));
+                let completion = model
+                    .complete_detailed(
                         ModelRequest {
                             system: String::new(),
                             context,
@@ -405,13 +386,22 @@ pub fn start(effect: &EffectRequest) -> ExternalRun {
                         future_token,
                     )
                     .await
-                    .map(Value::String)
-                    .map_err(|error| EffectError(error.to_string()))
+                    .map_err(|error| EffectError(error.to_string()))?;
+                if let Some(reasoning) = completion.reasoning {
+                    thinking(&format!(
+                        "Reasoning after {:.1?}:
+{reasoning}",
+                        started.elapsed()
+                    ));
+                } else {
+                    thinking(&format!(
+                        "The provider returned no visible reasoning tokens after {:.1?}.",
+                        started.elapsed()
+                    ));
+                }
+                Ok(Value::String(completion.content))
             });
-            ExternalRun {
-                future,
-                cancel: Box::new(move || cancel_token.cancel()),
-            }
+            ExternalRun::new(future, move || cancel_token.cancel())
         }
         EffectRequest::Agent { .. } => unreachable!("agent effects are started by Runtime"),
     }

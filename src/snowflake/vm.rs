@@ -162,8 +162,8 @@ impl Task {
             .collect()
     }
 
-    fn initialize_locals(&mut self, world: &mut World) {
-        for local in &mut self.locals {
+    fn initialize_locals(world: &mut World, locals: &mut [Local]) {
+        for local in locals {
             if let Local::Boxed(cell @ None) = local {
                 *cell = Some(world.allocate_cell(Value::Nil));
             }
@@ -222,7 +222,7 @@ impl Task {
     }
 
     fn step(&mut self, world: &mut World) -> Result<Option<TaskPoll>, VmError> {
-        self.initialize_locals(world);
+        Self::initialize_locals(world, &mut self.locals);
         let chunk = world
             .chunk(self.chunk)
             .ok_or_else(|| VmError::Invalid("current chunk does not exist".into()))?;
@@ -389,11 +389,9 @@ impl Task {
         let valid = world
             .chunk(self.chunk)
             .is_some_and(|chunk| (target as usize) < chunk.code.len());
-        if valid {
-            Ok(())
-        } else {
-            Err(VmError::Invalid("jump target out of range".into()))
-        }
+        valid
+            .then_some(())
+            .ok_or_else(|| VmError::Invalid("jump target out of range".into()))
     }
 
     fn jump(&mut self, world: &World, target: u32) -> Result<(), VmError> {
@@ -407,13 +405,9 @@ impl Task {
             .chunk(self.chunk)
             .ok_or_else(|| VmError::Invalid("current chunk does not exist".into()))?
             .max_stack as usize;
-        if self.stack.len().saturating_sub(self.base) > maximum {
-            Err(VmError::Invalid(
-                "operand stack exceeds chunk maximum".into(),
-            ))
-        } else {
-            Ok(())
-        }
+        (self.stack.len().saturating_sub(self.base) <= maximum)
+            .then_some(())
+            .ok_or_else(|| VmError::Invalid("operand stack exceeds chunk maximum".into()))
     }
 
     fn take_operands(&mut self, count: u16) -> Result<Vec<Value>, VmError> {
@@ -464,21 +458,25 @@ impl Task {
             }
             Value::Host(host) => {
                 self.stack.truncate(callable);
-                match effects::call(world, host, values)? {
-                    HostResult::Value(value) => {
-                        self.stack.push(value);
-                        Ok(None)
-                    }
-                    HostResult::Effect(effect) => {
-                        self.awaiting_effect = true;
-                        Ok(Some(TaskPoll::Effect(effect)))
-                    }
-                    HostResult::Terminal(effect) => Ok(Some(TaskPoll::Terminal(effect))),
-                }
+                Ok(self.accept_host_result(effects::call(world, host, values)?))
             }
             _ => Err(VmError::Evaluation(
                 "attempted to call a non-function".into(),
             )),
+        }
+    }
+
+    fn accept_host_result(&mut self, result: HostResult) -> Option<TaskPoll> {
+        match result {
+            HostResult::Value(value) => {
+                self.stack.push(value);
+                None
+            }
+            HostResult::Effect(effect) => {
+                self.awaiting_effect = true;
+                Some(TaskPoll::Effect(effect))
+            }
+            HostResult::Terminal(effect) => Some(TaskPoll::Terminal(effect)),
         }
     }
 
@@ -500,17 +498,7 @@ impl Task {
             }
             Value::Host(host) => {
                 self.stack.truncate(self.base);
-                match effects::call(world, host, values)? {
-                    HostResult::Value(value) => {
-                        self.stack.push(value);
-                        Ok(None)
-                    }
-                    HostResult::Effect(effect) => {
-                        self.awaiting_effect = true;
-                        Ok(Some(TaskPoll::Effect(effect)))
-                    }
-                    HostResult::Terminal(effect) => Ok(Some(TaskPoll::Terminal(effect))),
-                }
+                Ok(self.accept_host_result(effects::call(world, host, values)?))
             }
             _ => Err(VmError::Evaluation(
                 "attempted to call a non-function".into(),
@@ -542,11 +530,7 @@ impl Task {
             Self::read_cell(world, *cell)?;
         }
         let mut locals = Self::local_layout(chunk);
-        for local in &mut locals {
-            if let Local::Boxed(cell @ None) = local {
-                *cell = Some(world.allocate_cell(Value::Nil));
-            }
-        }
+        Self::initialize_locals(world, &mut locals);
         for (index, value) in arguments.into_iter().enumerate() {
             match &mut locals[index] {
                 Local::Direct(slot) => *slot = value,

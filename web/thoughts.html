@@ -5,18 +5,19 @@
 <title>Continuum — thoughts</title>
 <style>
 body{background:#0d1117;color:#c9d1d9;font:14px/1.5 monospace;margin:0;padding:20px}
-#log{height:95vh;overflow-y:auto;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;white-space:pre-wrap;word-wrap:break-word}
+#activity{margin-bottom:12px;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;white-space:pre-wrap}
+#log{height:75vh;overflow-y:auto;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;white-space:pre-wrap;word-wrap:break-word}
 #log::-webkit-scrollbar{width:8px}
 #log::-webkit-scrollbar-track{background:#161b22}
 #log::-webkit-scrollbar-thumb{background:#30363d;border-radius:4px}
 </style>
 </head>
-<body><div id="log"></div>
+<body><div id="activity"></div><div id="log"></div>
 <script>
-const el=document.getElementById('log');
-async function refresh(){try{let r=await fetch('/thoughts.json');let d=await r.json();el.textContent=d.join('\n');el.scrollTop=el.scrollHeight}catch(e){}}
+const el=document.getElementById('log'),activity=document.getElementById('activity');
+async function refresh(){try{let [lr,ar]=await Promise.all([fetch('/thoughts.json'),fetch('/activity.json')]);let d=await lr.json(),a=await ar.json();el.textContent=d.join('\n');activity.textContent=a.status+(a.reasoning?'\n\nLatest provider reasoning (may echo prompt text):\n'+a.reasoning:'');el.scrollTop=el.scrollHeight}catch(e){}}
 let version=0;
-async function watch(){for(;;){try{let r=await fetch('/events?since='+version);version=Number(await r.text());await refresh()}catch(e){await new Promise(resolve=>setTimeout(resolve,500))}}}
+async function watch(){for(;;){try{let r=await fetch('/events?since='+version);if(!r.ok)throw Error();version=Number(await r.text());await refresh()}catch(e){await new Promise(resolve=>setTimeout(resolve,500))}}}
 refresh();watch();
 </script>
 </body></html>

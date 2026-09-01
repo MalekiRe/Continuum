@@ -68,16 +68,13 @@ impl ImageStore {
         world: &World,
         transaction: Option<&mut Transaction>,
     ) -> Result<(), ImageError> {
-        let mut selected = None;
-        for index in 0..2 {
-            if let Ok(image) = self.read(&self.slot(index))
-                && selected
-                    .as_ref()
-                    .is_none_or(|(_, old): &(usize, Image)| image.generation > old.generation)
-            {
-                selected = Some((index, image));
-            }
-        }
+        let selected = (0..2)
+            .filter_map(|index| {
+                self.read(&self.slot(index))
+                    .ok()
+                    .map(|image| (index, image))
+            })
+            .max_by_key(|(index, image)| (image.generation, std::cmp::Reverse(*index)));
         let (slot, generation) = match selected {
             None => (0, 0),
             Some((index, image)) => (
@@ -200,20 +197,29 @@ fn validate(state: &mut State) -> Result<(), ImageError> {
             Op::GetGlobal(id) | Op::DefGlobal(id) | Op::SetGlobal(id) if id.0 >= symbol_count)
         });
     }
-    let inboxes: Vec<_> = state
-        .agents
-        .iter()
-        .flat_map(|agent| &agent.inbox)
-        .copied()
-        .collect();
-    let owned: HashSet<_> = inboxes.iter().copied().collect();
+    let messages = &state.messages;
+    let mut owned = HashSet::new();
     let agent_refs = !state.agents.is_empty()
-        && owned.len() == inboxes.len()
-        && owned.iter().all(|id| state.messages.contains_key(id));
-    let message_refs = state
-        .messages
-        .iter()
-        .all(|(id, message)| id.0 < state.next_message && message.answered != owned.contains(id));
+        && state
+            .agents
+            .iter()
+            .flat_map(|agent| &agent.inbox)
+            .all(|id| owned.insert(*id) && messages.contains_key(id));
+    let mut orders = HashSet::new();
+    let answered = messages.values().filter(|m| m.reply.is_some()).count() as u32;
+    let message_refs = messages.iter().all(|(id, message)| {
+        id.0 < state.next_message
+            && !message.created_at.is_empty()
+            && message.reply.is_some() != owned.contains(id)
+            && message.reply.is_some() == message.reply_at.is_some()
+            && message.reply.is_some() == message.reply_order.is_some()
+            && message.reply_order.is_none_or(|order| {
+                order.0 > id.0
+                    && order.0 <= state.next_message
+                    && order.1 < answered
+                    && orders.insert(order.1)
+            })
+    });
     if !(globals
         && cells
         && code

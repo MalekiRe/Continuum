@@ -159,6 +159,7 @@ async fn snapshot_during_external_pause_never_calls_cancellation() {
         .send(Command::HumanMessage("must survive".into()))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!cancelled.load(Ordering::Acquire));
     handle.send(Command::CancelExternal).unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while !cancelled.load(Ordering::Acquire) {
@@ -176,6 +177,96 @@ async fn snapshot_during_external_pause_never_calls_cancellation() {
 }
 
 #[tokio::test]
+async fn intentional_model_cancellation_does_not_enter_failure_backoff() {
+    let directory = directory();
+    let started = Arc::new(AtomicUsize::new(0));
+    let seen = started.clone();
+    let mut runtime =
+        Runtime::with_starter(World::default(), ImageStore::new(&directory), move |_| {
+            seen.fetch_add(1, Ordering::AcqRel);
+            let cancelled = tokio_util::sync::CancellationToken::new();
+            let future_cancel = cancelled.clone();
+            ExternalRun::new(
+                Box::pin(async move {
+                    future_cancel.cancelled().await;
+                    Err(persistent_lisp_harness::snowflake::effects::EffectError(
+                        "model request interrupted by human input".into(),
+                    ))
+                }),
+                move || cancelled.cancel(),
+            )
+        });
+    let handle = runtime.handle();
+    let worker = tokio::spawn(async move { runtime.run().await.map(|()| runtime) });
+    wait_for(&started, 1).await;
+    handle.send(Command::CancelExternal).unwrap();
+    wait_for(&started, 2).await;
+    handle.send(Command::Shutdown).unwrap();
+    finish_runtime(worker).await;
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn shutdown_closes_human_message_admission_for_handle_and_direct_commands() {
+    let directory = directory();
+    let mut runtime = Runtime::with_starter(
+        World::default(),
+        ImageStore::new(&directory),
+        |_| unreachable!(),
+    );
+    let handle = runtime.handle();
+    runtime.command(Command::Shutdown).unwrap();
+    assert!(
+        runtime
+            .command(Command::HumanMessage("direct".into()))
+            .is_err()
+    );
+    assert!(handle.send(Command::HumanMessage("late".into())).is_err());
+    let mut queued = Runtime::with_starter(
+        World::default(),
+        ImageStore::new(&directory),
+        |_| unreachable!(),
+    );
+    queued.handle().send(Command::Shutdown).unwrap();
+    assert!(
+        queued
+            .command(Command::HumanMessage("late direct".into()))
+            .is_err()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn persistent_model_errors_back_off_but_human_input_wakes_the_runtime() {
+    let directory = directory();
+    let started = Arc::new(AtomicUsize::new(0));
+    let seen = started.clone();
+    let mut runtime =
+        Runtime::with_starter(World::default(), ImageStore::new(&directory), move |_| {
+            seen.fetch_add(1, Ordering::AcqRel);
+            ExternalRun::new(
+                Box::pin(async {
+                    Err(persistent_lisp_harness::snowflake::effects::EffectError(
+                        "offline".into(),
+                    ))
+                }),
+                || {},
+            )
+        });
+    let handle = runtime.handle();
+    let worker = tokio::spawn(async move { runtime.run().await.map(|()| runtime) });
+    wait_for(&started, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(started.load(Ordering::Acquire), 1);
+    handle.send(Command::HumanMessage("wake".into())).unwrap();
+    wait_for(&started, 2).await;
+    handle.send(Command::Shutdown).unwrap();
+    let runtime = finish_runtime(worker).await;
+    assert_eq!(runtime.world.state.messages.len(), 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
 async fn human_message_reply_is_durable_and_answered() {
     let directory = directory();
     let counter = Arc::new(AtomicUsize::new(0));
@@ -187,13 +278,20 @@ async fn human_message_reply_is_durable_and_answered() {
     runtime
         .command(Command::HumanMessage("hello".into()))
         .unwrap();
+    let observed_reply = Arc::new(std::sync::Mutex::new(false));
+    let seen_reply = observed_reply.clone();
+    runtime.observe(Arc::new(move |_, _, replied| {
+        *seen_reply.lock().unwrap() |= replied
+    }));
     let handle = runtime.handle();
     let worker = tokio::spawn(async move { runtime.run().await.map(|()| runtime) });
     wait_for(&counter, 2).await;
     handle.send(Command::Shutdown).unwrap();
     let runtime = finish_runtime(worker).await;
     let message = runtime.world.state.messages.values().next().unwrap();
-    assert!(message.answered);
+    assert!(message.reply.is_some());
+    assert_eq!(message.reply.as_deref(), Some("yes"));
+    assert!(*observed_reply.lock().unwrap());
     assert!(runtime.world.state.agents[0].inbox.is_empty());
     assert_eq!(
         runtime.world.state.agents[0]
@@ -328,14 +426,15 @@ async fn unanswered_child_messages_return_to_the_parent_inbox() {
         vec![persistent_lisp_harness::snowflake::value::MessageId(0)]
     );
     assert!(
-        !runtime
+        runtime
             .world
             .state
             .messages
             .values()
             .next()
             .unwrap()
-            .answered
+            .reply
+            .is_none()
     );
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -505,7 +604,7 @@ async fn child_cannot_reply_to_a_message_owned_by_its_parent() {
     handle.send(Command::Shutdown).unwrap();
     let runtime = finish_runtime(worker).await;
     let message = runtime.world.state.messages.values().next().unwrap();
-    assert!(!message.answered);
+    assert!(message.reply.is_none());
     assert_eq!(
         runtime.world.state.agents[0].inbox,
         vec![persistent_lisp_harness::snowflake::value::MessageId(0)]

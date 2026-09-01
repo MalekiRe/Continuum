@@ -23,10 +23,13 @@ pub struct TranscriptEntry {
 #[serde(deny_unknown_fields)]
 pub struct Message {
     pub text: String,
-    pub answered: bool,
+    pub created_at: String,
+    pub reply: Option<String>,
+    pub reply_at: Option<String>,
+    pub reply_order: Option<(u32, u32)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
     pub name: String,
@@ -40,8 +43,7 @@ impl Agent {
         Self {
             name,
             instructions,
-            transcript: Vec::new(),
-            inbox: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -64,41 +66,37 @@ pub struct World {
 }
 
 #[derive(Debug, Clone)]
-pub struct Transaction {
-    committed: State,
-}
+pub struct Transaction(State);
 
 impl Transaction {
     pub fn begin(world: &World) -> Self {
-        Self {
-            committed: world.state.clone(),
-        }
+        Self(world.state.clone())
     }
 
     pub fn commit(&mut self, world: &World) {
-        self.committed = world.state.clone();
+        self.0 = world.state.clone();
     }
 
     pub fn committed(&self) -> &State {
-        &self.committed
+        &self.0
     }
 
     pub fn replace_committed(&mut self, state: State) {
-        self.committed = state;
+        self.0 = state;
     }
 
     pub fn merge_runtime_state(&mut self, world: &World) {
-        self.committed.agents = world.state.agents.clone();
-        self.committed.messages = world.state.messages.clone();
-        self.committed.next_message = world.state.next_message;
+        self.0.agents = world.state.agents.clone();
+        self.0.messages = world.state.messages.clone();
+        self.0.next_message = world.state.next_message;
     }
 
     pub fn abort(self, world: &mut World) {
-        world.state = self.committed;
+        world.state = self.0;
     }
 
     pub fn rollback(&mut self, world: &mut World) {
-        world.state = self.committed.clone();
+        world.state = self.0.clone();
     }
 }
 
@@ -177,46 +175,24 @@ impl World {
                 depths[ip] = Some(before);
                 let op = &chunk.code[ip];
                 let (needed, delta) = match op {
-                    Op::Const(index) => {
-                        if (*index as usize) >= chunk.constants.len() {
-                            return Err("constant index out of range".into());
-                        }
-                        (0, 1)
+                    Op::Const(index) if (*index as usize) >= chunk.constants.len() => {
+                        return Err("constant index out of range".into());
                     }
-                    Op::GetGlobal(symbol) => {
-                        if self.state.symbols.name(*symbol).is_none() {
-                            return Err("unknown global symbol".into());
-                        }
-                        (0, 1)
+                    Op::GetGlobal(symbol) | Op::DefGlobal(symbol) | Op::SetGlobal(symbol)
+                        if self.state.symbols.name(*symbol).is_none() =>
+                    {
+                        return Err("unknown global symbol".into());
                     }
-                    Op::DefGlobal(symbol) | Op::SetGlobal(symbol) => {
-                        if self.state.symbols.name(*symbol).is_none() {
-                            return Err("unknown global symbol".into());
-                        }
-                        (1, 0)
+                    Op::GetLocal(index) | Op::SetLocal(index) if *index >= chunk.locals => {
+                        return Err("local index out of range".into());
                     }
-                    Op::GetLocal(index) => {
-                        if *index >= chunk.locals {
-                            return Err("local index out of range".into());
-                        }
-                        (0, 1)
+                    Op::GetCapture(index) | Op::SetCapture(index)
+                        if (*index as usize) >= chunk.captures.len() =>
+                    {
+                        return Err("capture index out of range".into());
                     }
-                    Op::SetLocal(index) => {
-                        if *index >= chunk.locals {
-                            return Err("local index out of range".into());
-                        }
-                        (1, 0)
-                    }
-                    Op::GetCapture(index) => {
-                        if (*index as usize) >= chunk.captures.len() {
-                            return Err("capture index out of range".into());
-                        }
-                        (0, 1)
-                    }
-                    Op::SetCapture(index) => {
-                        if (*index as usize) >= chunk.captures.len() {
-                            return Err("capture index out of range".into());
-                        }
+                    Op::Const(_) | Op::GetGlobal(_) | Op::GetLocal(_) | Op::GetCapture(_) => (0, 1),
+                    Op::DefGlobal(_) | Op::SetGlobal(_) | Op::SetLocal(_) | Op::SetCapture(_) => {
                         (1, 0)
                     }
                     Op::Closure(id) => {

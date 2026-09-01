@@ -1,37 +1,21 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Continuum — chat</title>
+<html lang="en"><head><meta charset="utf-8"><title>Continuum — chat</title>
 <style>
-body{background:#0d1117;color:#c9d1d9;font:14px/1.5 sans-serif;margin:0;padding:20px;max-width:800px;margin:0 auto}
-#activity{padding:8px 12px;margin-bottom:8px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#8b949e;white-space:pre-wrap;max-height:8em;overflow:auto}
-#messages{display:flex;flex-direction:column;gap:8px;height:64vh;overflow-y:auto;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;margin-bottom:12px}
-.msg{padding:8px 12px;border-radius:6px;max-width:80%;line-height:1.5}
-.user{background:#1f6feb;align-self:flex-end;color:#fff}
-.agent{background:#21262d;align-self:flex-start;color:#c9d1d9;border:1px solid #30363d}
-.meta{font-size:11px;color:#8b949e;margin-top:4px}
-form{display:flex;gap:8px}
-input[type=text]{flex:1;padding:10px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#c9d1d9;font:14px sans-serif}
-button{padding:10px 20px;border:none;border-radius:6px;background:#238636;color:#fff;font:14px sans-serif;cursor:pointer}
-button:hover{background:#2ea043}
-</style>
-</head>
-<body>
-<div id="activity">Continuum is thinking…</div>
+body{background:#0d1117;color:#c9d1d9;font:14px/1.5 sans-serif;margin:0 auto;padding:20px;max-width:800px}
+#status,#reasoning{padding:8px 12px;margin-bottom:8px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#8b949e;white-space:pre-wrap;max-height:12em;overflow:auto}
+#messages{display:flex;flex-direction:column;gap:8px;height:58vh;overflow-y:auto;padding:12px;background:#161b22;border:1px solid #30363d;border-radius:6px;margin-bottom:12px}
+.meta{font-size:11px;opacity:.7;margin-top:4px}.msg{padding:8px 12px;border-radius:6px;max-width:80%;line-height:1.5}.user{background:#1f6feb;align-self:flex-end;color:#fff}.agent{background:#21262d;align-self:flex-start;border:1px solid #30363d}
+#controls{display:flex;gap:8px;margin-bottom:8px}form{display:flex;gap:8px}input{flex:1;padding:10px;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#c9d1d9}button{padding:10px 20px;border:0;border-radius:6px;background:#238636;color:#fff;cursor:pointer}
+</style></head><body>
+<div id="status">Continuum is starting…</div>
+<details><summary>Latest provider reasoning (may echo prompt text)</summary><pre id="reasoning">No visible reasoning returned yet.</pre></details>
 <div id="messages"></div>
-<form hx-post="/chat/send" hx-target="#messages" hx-swap="innerHTML" hx-on::after-request="this.reset()">
-  <input type="text" name="message" placeholder="Type a message..." autofocus>
-  <button type="submit">Send</button>
-</form>
-<script src="https://unpkg.com/htmx.org@2.0.4"></script>
+<div id="controls"><button type="button" data-control="/control/cancel-external">Cancel model/Bash</button><button type="button" data-control="/control/cancel-lisp">Cancel Lisp</button><button type="button" data-control="/control/snapshot">Snapshot</button></div>
+<form id="send" method="post" action="/chat/send"><input type="hidden" name="token" value="__CONTINUUM_TOKEN__"><input type="text" name="message" placeholder="Type a message…" autofocus required><button type="submit">Send</button></form>
 <script>
-const messages=document.getElementById('messages');
-const activity=document.getElementById('activity');
-async function refresh(){try{let [history,thoughts]=await Promise.all([fetch('/chat/history'),fetch('/thoughts.json')]);messages.innerHTML=await history.text();messages.scrollTop=messages.scrollHeight;let log=await thoughts.json();activity.textContent=log.at(-1)||'Continuum is thinking…'}catch(e){}}
-let version=0;
-async function watch(){for(;;){try{let r=await fetch('/events?since='+version);version=Number(await r.text());await refresh()}catch(e){await new Promise(resolve=>setTimeout(resolve,500))}}}
-refresh();watch();
-</script>
-</body>
-</html>
+const token='__CONTINUUM_TOKEN__',messages=document.getElementById('messages'),status=document.getElementById('status'),reasoning=document.getElementById('reasoning'),form=document.getElementById('send');let cursor=0,refreshing=Promise.resolve();
+function refresh(){refreshing=refreshing.then(update,update);return refreshing}async function update(){try{let activity=await fetch('/activity.json'),state=await activity.json();status.textContent=state.status;reasoning.textContent=state.reasoning||'No visible reasoning returned yet.';for(;;){let response=await fetch('/chat/history?after='+cursor),batch=await response.json();messages.insertAdjacentHTML('beforeend',batch.html);if(batch.next===cursor)break;cursor=batch.next}messages.scrollTop=messages.scrollHeight}catch(e){}}
+form.addEventListener('submit',async event=>{event.preventDefault();let body=new URLSearchParams(new FormData(form));let response=await fetch('/chat/send',{method:'POST',body});if(response.ok){form.reset();await refresh()}});
+document.querySelectorAll('[data-control]').forEach(button=>button.addEventListener('click',async()=>{await fetch(button.dataset.control,{method:'POST',headers:{'X-Continuum-Token':token}});await refresh()}));
+let version=0;async function watch(){for(;;){try{let r=await fetch('/events?since='+version);if(!r.ok)throw Error();version=Number(await r.text());await refresh()}catch(e){await new Promise(resolve=>setTimeout(resolve,500))}}}refresh();watch();
+</script></body></html>

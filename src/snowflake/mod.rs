@@ -14,4 +14,4 @@ pub mod vm;
 pub mod world;
 
 /// Images are readable only by this exact experimental VM ABI.
-pub const ABI: u64 = 2;
+pub const ABI: u64 = 5;

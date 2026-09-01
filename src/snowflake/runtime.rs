@@ -4,14 +4,15 @@ use crate::snowflake::image::{ImageError, ImageStore};
 use crate::snowflake::value::{MessageId, Value};
 use crate::snowflake::vm::{Task, TaskPoll, VmError};
 use crate::snowflake::world::{Agent, Message, TranscriptEntry, World};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const PAUSE: u8 = 1;
 pub const CANCEL_LISP: u8 = 2;
 pub(crate) const LISP_ACTIVE: u8 = 4;
+const STOPPING: u8 = 8;
 
 pub enum Active {
     Idle,
@@ -29,10 +30,15 @@ pub enum Command {
 }
 
 #[derive(Clone)]
-pub struct RuntimeHandle(mpsc::UnboundedSender<Command>, Arc<AtomicU8>);
+pub struct RuntimeHandle(
+    mpsc::UnboundedSender<Command>,
+    Arc<AtomicU8>,
+    Arc<Mutex<()>>,
+);
 
 impl RuntimeHandle {
     pub fn send(&self, command: Command) -> Result<(), RuntimeError> {
+        let _admission = self.2.lock().expect("admission lock poisoned");
         if matches!(&command, Command::CancelLisp) {
             let _ = self
                 .1
@@ -43,12 +49,16 @@ impl RuntimeHandle {
                 .then_some(())
                 .ok_or(RuntimeError::Invariant("runtime stopped"));
         }
-        if matches!(
-            &command,
-            Command::Snapshot | Command::HumanMessage(_) | Command::Shutdown
-        ) {
-            self.1.fetch_or(PAUSE, Ordering::AcqRel);
+        let human = matches!(&command, Command::HumanMessage(_));
+        if human && self.1.load(Ordering::Acquire) & STOPPING != 0 {
+            return Err(RuntimeError::Invariant("runtime stopping"));
         }
+        let flags = match &command {
+            Command::Shutdown => PAUSE | STOPPING,
+            Command::Snapshot | Command::HumanMessage(_) => PAUSE,
+            _ => 0,
+        };
+        self.1.fetch_or(flags, Ordering::AcqRel);
         self.0
             .send(command)
             .map_err(|_| RuntimeError::Invariant("runtime stopped"))
@@ -66,7 +76,8 @@ pub enum RuntimeError {
 }
 
 type Starter = Arc<dyn Fn(&EffectRequest) -> ExternalRun + Send + Sync>;
-type Observer = Arc<dyn Fn(&str, &TranscriptEntry) + Send + Sync>;
+pub type RuntimeObserver = Arc<dyn Fn(&str, &TranscriptEntry, bool) + Send + Sync>;
+pub type HumanObserver = Arc<dyn Fn(&Message) + Send + Sync>;
 
 struct RunGuard(tokio::task::JoinHandle<()>, Arc<AtomicU8>);
 
@@ -82,19 +93,19 @@ pub struct Runtime {
     active: Active,
     parked: Vec<Task>,
     control: Arc<AtomicU8>,
+    admission: Arc<Mutex<()>>,
     images: ImageStore,
     starter: Starter,
-    observer: Option<Observer>,
+    observer: Option<RuntimeObserver>,
+    human_observer: Option<HumanObserver>,
     sender: mpsc::UnboundedSender<Command>,
     commands: mpsc::UnboundedReceiver<Command>,
     shutdown: Option<tokio::time::Instant>,
+    model_failures: u8,
+    model_retry: Option<tokio::time::Instant>,
 }
 
 impl Runtime {
-    pub fn new(world: World, images: ImageStore) -> Self {
-        Self::with_starter(world, images, effects::start)
-    }
-
     pub fn with_starter(
         mut world: World,
         images: ImageStore,
@@ -111,21 +122,33 @@ impl Runtime {
             active: Active::Idle,
             parked: Vec::new(),
             control: Arc::new(AtomicU8::new(0)),
+            admission: Arc::new(Mutex::new(())),
             images,
             starter: Arc::new(starter),
             observer: None,
+            human_observer: None,
             sender,
             commands,
             shutdown: None,
+            model_failures: 0,
+            model_retry: None,
         }
     }
 
-    pub fn observe(&mut self, observer: impl Fn(&str, &TranscriptEntry) + Send + Sync + 'static) {
-        self.observer = Some(Arc::new(observer));
+    pub fn observe(&mut self, observer: RuntimeObserver) {
+        self.observer = Some(observer);
+    }
+
+    pub fn observe_humans(&mut self, observer: HumanObserver) {
+        self.human_observer = Some(observer);
     }
 
     pub fn handle(&self) -> RuntimeHandle {
-        RuntimeHandle(self.sender.clone(), self.control.clone())
+        RuntimeHandle(
+            self.sender.clone(),
+            self.control.clone(),
+            self.admission.clone(),
+        )
     }
 
     pub async fn run(&mut self) -> Result<(), RuntimeError> {
@@ -154,12 +177,23 @@ impl Runtime {
                 self.images.save(&self.world, None)?;
                 break;
             }
+            if let Ok(command) = self.commands.try_recv() {
+                self.command(command)?;
+                continue;
+            }
             if self.shutdown.is_some() && matches!(self.active, Active::Idle) {
                 self.images.save(&self.world, None)?;
                 break;
             }
-            if let Ok(command) = self.commands.try_recv() {
-                self.command(command)?;
+            if matches!(self.active, Active::Idle)
+                && (self.model_failures >= 3 || self.model_retry.is_some())
+            {
+                tokio::select! {
+                    command = self.commands.recv() => self.command(command.ok_or(
+                        RuntimeError::Invariant("command channel closed"))?)?,
+                    _ = tokio::time::sleep_until(self.model_retry.expect("failed models retry")),
+                        if self.model_failures < 3 => self.model_retry = None,
+                }
                 continue;
             }
             match std::mem::replace(&mut self.active, Active::Idle) {
@@ -219,15 +253,15 @@ impl Runtime {
         }
         let source = task.source().to_owned();
         match poll {
-            TaskPoll::Complete(value) => self.finish(source, effects::display(&value))?,
+            TaskPoll::Complete(value) => self.finish(false, source, effects::display(&value))?,
             TaskPoll::Effect(request) => self.start_effect(task, request)?,
             TaskPoll::Terminal(effect) => self.finish_terminal(task, source, effect)?,
             TaskPoll::Paused => self.resume_lisp(task),
             TaskPoll::Cancelled => {
-                self.finish(source, "error: Lisp cancelled".into())?;
+                self.finish(false, source, "error: Lisp cancelled".into())?;
                 self.control.fetch_and(!CANCEL_LISP, Ordering::AcqRel);
             }
-            TaskPoll::Failed(error) => self.finish(source, format!("error: {error}"))?,
+            TaskPoll::Failed(error) => self.finish(false, source, format!("error: {error}"))?,
         }
         Ok(())
     }
@@ -256,7 +290,7 @@ impl Runtime {
             if self.shutdown.is_some() {
                 self.active = Active::Idle;
             } else {
-                self.finish(source, format!("error: {error}"))?;
+                self.finish(false, source, format!("error: {error}"))?;
             }
         } else {
             self.resume_lisp(task);
@@ -266,13 +300,25 @@ impl Runtime {
 
     fn finish_thinking(&mut self, result: Result<Value, EffectError>) -> Result<(), RuntimeError> {
         let source = match result {
-            Ok(Value::String(source)) => source,
+            Ok(Value::String(source)) => {
+                self.model_failures = 0;
+                self.model_retry = None;
+                source
+            }
             Ok(_) => return Err(RuntimeError::Invariant("model returned a non-string value")),
             Err(error) => {
                 if self.shutdown.is_some() {
                     self.active = Active::Idle;
                 } else {
-                    self.finish("(model)".into(), format!("error: {error}"))?;
+                    if error.0 == "model request interrupted by human input" {
+                        self.model_retry = None;
+                    } else {
+                        self.model_failures = self.model_failures.saturating_add(1);
+                        let seconds = 1_u64 << self.model_failures.min(6);
+                        self.model_retry =
+                            Some(tokio::time::Instant::now() + Duration::from_secs(seconds));
+                    }
+                    self.finish(false, "(model)".into(), format!("error: {error}"))?;
                 }
                 return Ok(());
             }
@@ -284,7 +330,7 @@ impl Runtime {
                 task.replace_checkpoint(committed);
                 self.resume_lisp(task);
             }
-            Err(error) => self.finish(source, format!("error: {error}"))?,
+            Err(error) => self.finish(false, source, format!("error: {error}"))?,
         }
         Ok(())
     }
@@ -304,19 +350,25 @@ impl Runtime {
                     .position(|id| *id == message)
                     .ok_or(RuntimeError::Invariant("reply message is not owned"))?;
                 inbox.remove(owned);
-                self.world
+                let messages = &self.world.state.messages;
+                let order = messages.values().filter(|m| m.reply.is_some()).count() as u32;
+                let after = self.world.state.next_message;
+                let message = self
+                    .world
                     .state
                     .messages
                     .get_mut(&message)
-                    .ok_or(RuntimeError::Invariant("reply message disappeared"))?
-                    .answered = true;
+                    .ok_or(RuntimeError::Invariant("reply message disappeared"))?;
+                message.reply = Some(text.clone());
+                message.reply_at = Some(chrono::Utc::now().to_rfc3339());
+                message.reply_order = Some((after, order));
                 task.commit_boundary(&self.world);
-                self.finish(source, text)
+                self.finish(true, source, text)
             }
             TerminalEffect::ReturnAgent(result) => {
                 if self.world.state.agents.len() == 1 {
                     task.abort(&mut self.world);
-                    return self.finish(source, "error: root agent cannot return".into());
+                    return self.finish(false, source, "error: root agent cannot return".into());
                 }
                 task.commit_boundary(&self.world);
                 let child = self
@@ -333,7 +385,7 @@ impl Runtime {
                             .state
                             .messages
                             .get(id)
-                            .is_some_and(|message| !message.answered)
+                            .is_some_and(|message| message.reply.is_none())
                     })
                     .collect();
                 self.world
@@ -348,15 +400,7 @@ impl Runtime {
                     parent.resume(Ok(Value::String(result)))?;
                     self.resume_lisp(parent);
                 } else {
-                    let current = self.current()?;
-                    self.record(
-                        current,
-                        TranscriptEntry {
-                            source: format!("(agent/result {})", child.name),
-                            result,
-                        },
-                    );
-                    self.active = Active::Idle;
+                    self.finish(false, format!("(agent/result {})", child.name), result)?;
                 }
                 Ok(())
             }
@@ -364,6 +408,8 @@ impl Runtime {
     }
 
     pub fn command(&mut self, command: Command) -> Result<(), RuntimeError> {
+        let admission = self.admission.clone();
+        let _admission = admission.lock().expect("admission lock poisoned");
         match command {
             Command::Snapshot => {
                 self.control.fetch_or(PAUSE, Ordering::AcqRel);
@@ -387,7 +433,12 @@ impl Runtime {
                 _ => {}
             },
             Command::HumanMessage(text) => {
+                if self.shutdown.is_some() || self.control.load(Ordering::Acquire) & STOPPING != 0 {
+                    return Err(RuntimeError::Invariant("runtime stopping"));
+                }
                 self.add_message(text)?;
+                self.model_failures = 0;
+                self.model_retry = None;
                 match &mut self.active {
                     Active::Lisp(task) | Active::External(task, _) => {
                         task.merge_runtime_state(&self.world);
@@ -397,6 +448,7 @@ impl Runtime {
                 self.control.fetch_and(!PAUSE, Ordering::AcqRel);
             }
             Command::Shutdown => {
+                self.control.fetch_or(PAUSE | STOPPING, Ordering::AcqRel);
                 self.shutdown
                     .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(2));
                 self.control.fetch_or(CANCEL_LISP, Ordering::AcqRel);
@@ -410,19 +462,26 @@ impl Runtime {
     }
 
     fn context(&self) -> Result<String, RuntimeError> {
-        let agent = &self.world.state.agents[self.current()?];
+        let current = self.current()?;
+        let agent = &self.world.state.agents[current];
         let mut text = format!(
             "{}\nEmit exactly one raw Lisp form and no prose. Continue taking actions after replies. Supported special forms are quote, if, begin, lambda, define, set!, let, let*, and letrec; use begin, never progn. Effects are ordinary expressions: (bash STRING), (model STRING), (agent NAME REQUEST), (reply INTEGER-ID TEXT), and child-only (return TEXT). Core values are integers, strings, booleans, nil, and lists. Never invent a human-message ID or call reply unless a PENDING HUMAN MESSAGE line is present.\n",
             agent.instructions
         );
         if agent.inbox.is_empty() {
-            text.push_str("There are NO pending human messages. Do not call reply.\n");
+            text.push_str("This agent owns no pending messages; do not call reply.\n");
         }
-        for id in &agent.inbox {
-            if let Some(message) = self.world.state.messages.get(id) {
+        for (id, message) in &self.world.state.messages {
+            if agent.inbox.contains(id) {
+                text.push_str(&format!("PENDING HUMAN MESSAGE {}: {}\nAnswer it exactly as (reply {} \"your response\").\n", id.0, message.text, id.0));
+            } else if current == 0 {
+                let status = message
+                    .reply
+                    .as_ref()
+                    .map_or("pending elsewhere", |_| "answered");
                 text.push_str(&format!(
-                    "PENDING HUMAN MESSAGE {}: {}\nAnswer it using the unquoted integer exactly as (reply {} \"your response\").\n",
-                    id.0, message.text, id.0
+                    "HUMAN MESSAGE HISTORY {}: {} ({status})\n",
+                    id.0, message.text
                 ));
             }
         }
@@ -432,16 +491,21 @@ impl Runtime {
         Ok(text)
     }
 
-    fn record(&mut self, current: usize, entry: TranscriptEntry) {
+    fn record(&mut self, current: usize, entry: TranscriptEntry, replied: bool) {
         if let Some(observer) = &self.observer {
-            observer(&self.world.state.agents[current].name, &entry);
+            observer(&self.world.state.agents[current].name, &entry, replied);
         }
         self.world.state.agents[current].transcript.push(entry);
     }
 
-    fn finish(&mut self, source: String, result: String) -> Result<(), RuntimeError> {
+    fn finish(
+        &mut self,
+        replied: bool,
+        source: String,
+        result: String,
+    ) -> Result<(), RuntimeError> {
         let current = self.current()?;
-        self.record(current, TranscriptEntry { source, result });
+        self.record(current, TranscriptEntry { source, result }, replied);
         self.active = Active::Idle;
         Ok(())
     }
@@ -468,11 +532,17 @@ impl Runtime {
             id,
             Message {
                 text,
-                answered: false,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                reply: None,
+                reply_at: None,
+                reply_order: None,
             },
         );
         let current = self.current()?;
         self.world.state.agents[current].inbox.push(id);
+        if let Some(observer) = &self.human_observer {
+            observer(&self.world.state.messages[&id]);
+        }
         Ok(())
     }
 }
