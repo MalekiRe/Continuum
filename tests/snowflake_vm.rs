@@ -1,13 +1,13 @@
 use persistent_lisp_harness::snowflake::compile::compile;
 use persistent_lisp_harness::snowflake::effects::{self, EffectError, EffectRequest};
-use persistent_lisp_harness::snowflake::runtime::{CANCEL_LISP, PAUSE, RUN};
+use persistent_lisp_harness::snowflake::runtime::{CANCEL_LISP, PAUSE};
 use persistent_lisp_harness::snowflake::value::Value;
 use persistent_lisp_harness::snowflake::vm::{Task, TaskPoll};
 use persistent_lisp_harness::snowflake::world::World;
 use std::sync::atomic::AtomicU8;
 
 fn task(world: &mut World, source: &str) -> Task {
-    let control = AtomicU8::new(RUN);
+    let control = AtomicU8::new(0);
     let entry = compile(world, source, &control).unwrap();
     Task::start(world, entry).unwrap()
 }
@@ -16,7 +16,7 @@ fn evaluate(source: &str) -> Value {
     let mut world = World::default();
     effects::install(&mut world);
     let mut task = task(&mut world, source);
-    match task.poll(&mut world, &AtomicU8::new(RUN)) {
+    match task.poll(&mut world, &AtomicU8::new(0)) {
         TaskPoll::Complete(value) => value,
         _ => panic!("task did not complete"),
     }
@@ -37,25 +37,33 @@ fn closures_share_stable_mutable_cells_and_letrec_tail_calls() {
 }
 
 #[test]
+fn escaped_closure_cells_are_not_reused_by_later_lexical_scopes() {
+    assert_eq!(
+        evaluate("(begin (define f nil) (let ((x 1)) (set! f (lambda () x))) (let ((y 2)) y) (f))"),
+        Value::Int(1)
+    );
+}
+
+#[test]
 fn two_effects_suspend_and_resume_once_each() {
     let mut world = World::default();
     effects::install(&mut world);
     let mut task = task(&mut world, r#"(list (bash "one") (model "two"))"#);
     assert!(matches!(
-        task.poll(&mut world, &AtomicU8::new(RUN)),
+        task.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Effect(EffectRequest::Bash(ref text)) if text == "one"
     ));
     task.commit_boundary(&world);
     assert!(task.resume(Ok(Value::String("first".into()))).is_ok());
     assert!(task.resume(Ok(Value::Nil)).is_err());
     assert!(matches!(
-        task.poll(&mut world, &AtomicU8::new(RUN)),
+        task.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Effect(EffectRequest::Model(ref text)) if text == "two"
     ));
     task.commit_boundary(&world);
     task.resume(Ok(Value::String("second".into()))).unwrap();
     assert_eq!(
-        match task.poll(&mut world, &AtomicU8::new(RUN)) {
+        match task.poll(&mut world, &AtomicU8::new(0)) {
             TaskPoll::Complete(value) => value,
             _ => panic!("task did not complete"),
         },
@@ -76,7 +84,7 @@ fn pause_is_resumable_cancel_and_errors_roll_back() {
         TaskPoll::Paused
     ));
     assert!(matches!(
-        paused.poll(&mut world, &AtomicU8::new(RUN)),
+        paused.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Complete(Value::Int(1))
     ));
 
@@ -90,7 +98,7 @@ fn pause_is_resumable_cancel_and_errors_roll_back() {
 
     let mut failed = task(&mut world, "(begin (define temporary 3) (missing))");
     assert!(matches!(
-        failed.poll(&mut world, &AtomicU8::new(RUN)),
+        failed.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Failed(_)
     ));
     let temporary = world.state.symbols.intern("temporary");
@@ -105,7 +113,7 @@ fn immutable_hosts_are_first_class_and_effect_failures_are_single_use() {
     effects::install(&mut world);
     let mut task = task(&mut world, r#"(bash "failure")"#);
     assert!(matches!(
-        task.poll(&mut world, &AtomicU8::new(RUN)),
+        task.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Effect(_)
     ));
     assert!(task.resume(Err(EffectError("no".into()))).is_err());
@@ -122,13 +130,13 @@ fn effect_boundaries_preserve_only_accepted_segments() {
         r#"(begin (define before 1) (bash "ok") (define after 2) (missing))"#,
     );
     assert!(matches!(
-        task.poll(&mut world, &AtomicU8::new(RUN)),
+        task.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Effect(_)
     ));
     task.commit_boundary(&world);
     task.resume(Ok(Value::String("done".into()))).unwrap();
     assert!(matches!(
-        task.poll(&mut world, &AtomicU8::new(RUN)),
+        task.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Failed(_)
     ));
     let before = world.state.symbols.intern("before");
@@ -143,7 +151,7 @@ fn integer_overflow_is_an_effect_error_and_rolls_back() {
     effects::install(&mut world);
     let mut task = task(&mut world, "(+ 9223372036854775807 1)");
     assert!(matches!(
-        task.poll(&mut world, &AtomicU8::new(RUN)),
+        task.poll(&mut world, &AtomicU8::new(0)),
         TaskPoll::Failed(_)
     ));
 }

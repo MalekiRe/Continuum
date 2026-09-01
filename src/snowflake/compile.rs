@@ -1,4 +1,3 @@
-use crate::snowflake::runtime::RUN;
 use crate::snowflake::value::{Capture, Chunk, ChunkId, Op, SymbolId, Value};
 use crate::snowflake::world::World;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -19,7 +18,6 @@ fn error(offset: usize, message: impl Into<String>) -> CompileError {
 
 enum ReadFrame {
     List(Vec<Value>),
-    Vector(Vec<Value>),
     Map {
         entries: Vec<(Value, Value)>,
         key: Option<Value>,
@@ -69,10 +67,7 @@ impl<'a> Reader<'a> {
                     self.frames.push(ReadFrame::List(Vec::new()));
                     None
                 }
-                '[' => {
-                    self.frames.push(ReadFrame::Vector(Vec::new()));
-                    None
-                }
+                '[' => return Err(error(start, "vectors are not supported")),
                 '{' => {
                     self.frames.push(ReadFrame::Map {
                         entries: Vec::new(),
@@ -132,14 +127,6 @@ impl<'a> Reader<'a> {
             "nil" => Ok(Value::Nil),
             "true" | "#t" => Ok(Value::Bool(true)),
             "false" | "#f" => Ok(Value::Bool(false)),
-            _ if token.starts_with(':') => {
-                let name = &token[1..];
-                if name.is_empty() {
-                    Err(error(start, "empty keyword"))
-                } else {
-                    Ok(Value::Keyword(world.state.symbols.intern(name)))
-                }
-            }
             _ => {
                 if let Ok(integer) = token.parse::<i64>() {
                     return Ok(Value::Int(integer));
@@ -159,7 +146,7 @@ impl<'a> Reader<'a> {
         loop {
             match self.frames.last_mut() {
                 None => return Ok(Some(value)),
-                Some(ReadFrame::List(values)) | Some(ReadFrame::Vector(values)) => {
+                Some(ReadFrame::List(values)) => {
                     values.push(value);
                     return Ok(None);
                 }
@@ -190,7 +177,6 @@ impl<'a> Reader<'a> {
         };
         let value = match (closing, frame) {
             (')', ReadFrame::List(values)) => Value::List(values),
-            (']', ReadFrame::Vector(values)) => Value::Vector(values),
             ('}', ReadFrame::Map { entries, key: None }) => Value::Map(entries),
             ('}', ReadFrame::Map { key: Some(_), .. }) => {
                 return Err(error(
@@ -245,8 +231,7 @@ enum Place {
 
 struct Local {
     name: SymbolId,
-    depth: u16,
-    captured: bool,
+    slot: u16,
 }
 
 struct Builder {
@@ -293,7 +278,6 @@ impl Builder {
             Op::Pop | Op::JumpFalse(_) | Op::Return => (1, -1),
             Op::Jump(_) => (0, 0),
             Op::Call(count) | Op::TailCall(count) => (i32::from(*count) + 1, -i32::from(*count)),
-            Op::List(count) | Op::Vector(count) => (i32::from(*count), 1 - i32::from(*count)),
             Op::Map(count) => (i32::from(*count) * 2, 1 - i32::from(*count) * 2),
         };
         if self.stack < needed {
@@ -318,16 +302,13 @@ impl Builder {
     }
 
     fn add_local(&mut self, name: SymbolId) -> Result<u16, CompileError> {
-        let index = u16::try_from(self.locals.len()).map_err(|_| error(0, "too many locals"))?;
-        let count =
-            u16::try_from(self.locals.len() + 1).map_err(|_| error(0, "too many locals"))?;
-        self.locals.push(Local {
-            name,
-            depth: self.scope,
-            captured: false,
-        });
-        self.local_slots = self.local_slots.max(count);
-        Ok(index)
+        let slot = self.local_slots;
+        self.local_slots = self
+            .local_slots
+            .checked_add(1)
+            .ok_or_else(|| error(0, "too many locals"))?;
+        self.locals.push(Local { name, slot });
+        Ok(slot)
     }
 
     fn finish(mut self) -> Result<Chunk, CompileError> {
@@ -364,12 +345,12 @@ impl Compiler<'_> {
     }
 
     fn expression(&mut self, form: &Value, tail: bool) -> Result<(), CompileError> {
-        if self.control.load(Ordering::Acquire) != RUN {
+        if self.control.load(Ordering::Acquire) != 0 {
             return Err(error(0, "compilation cancelled"));
         }
         match form {
             Value::Symbol(name) => {
-                let place = self.resolve(*name);
+                let place = self.resolve(*name)?;
                 self.current().emit(match place {
                     Place::Local(index) => Op::GetLocal(index),
                     Place::Capture(index) => Op::GetCapture(index),
@@ -395,14 +376,6 @@ impl Compiler<'_> {
                 } else {
                     Op::Call(count)
                 })
-            }
-            Value::Vector(values) => {
-                let count =
-                    u16::try_from(values.len()).map_err(|_| error(0, "vector is too large"))?;
-                for value in values {
-                    self.expression(value, false)?;
-                }
-                self.current().emit(Op::Vector(count))
             }
             Value::Map(entries) => {
                 let count =
@@ -518,7 +491,7 @@ impl Compiler<'_> {
             return Err(error(0, "set! expects a name and value"));
         };
         self.expression(value, false)?;
-        let op = match self.resolve(*name) {
+        let op = match self.resolve(*name)? {
             Place::Local(index) => Op::SetLocal(index),
             Place::Capture(index) => Op::SetCapture(index),
             Place::Global(symbol) => Op::SetGlobal(symbol),
@@ -637,14 +610,15 @@ impl Compiler<'_> {
         Ok(id)
     }
 
-    fn resolve(&mut self, name: SymbolId) -> Place {
+    fn resolve(&mut self, name: SymbolId) -> Result<Place, CompileError> {
         let current = self.functions.len() - 1;
-        if let Some(index) = self.functions[current]
+        if let Some(local) = self.functions[current]
             .locals
             .iter()
-            .rposition(|local| local.name == name)
+            .rev()
+            .find(|local| local.name == name)
         {
-            return Place::Local(index as u16);
+            return Ok(Place::Local(local.slot));
         }
         for owner in (0..current).rev() {
             if let Some(local) = self.functions[owner]
@@ -652,8 +626,7 @@ impl Compiler<'_> {
                 .iter()
                 .rposition(|local| local.name == name)
             {
-                self.functions[owner].locals[local].captured = true;
-                let local = local as u16;
+                let local = self.functions[owner].locals[local].slot;
                 if let Err(position) = self.functions[owner].boxed.binary_search(&local) {
                     self.functions[owner].boxed.insert(position, local);
                 }
@@ -674,16 +647,17 @@ impl Compiler<'_> {
                         self.functions[child].captures.push(link);
                         self.functions[child].captures.len() - 1
                     };
-                    parent_capture = Some(index as u16);
+                    parent_capture =
+                        Some(u16::try_from(index).map_err(|_| error(0, "too many captures"))?);
                 }
-                return Place::Capture(parent_capture.expect("capture link exists"));
+                return Ok(Place::Capture(parent_capture.expect("capture link exists")));
             }
         }
-        Place::Global(name)
+        Ok(Place::Global(name))
     }
 
     fn finish(mut self) -> Result<ChunkId, CompileError> {
-        if self.control.load(Ordering::Acquire) != RUN {
+        if self.control.load(Ordering::Acquire) != 0 {
             return Err(error(0, "compilation cancelled"));
         }
         let root = self

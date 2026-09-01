@@ -1,6 +1,6 @@
 use crate::snowflake::effects::{self, EffectError, EffectRequest, HostResult, TerminalEffect};
-use crate::snowflake::runtime::{CANCEL_LISP, PAUSE, RUN};
-use crate::snowflake::value::{Capture, CellId, ChunkId, RootSet, Value};
+use crate::snowflake::runtime::{CANCEL_LISP, PAUSE};
+use crate::snowflake::value::{Capture, CellId, ChunkId, Value};
 use crate::snowflake::world::{Binding, Transaction, World};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -29,6 +29,7 @@ struct CallFrame {
 }
 
 pub struct Task {
+    source: String,
     chunk: ChunkId,
     ip: usize,
     base: usize,
@@ -64,6 +65,7 @@ impl Task {
             return Err(VmError::Invalid("entry chunk has captures".into()));
         }
         Ok(Self {
+            source: chunk.source.clone(),
             chunk: entry,
             ip: 0,
             base: 0,
@@ -85,29 +87,24 @@ impl Task {
             ));
         }
         loop {
-            match control.load(Ordering::Acquire) {
-                RUN => {}
-                PAUSE => return TaskPoll::Paused,
-                CANCEL_LISP => {
-                    self.transaction.rollback(world);
-                    return TaskPoll::Cancelled;
-                }
-                value => {
-                    self.transaction.rollback(world);
-                    return TaskPoll::Failed(VmError::Invalid(format!(
-                        "unknown task control value {value}"
-                    )));
-                }
+            let signal = control.load(Ordering::Acquire);
+            if signal & CANCEL_LISP != 0 {
+                self.transaction.rollback(world);
+                return TaskPoll::Cancelled;
+            }
+            if signal & PAUSE != 0 {
+                return TaskPoll::Paused;
+            }
+            if signal != 0 {
+                self.transaction.rollback(world);
+                return TaskPoll::Failed(VmError::Invalid("unknown task control bits".into()));
             }
             match self.step(world) {
                 Ok(Some(TaskPoll::Complete(value))) => {
                     self.transaction.commit(world);
                     return TaskPoll::Complete(value);
                 }
-                Ok(Some(TaskPoll::Terminal(effect))) => {
-                    self.transaction.commit(world);
-                    return TaskPoll::Terminal(effect);
-                }
+                Ok(Some(TaskPoll::Terminal(effect))) => return TaskPoll::Terminal(effect),
                 Ok(Some(poll)) => return poll,
                 Ok(None) => {}
                 Err(error) => {
@@ -133,23 +130,24 @@ impl Task {
         self.transaction.commit(world);
     }
 
-    pub fn abort(self, world: &mut World) {
-        self.transaction.abort(world);
+    pub fn transaction(&mut self) -> &mut Transaction {
+        &mut self.transaction
     }
 
-    pub fn roots(&self) -> RootSet {
-        let mut roots = RootSet {
-            values: self.stack.clone(),
-            cells: self.captures.clone(),
-            chunks: vec![self.chunk],
-        };
-        Self::local_roots(&self.locals, &mut roots);
-        for frame in &self.calls {
-            roots.chunks.push(frame.chunk);
-            roots.cells.extend(frame.captures.iter().copied());
-            Self::local_roots(&frame.locals, &mut roots);
-        }
-        roots
+    pub fn replace_checkpoint(&mut self, state: crate::snowflake::world::State) {
+        self.transaction.replace_committed(state);
+    }
+
+    pub fn merge_runtime_state(&mut self, world: &World) {
+        self.transaction.merge_runtime_state(world);
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn abort(self, world: &mut World) {
+        self.transaction.abort(world);
     }
 
     fn local_layout(chunk: &crate::snowflake::value::Chunk) -> Vec<Local> {
@@ -162,16 +160,6 @@ impl Task {
                 }
             })
             .collect()
-    }
-
-    fn local_roots(locals: &[Local], roots: &mut RootSet) {
-        for local in locals {
-            match local {
-                Local::Direct(value) => roots.values.push(value.clone()),
-                Local::Boxed(Some(cell)) => roots.cells.push(*cell),
-                Local::Boxed(None) => {}
-            }
-        }
     }
 
     fn initialize_locals(&mut self, world: &mut World) {
@@ -391,14 +379,6 @@ impl Task {
             Op::Return => {
                 let value = self.pop()?;
                 return self.return_value(value);
-            }
-            Op::List(count) => {
-                let values = self.take_operands(count)?;
-                self.stack.push(Value::List(values));
-            }
-            Op::Vector(count) => {
-                let values = self.take_operands(count)?;
-                self.stack.push(Value::Vector(values));
             }
             Op::Map(count) => {
                 let total = count

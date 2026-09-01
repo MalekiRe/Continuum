@@ -38,6 +38,11 @@ pub struct ExternalRun {
 }
 
 impl ExternalRun {
+    pub fn new(future: ExternalFuture, cancel: impl Fn() + Send + Sync + 'static) -> Self {
+        let cancel = Box::new(cancel);
+        Self { future, cancel }
+    }
+
     pub fn cancel(&self) {
         (self.cancel)();
     }
@@ -49,52 +54,57 @@ const MULTIPLY: HostId = HostId(2);
 const DIVIDE: HostId = HostId(3);
 const EQUAL: HostId = HostId(4);
 const LESS: HostId = HostId(5);
-const LESS_EQUAL: HostId = HostId(6);
-const GREATER: HostId = HostId(7);
-const GREATER_EQUAL: HostId = HostId(8);
-const LIST: HostId = HostId(9);
-const CONS: HostId = HostId(10);
-const FIRST: HostId = HostId(11);
-const REST: HostId = HostId(12);
-const LENGTH: HostId = HostId(13);
-const STRING_APPEND: HostId = HostId(14);
-const STRING_LENGTH: HostId = HostId(15);
-const TO_STRING: HostId = HostId(16);
-const BASH: HostId = HostId(17);
-const MODEL: HostId = HostId(18);
-const AGENT: HostId = HostId(19);
-const REPLY: HostId = HostId(20);
-const RETURN: HostId = HostId(21);
+const LIST: HostId = HostId(7);
+const CONS: HostId = HostId(8);
+const FIRST: HostId = HostId(9);
+const REST: HostId = HostId(10);
+const LENGTH: HostId = HostId(11);
+const STRING_APPEND: HostId = HostId(12);
+const BASH: HostId = HostId(13);
+const MODEL: HostId = HostId(14);
+const AGENT: HostId = HostId(15);
+const REPLY: HostId = HostId(16);
+pub const RETURN: HostId = HostId(17);
+
+const HOSTS: &[(&str, HostId)] = &[
+    ("+", ADD),
+    ("-", SUBTRACT),
+    ("*", MULTIPLY),
+    ("/", DIVIDE),
+    ("=", EQUAL),
+    ("<", LESS),
+    ("list", LIST),
+    ("cons", CONS),
+    ("first", FIRST),
+    ("rest", REST),
+    ("length", LENGTH),
+    ("string-append", STRING_APPEND),
+    ("bash", BASH),
+    ("model", MODEL),
+    ("agent", AGENT),
+    ("reply", REPLY),
+    ("return", RETURN),
+];
 
 pub fn install(world: &mut World) {
-    for (name, host) in [
-        ("+", ADD),
-        ("-", SUBTRACT),
-        ("*", MULTIPLY),
-        ("/", DIVIDE),
-        ("=", EQUAL),
-        ("<", LESS),
-        ("<=", LESS_EQUAL),
-        (">", GREATER),
-        (">=", GREATER_EQUAL),
-        ("list", LIST),
-        ("cons", CONS),
-        ("first", FIRST),
-        ("car", FIRST),
-        ("rest", REST),
-        ("cdr", REST),
-        ("length", LENGTH),
-        ("string-append", STRING_APPEND),
-        ("string-length", STRING_LENGTH),
-        ("str", TO_STRING),
-        ("bash", BASH),
-        ("model", MODEL),
-        ("agent", AGENT),
-        ("reply", REPLY),
-        ("return", RETURN),
-    ] {
+    for &(name, host) in HOSTS {
         world.install_host(name, host);
     }
+}
+
+pub(crate) fn valid_host(host: HostId) -> bool {
+    HOSTS.iter().any(|(_, registered)| *registered == host)
+}
+
+pub(crate) fn valid_prelude(world: &World) -> bool {
+    HOSTS.iter().all(|(name, host)| {
+        world
+            .state
+            .symbols
+            .get(name)
+            .and_then(|id| world.state.globals.get(&id))
+            .is_some_and(|binding| binding.value == Value::Host(*host) && !binding.mutable)
+    })
 }
 
 pub fn call(
@@ -116,9 +126,6 @@ pub fn call(
             Value::Bool(arguments[0] == arguments[1])
         }
         LESS => compare("<", &arguments, |left, right| left < right)?,
-        LESS_EQUAL => compare("<=", &arguments, |left, right| left <= right)?,
-        GREATER => compare(">", &arguments, |left, right| left > right)?,
-        GREATER_EQUAL => compare(">=", &arguments, |left, right| left >= right)?,
         LIST => Value::List(arguments),
         CONS => {
             exact("cons", &arguments, 2)?;
@@ -141,7 +148,7 @@ pub fn call(
         LENGTH => {
             exact("length", &arguments, 1)?;
             let length = match &arguments[0] {
-                Value::List(values) | Value::Vector(values) => values.len(),
+                Value::List(values) => values.len(),
                 Value::String(value) => value.chars().count(),
                 _ => {
                     return Err(EffectError(
@@ -157,19 +164,6 @@ pub fn call(
                 result.push_str(expect_string("string-append", value)?);
             }
             Value::String(result)
-        }
-        STRING_LENGTH => {
-            exact("string-length", &arguments, 1)?;
-            let length = expect_string("string-length", &arguments[0])?
-                .chars()
-                .count();
-            Value::Int(
-                i64::try_from(length).map_err(|_| EffectError("string length overflow".into()))?,
-            )
-        }
-        TO_STRING => {
-            exact("str", &arguments, 1)?;
-            Value::String(display(&arguments[0]))
         }
         BASH => {
             exact("bash", &arguments, 1)?;
@@ -310,22 +304,18 @@ fn numeric_subtract(arguments: &[Value]) -> Result<Value, EffectError> {
 }
 
 fn numeric_divide(arguments: &[Value]) -> Result<Value, EffectError> {
-    if arguments.is_empty() {
-        return Err(EffectError("/ expects at least one argument".into()));
-    }
-    let (first, _) = number("/", &arguments[0])?;
-    let mut result = if arguments.len() == 1 {
+    let mut values = arguments.iter();
+    let first = values
+        .next()
+        .ok_or_else(|| EffectError("/ expects arguments".into()))?;
+    let first = number("/", first)?.0;
+    let result = if arguments.len() == 1 {
         1.0 / first
     } else {
-        first
+        values.try_fold(first, |left, right| {
+            Ok::<_, EffectError>(left / number("/", right)?.0)
+        })?
     };
-    for argument in &arguments[1..] {
-        let (value, _) = number("/", argument)?;
-        if value == 0.0 {
-            return Err(EffectError("division by zero".into()));
-        }
-        result /= value;
-    }
     float_result("/", result)
 }
 
@@ -363,7 +353,7 @@ fn expect_string<'a>(name: &str, value: &'a Value) -> Result<&'a str, EffectErro
     }
 }
 
-fn display(value: &Value) -> String {
+pub fn display(value: &Value) -> String {
     match value {
         Value::Nil => "nil".into(),
         Value::Bool(value) => value.to_string(),
@@ -453,19 +443,17 @@ pub fn start(effect: &EffectRequest) -> ExternalRun {
                 }),
             }
         }
-        request @ (EffectRequest::Model(_) | EffectRequest::Agent { .. }) => {
-            let (system, context) = match request {
-                EffectRequest::Model(prompt) => (String::new(), prompt),
-                EffectRequest::Agent { name, request } => {
-                    (format!("You are the agent named {name}."), request)
-                }
-                EffectRequest::Bash(_) => unreachable!(),
-            };
+        EffectRequest::Model(context) => {
             let future_token = cancellation.clone();
             let future = Box::pin(async move {
-                let model = OpenRouterModel::default();
-                model
-                    .complete(ModelRequest { system, context }, future_token)
+                OpenRouterModel::default()
+                    .complete(
+                        ModelRequest {
+                            system: String::new(),
+                            context,
+                        },
+                        future_token,
+                    )
                     .await
                     .map(Value::String)
                     .map_err(|error| EffectError(error.to_string()))
@@ -475,5 +463,6 @@ pub fn start(effect: &EffectRequest) -> ExternalRun {
                 cancel: Box::new(move || cancel_token.cancel()),
             }
         }
+        EffectRequest::Agent { .. } => unreachable!("agent effects are started by Runtime"),
     }
 }

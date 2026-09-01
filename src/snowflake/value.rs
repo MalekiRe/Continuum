@@ -8,7 +8,6 @@ macro_rules! id {
     };
 }
 
-id!(AgentId);
 id!(CellId);
 id!(ChunkId);
 id!(HostId);
@@ -16,6 +15,7 @@ id!(MessageId);
 id!(SymbolId);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Value {
     Nil,
     Bool(bool),
@@ -23,35 +23,24 @@ pub enum Value {
     Float(f64),
     String(String),
     Symbol(SymbolId),
-    Keyword(SymbolId),
     List(Vec<Value>),
-    Vector(Vec<Value>),
     Map(Vec<(Value, Value)>),
     Closure {
         chunk: ChunkId,
         captures: Vec<CellId>,
     },
     Host(HostId),
-    Data {
-        tag: SymbolId,
-        fields: Vec<Value>,
-    },
-}
-
-#[derive(Debug, Default)]
-pub struct RootSet {
-    pub values: Vec<Value>,
-    pub cells: Vec<CellId>,
-    pub chunks: Vec<ChunkId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Capture {
     Local(u16),
     Parent(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Op {
     Const(u32),
     GetGlobal(SymbolId),
@@ -68,12 +57,11 @@ pub enum Op {
     Call(u16),
     TailCall(u16),
     Return,
-    List(u16),
-    Vector(u16),
     Map(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Chunk {
     pub name: SymbolId,
     pub source: String,
@@ -87,6 +75,7 @@ pub struct Chunk {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Symbols {
     names: Vec<String>,
     #[serde(skip)]
@@ -103,6 +92,10 @@ impl Symbols {
         self.names.push(name.to_owned());
         self.index.insert(name.to_owned(), symbol);
         symbol
+    }
+
+    pub fn get(&self, name: &str) -> Option<SymbolId> {
+        self.index.get(name).copied()
     }
 
     pub fn name(&self, symbol: SymbolId) -> Option<&str> {
