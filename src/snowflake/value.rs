@@ -20,11 +20,9 @@ pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
-    Float(f64),
     String(String),
     Symbol(SymbolId),
     List(Vec<Value>),
-    Map(Vec<(Value, Value)>),
     Closure {
         chunk: ChunkId,
         captures: Vec<CellId>,
@@ -57,7 +55,6 @@ pub enum Op {
     Call(u16),
     TailCall(u16),
     Return,
-    Map(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

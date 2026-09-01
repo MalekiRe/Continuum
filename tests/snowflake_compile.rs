@@ -16,8 +16,8 @@ fn reader_requires_exactly_one_well_formed_form() {
     let cases = [
         ("", "expected one form"),
         ("1 2", "trailing input"),
-        ("({)}", "mismatched"),
-        ("{1}", "even number"),
+        ("(()]", "mismatched"),
+        ("{1}", "maps are not supported"),
         ("'", "unterminated"),
         ("\"no", "unterminated string"),
         ("`x", "unsupported reader prefix"),
@@ -43,11 +43,10 @@ fn reader_requires_exactly_one_well_formed_form() {
 #[test]
 fn emits_collections_branches_and_tail_calls_with_checked_stack() {
     let mut world = World::default();
-    let entry = compile_source(&mut world, "(if true (f 1) (begin (list 2) {:k 3}))");
+    let entry = compile_source(&mut world, "(if true (f 1) (list 3))");
     let chunk = world.chunk(entry).unwrap();
     assert!(chunk.code.iter().any(|op| matches!(op, Op::JumpFalse(_))));
     assert!(chunk.code.iter().any(|op| matches!(op, Op::TailCall(1))));
-    assert!(chunk.code.iter().any(|op| matches!(op, Op::Map(1))));
     assert_eq!(chunk.code.last(), Some(&Op::Return));
     assert!(chunk.max_stack >= 2);
 }

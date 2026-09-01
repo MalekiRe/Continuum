@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 pub const PAUSE: u8 = 1;
 pub const CANCEL_LISP: u8 = 2;
+pub(crate) const LISP_ACTIVE: u8 = 4;
 
 pub enum Active {
     Idle,
@@ -32,12 +33,22 @@ pub struct RuntimeHandle(mpsc::UnboundedSender<Command>, Arc<AtomicU8>);
 
 impl RuntimeHandle {
     pub fn send(&self, command: Command) -> Result<(), RuntimeError> {
-        let signal = match command {
-            Command::Snapshot | Command::HumanMessage(_) | Command::Shutdown => PAUSE,
-            Command::CancelLisp => CANCEL_LISP,
-            _ => 0,
-        };
-        self.1.fetch_or(signal, Ordering::AcqRel);
+        if matches!(&command, Command::CancelLisp) {
+            let _ = self
+                .1
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state & LISP_ACTIVE != 0).then_some(state | CANCEL_LISP)
+                });
+            return (!self.0.is_closed())
+                .then_some(())
+                .ok_or(RuntimeError::Invariant("runtime stopped"));
+        }
+        if matches!(
+            &command,
+            Command::Snapshot | Command::HumanMessage(_) | Command::Shutdown
+        ) {
+            self.1.fetch_or(PAUSE, Ordering::AcqRel);
+        }
         self.0
             .send(command)
             .map_err(|_| RuntimeError::Invariant("runtime stopped"))
@@ -180,6 +191,11 @@ impl Runtime {
         Ok(())
     }
 
+    fn resume_lisp(&mut self, task: Task) {
+        self.control.fetch_or(LISP_ACTIVE, Ordering::AcqRel);
+        self.active = Active::Lisp(task);
+    }
+
     async fn drive_task(&mut self, mut task: Task) -> Result<(), RuntimeError> {
         let mut world = self.world.clone();
         let control = self.control.clone();
@@ -190,12 +206,16 @@ impl Runtime {
         .await
         .map_err(|_| RuntimeError::Invariant("Lisp worker panicked"))?;
         self.world = world;
+        self.control.fetch_and(!LISP_ACTIVE, Ordering::AcqRel);
+        if !matches!(poll, TaskPoll::Paused | TaskPoll::Cancelled) {
+            self.control.fetch_and(!CANCEL_LISP, Ordering::AcqRel);
+        }
         let source = task.source().to_owned();
         match poll {
             TaskPoll::Complete(value) => self.finish(source, effects::display(&value))?,
             TaskPoll::Effect(request) => self.start_effect(task, request)?,
             TaskPoll::Terminal(effect) => self.finish_terminal(task, source, effect)?,
-            TaskPoll::Paused => self.active = Active::Lisp(task),
+            TaskPoll::Paused => self.resume_lisp(task),
             TaskPoll::Cancelled => {
                 self.finish(source, "error: Lisp cancelled".into())?;
                 self.control.fetch_and(!CANCEL_LISP, Ordering::AcqRel);
@@ -232,7 +252,7 @@ impl Runtime {
                 self.finish(source, format!("error: {error}"))?;
             }
         } else {
-            self.active = Active::Lisp(task);
+            self.resume_lisp(task);
         }
         Ok(())
     }
@@ -255,7 +275,7 @@ impl Runtime {
             Ok(entry) => {
                 let mut task = Task::start(&self.world, entry)?;
                 task.replace_checkpoint(committed);
-                self.active = Active::Lisp(task);
+                self.resume_lisp(task);
             }
             Err(error) => self.finish(source, format!("error: {error}"))?,
         }
@@ -270,13 +290,19 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         match effect {
             TerminalEffect::Reply { message, text } => {
-                let message = self
-                    .world
+                let current = self.current()?;
+                let inbox = &mut self.world.state.agents[current].inbox;
+                let owned = inbox
+                    .iter()
+                    .position(|id| *id == message)
+                    .ok_or(RuntimeError::Invariant("reply message is not owned"))?;
+                inbox.remove(owned);
+                self.world
                     .state
                     .messages
                     .get_mut(&message)
-                    .ok_or(RuntimeError::Invariant("reply message disappeared"))?;
-                message.answered = true;
+                    .ok_or(RuntimeError::Invariant("reply message disappeared"))?
+                    .answered = true;
                 task.commit_boundary(&self.world);
                 self.finish(source, text)
             }
@@ -313,7 +339,7 @@ impl Runtime {
                 if let Some(mut parent) = self.parked.pop() {
                     parent.commit_boundary(&self.world);
                     parent.resume(Ok(Value::String(result)))?;
-                    self.active = Active::Lisp(parent);
+                    self.resume_lisp(parent);
                 } else {
                     self.world
                         .state
@@ -381,7 +407,7 @@ impl Runtime {
     fn context(&self) -> Result<String, RuntimeError> {
         let agent = &self.world.state.agents[self.current()?];
         let mut text = format!(
-            "{}\nEmit exactly one raw Lisp form. Continue taking actions after replies.\n",
+            "{}\nEmit exactly one raw Lisp form. Continue taking actions after replies. Effects are expressions: (bash STRING), (model STRING), (agent NAME REQUEST), (reply ID TEXT), and child-only (return TEXT). Core values are integers, strings, booleans, nil, and lists.\n",
             agent.instructions
         );
         for id in &agent.inbox {

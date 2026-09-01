@@ -154,9 +154,6 @@ fn valid_value(root: &Value, state: &State, symbols: u32) -> bool {
         match value {
             Value::Symbol(id) if id.0 >= symbols => return false,
             Value::List(values) => pending.extend(values),
-            Value::Map(entries) => {
-                pending.extend(entries.iter().flat_map(|(key, value)| [key, value]));
-            }
             Value::Closure { chunk, captures } => {
                 if state
                     .code
@@ -169,7 +166,6 @@ fn valid_value(root: &Value, state: &State, symbols: u32) -> bool {
                 }
             }
             Value::Host(host) if !crate::snowflake::effects::valid_host(*host) => return false,
-            Value::Float(value) if !value.is_finite() => return false,
             _ => {}
         }
     }
@@ -204,13 +200,20 @@ fn validate(state: &mut State) -> Result<(), ImageError> {
             Op::GetGlobal(id) | Op::DefGlobal(id) | Op::SetGlobal(id) if id.0 >= symbol_count)
         });
     }
-    let messages: HashSet<_> = state.messages.keys().copied().collect();
+    let inboxes: Vec<_> = state
+        .agents
+        .iter()
+        .flat_map(|agent| &agent.inbox)
+        .copied()
+        .collect();
+    let owned: HashSet<_> = inboxes.iter().copied().collect();
     let agent_refs = !state.agents.is_empty()
-        && state
-            .agents
-            .iter()
-            .all(|agent| agent.inbox.iter().all(|id| messages.contains(id)));
-    let message_refs = state.messages.keys().all(|key| key.0 < state.next_message);
+        && owned.len() == inboxes.len()
+        && owned.iter().all(|id| state.messages.contains_key(id));
+    let message_refs = state
+        .messages
+        .iter()
+        .all(|(id, message)| id.0 < state.next_message && message.answered != owned.contains(id));
     if !(globals
         && cells
         && code

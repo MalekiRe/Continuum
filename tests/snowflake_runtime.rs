@@ -194,6 +194,7 @@ async fn human_message_reply_is_durable_and_answered() {
     let runtime = finish_runtime(worker).await;
     let message = runtime.world.state.messages.values().next().unwrap();
     assert!(message.answered);
+    assert!(runtime.world.state.agents[0].inbox.is_empty());
     assert_eq!(
         runtime.world.state.agents[0]
             .transcript
@@ -394,5 +395,120 @@ async fn shutdown_deadline_preserves_only_the_accepted_external_segment() {
     let mut recovered = ImageStore::new(&directory).load().unwrap();
     let tentative = recovered.state.symbols.intern("tentative");
     assert_eq!(recovered.state.globals[&tentative].value, Value::Int(9));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn cancel_lisp_sent_during_external_never_cancels_the_resumed_task() {
+    let directory = directory();
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let seen = started.clone();
+    let released = release.clone();
+    let mut runtime =
+        Runtime::with_starter(World::default(), ImageStore::new(&directory), move |_| {
+            let turn = seen.fetch_add(1, Ordering::AcqRel);
+            let released = released.clone();
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let future_cancel = cancellation.clone();
+            ExternalRun::new(
+                Box::pin(async move {
+                    match turn {
+                        0 => Ok(Value::String(
+                            r#"(begin (model "hold") "effectdone")"#.into(),
+                        )),
+                        1 => {
+                            released.notified().await;
+                            Ok(Value::String("released".into()))
+                        }
+                        _ => {
+                            future_cancel.cancelled().await;
+                            Err(persistent_lisp_harness::snowflake::effects::EffectError(
+                                "cancelled".into(),
+                            ))
+                        }
+                    }
+                }),
+                move || cancellation.cancel(),
+            )
+        });
+    let handle = runtime.handle();
+    let worker = tokio::spawn(async move { runtime.run().await.map(|()| runtime) });
+    wait_for(&started, 2).await;
+    handle.send(Command::CancelLisp).unwrap();
+    release.notify_one();
+    wait_for(&started, 3).await;
+    handle.send(Command::Shutdown).unwrap();
+    let runtime = finish_runtime(worker).await;
+    let result = &runtime.world.state.agents[0]
+        .transcript
+        .last()
+        .unwrap()
+        .result;
+    assert_eq!(result, "effectdone");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn runtime_handle_still_cancels_actively_running_lisp() {
+    let directory = directory();
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut runtime = Runtime::with_starter(
+        World::default(),
+        ImageStore::new(&directory),
+        scripted(
+            started.clone(),
+            vec!["(letrec ((loop (lambda () (loop)))) (loop))"],
+        ),
+    );
+    let handle = runtime.handle();
+    let worker = tokio::spawn(async move { runtime.run().await.map(|()| runtime) });
+    wait_for(&started, 1).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    handle.send(Command::CancelLisp).unwrap();
+    wait_for(&started, 2).await;
+    handle.send(Command::Shutdown).unwrap();
+    let runtime = finish_runtime(worker).await;
+    assert_eq!(
+        runtime.world.state.agents[0]
+            .transcript
+            .last()
+            .unwrap()
+            .result,
+        "error: Lisp cancelled"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn child_cannot_reply_to_a_message_owned_by_its_parent() {
+    let directory = directory();
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut runtime = Runtime::with_starter(
+        World::default(),
+        ImageStore::new(&directory),
+        scripted(
+            started.clone(),
+            vec![
+                r#"(agent "child" "help")"#,
+                r#"(reply 0 "stolen")"#,
+                r#"(return "done")"#,
+            ],
+        ),
+    );
+    runtime
+        .command(Command::HumanMessage("root only".into()))
+        .unwrap();
+    let handle = runtime.handle();
+    let worker = tokio::spawn(async move { runtime.run().await.map(|()| runtime) });
+    wait_for(&started, 4).await;
+    handle.send(Command::Shutdown).unwrap();
+    let runtime = finish_runtime(worker).await;
+    let message = runtime.world.state.messages.values().next().unwrap();
+    assert!(!message.answered);
+    assert_eq!(
+        runtime.world.state.agents[0].inbox,
+        vec![persistent_lisp_harness::snowflake::value::MessageId(0)]
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }

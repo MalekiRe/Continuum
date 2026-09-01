@@ -1,9 +1,9 @@
 use persistent_lisp_harness::snowflake::effects;
 use persistent_lisp_harness::snowflake::image::{ImageError, ImageStore};
 use persistent_lisp_harness::snowflake::runtime::PAUSE;
-use persistent_lisp_harness::snowflake::value::{Capture, Chunk, ChunkId, Op, Value};
+use persistent_lisp_harness::snowflake::value::{Capture, Chunk, ChunkId, MessageId, Op, Value};
 use persistent_lisp_harness::snowflake::vm::{Task, TaskPoll};
-use persistent_lisp_harness::snowflake::world::{Agent, Binding, World};
+use persistent_lisp_harness::snowflake::world::{Agent, Binding, Message, World};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -175,6 +175,47 @@ fn images_validate_unreachable_bytecode_tails() {
         constants: vec![Value::Nil],
         code: vec![Op::Const(0), Op::Return, Op::GetCapture(0)],
     }));
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn images_require_exactly_one_owner_for_each_unanswered_message() {
+    let directory = directory();
+    let store = ImageStore::new(&directory);
+    let mut world = world();
+    world.state.messages.insert(
+        MessageId(0),
+        Message {
+            text: "pending".into(),
+            answered: false,
+        },
+    );
+    world.state.next_message = 1;
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    world.state.agents[0].inbox.push(MessageId(0));
+    world
+        .state
+        .agents
+        .push(Agent::new("child".into(), String::new()));
+    world.state.agents[1].inbox.push(MessageId(0));
+    assert!(matches!(
+        store.save(&world, None),
+        Err(ImageError::Invalid(_))
+    ));
+    world.state.agents[1].inbox.clear();
+    world
+        .state
+        .messages
+        .get_mut(&MessageId(0))
+        .unwrap()
+        .answered = true;
     assert!(matches!(
         store.save(&world, None),
         Err(ImageError::Invalid(_))

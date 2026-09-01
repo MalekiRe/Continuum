@@ -18,10 +18,6 @@ fn error(offset: usize, message: impl Into<String>) -> CompileError {
 
 enum ReadFrame {
     List(Vec<Value>),
-    Map {
-        entries: Vec<(Value, Value)>,
-        key: Option<Value>,
-    },
     Prefix(SymbolId),
 }
 
@@ -68,13 +64,7 @@ impl<'a> Reader<'a> {
                     None
                 }
                 '[' => return Err(error(start, "vectors are not supported")),
-                '{' => {
-                    self.frames.push(ReadFrame::Map {
-                        entries: Vec::new(),
-                        key: None,
-                    });
-                    None
-                }
+                '{' => return Err(error(start, "maps are not supported")),
                 ')' | ']' | '}' => self.finish(character)?,
                 '\'' => {
                     let quote = world.state.symbols.intern("quote");
@@ -131,12 +121,6 @@ impl<'a> Reader<'a> {
                 if let Ok(integer) = token.parse::<i64>() {
                     return Ok(Value::Int(integer));
                 }
-                if (token.contains('.') || token.contains('e') || token.contains('E'))
-                    && let Ok(float) = token.parse::<f64>()
-                    && float.is_finite()
-                {
-                    return Ok(Value::Float(float));
-                }
                 Ok(Value::Symbol(world.state.symbols.intern(token)))
             }
         }
@@ -148,14 +132,6 @@ impl<'a> Reader<'a> {
                 None => return Ok(Some(value)),
                 Some(ReadFrame::List(values)) => {
                     values.push(value);
-                    return Ok(None);
-                }
-                Some(ReadFrame::Map { entries, key }) => {
-                    if let Some(key) = key.take() {
-                        entries.push((key, value));
-                    } else {
-                        *key = Some(value);
-                    }
                     return Ok(None);
                 }
                 Some(ReadFrame::Prefix(_)) => {
@@ -177,13 +153,6 @@ impl<'a> Reader<'a> {
         };
         let value = match (closing, frame) {
             (')', ReadFrame::List(values)) => Value::List(values),
-            ('}', ReadFrame::Map { entries, key: None }) => Value::Map(entries),
-            ('}', ReadFrame::Map { key: Some(_), .. }) => {
-                return Err(error(
-                    self.offset - 1,
-                    "map requires an even number of forms",
-                ));
-            }
             (_, ReadFrame::Prefix(_)) => {
                 return Err(error(self.offset - 1, "prefix is missing its form"));
             }
@@ -278,7 +247,6 @@ impl Builder {
             Op::Pop | Op::JumpFalse(_) | Op::Return => (1, -1),
             Op::Jump(_) => (0, 0),
             Op::Call(count) | Op::TailCall(count) => (i32::from(*count) + 1, -i32::from(*count)),
-            Op::Map(count) => (i32::from(*count) * 2, 1 - i32::from(*count) * 2),
         };
         if self.stack < needed {
             return Err(error(0, "compiler stack underflow"));
@@ -376,15 +344,6 @@ impl Compiler<'_> {
                 } else {
                     Op::Call(count)
                 })
-            }
-            Value::Map(entries) => {
-                let count =
-                    u16::try_from(entries.len()).map_err(|_| error(0, "map is too large"))?;
-                for (key, value) in entries {
-                    self.expression(key, false)?;
-                    self.expression(value, false)?;
-                }
-                self.current().emit(Op::Map(count))
             }
             value => self.current().constant(value.clone()),
         }

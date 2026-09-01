@@ -246,7 +246,6 @@ impl World {
                     Op::Call(count) | Op::TailCall(count) => {
                         (i32::from(*count) + 1, -i32::from(*count))
                     }
-                    Op::Map(count) => (i32::from(*count) * 2, 1 - i32::from(*count) * 2),
                 };
                 if before < needed || matches!(op, Op::Return) && before != 1 {
                     return Err(format!("invalid stack depth at instruction {ip}"));

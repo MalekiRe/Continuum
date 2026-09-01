@@ -1,5 +1,5 @@
 use crate::snowflake::effects::{self, EffectError, EffectRequest, HostResult, TerminalEffect};
-use crate::snowflake::runtime::{CANCEL_LISP, PAUSE};
+use crate::snowflake::runtime::{CANCEL_LISP, LISP_ACTIVE, PAUSE};
 use crate::snowflake::value::{Capture, CellId, ChunkId, Value};
 use crate::snowflake::world::{Binding, Transaction, World};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -95,7 +95,7 @@ impl Task {
             if signal & PAUSE != 0 {
                 return TaskPoll::Paused;
             }
-            if signal != 0 {
+            if signal & !(CANCEL_LISP | PAUSE | LISP_ACTIVE) != 0 {
                 self.transaction.rollback(world);
                 return TaskPoll::Failed(VmError::Invalid("unknown task control bits".into()));
             }
@@ -379,17 +379,6 @@ impl Task {
             Op::Return => {
                 let value = self.pop()?;
                 return self.return_value(value);
-            }
-            Op::Map(count) => {
-                let total = count
-                    .checked_mul(2)
-                    .ok_or_else(|| VmError::Invalid("map operand count overflow".into()))?;
-                let values = self.take_operands(total)?;
-                let entries = values
-                    .chunks_exact(2)
-                    .map(|pair| (pair[0].clone(), pair[1].clone()))
-                    .collect();
-                self.stack.push(Value::Map(entries));
             }
         }
         self.check_stack(world)?;

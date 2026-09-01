@@ -113,19 +113,15 @@ pub fn call(
     arguments: Vec<Value>,
 ) -> Result<HostResult, EffectError> {
     let value = match host {
-        ADD => arithmetic_fold("+", &arguments, 0, i64::checked_add, |left, right| {
-            left + right
-        })?,
-        MULTIPLY => arithmetic_fold("*", &arguments, 1, i64::checked_mul, |left, right| {
-            left * right
-        })?,
+        ADD => arithmetic_fold("+", &arguments, 0, i64::checked_add)?,
+        MULTIPLY => arithmetic_fold("*", &arguments, 1, i64::checked_mul)?,
         SUBTRACT => numeric_subtract(&arguments)?,
         DIVIDE => numeric_divide(&arguments)?,
         EQUAL => {
             exact("=", &arguments, 2)?;
             Value::Bool(arguments[0] == arguments[1])
         }
-        LESS => compare("<", &arguments, |left, right| left < right)?,
+        LESS => compare("<", &arguments)?,
         LIST => Value::List(arguments),
         CONS => {
             exact("cons", &arguments, 2)?;
@@ -193,6 +189,16 @@ pub fn call(
                 u32::try_from(raw)
                     .map_err(|_| EffectError("reply message id is out of range".into()))?,
             );
+            if world
+                .state
+                .agents
+                .last()
+                .is_none_or(|agent| !agent.inbox.contains(&id))
+            {
+                return Err(EffectError(
+                    "reply message is not owned by this agent".into(),
+                ));
+            }
             let message = world
                 .state
                 .messages
@@ -228,11 +234,11 @@ fn exact(name: &str, arguments: &[Value], expected: usize) -> Result<(), EffectE
     }
 }
 
-fn number(name: &str, value: &Value) -> Result<(f64, bool), EffectError> {
-    match value {
-        Value::Int(value) => Ok((*value as f64, true)),
-        Value::Float(value) if value.is_finite() => Ok((*value, false)),
-        _ => Err(EffectError(format!("{name} expects finite numbers"))),
+fn integer(name: &str, value: &Value) -> Result<i64, EffectError> {
+    if let Value::Int(value) = value {
+        Ok(*value)
+    } else {
+        Err(EffectError(format!("{name} expects integers")))
     }
 }
 
@@ -240,103 +246,49 @@ fn arithmetic_fold(
     name: &str,
     arguments: &[Value],
     initial: i64,
-    integer_operation: impl Fn(i64, i64) -> Option<i64>,
-    float_operation: impl Fn(f64, f64) -> f64,
+    operation: impl Fn(i64, i64) -> Option<i64>,
 ) -> Result<Value, EffectError> {
-    let floating = arguments
+    arguments
         .iter()
-        .map(|argument| number(name, argument))
-        .collect::<Result<Vec<_>, _>>()?;
-    if floating.iter().any(|(_, integer)| !integer) {
-        let result = floating
-            .into_iter()
-            .fold(initial as f64, |result, (value, _)| {
-                float_operation(result, value)
-            });
-        return float_result(name, result);
-    }
-    let mut result = initial;
-    for argument in arguments {
-        let Value::Int(value) = argument else {
-            unreachable!("numbers were classified as integers")
-        };
-        result = integer_operation(result, *value)
-            .ok_or_else(|| EffectError(format!("{name} integer overflow")))?;
-    }
-    Ok(Value::Int(result))
+        .try_fold(initial, |result, argument| {
+            operation(result, integer(name, argument)?)
+                .ok_or_else(|| EffectError(format!("{name} integer overflow")))
+        })
+        .map(Value::Int)
 }
 
 fn numeric_subtract(arguments: &[Value]) -> Result<Value, EffectError> {
-    if arguments.is_empty() {
-        return Err(EffectError("- expects at least one argument".into()));
-    }
-    let floating = arguments
-        .iter()
-        .map(|argument| number("-", argument))
-        .collect::<Result<Vec<_>, _>>()?;
-    if floating.iter().any(|(_, integer)| !integer) {
-        let first = floating[0].0;
-        let result = if floating.len() == 1 {
-            -first
-        } else {
-            floating[1..]
-                .iter()
-                .fold(first, |result, (value, _)| result - value)
-        };
-        return float_result("-", result);
-    }
-    let Value::Int(first) = arguments[0] else {
-        unreachable!("numbers were classified as integers")
-    };
+    let mut values = arguments.iter();
+    let first = integer(
+        "-",
+        values
+            .next()
+            .ok_or_else(|| EffectError("- expects arguments".into()))?,
+    )?;
+    let overflow = || EffectError("- integer overflow".into());
     let result = if arguments.len() == 1 {
-        first.checked_neg()
+        first.checked_neg().ok_or_else(overflow)?
     } else {
-        arguments[1..].iter().try_fold(first, |result, argument| {
-            let Value::Int(value) = argument else {
-                unreachable!("numbers were classified as integers")
-            };
-            result.checked_sub(*value)
-        })
+        values.try_fold(first, |left, right| {
+            left.checked_sub(integer("-", right)?).ok_or_else(overflow)
+        })?
     };
-    result
-        .map(Value::Int)
-        .ok_or_else(|| EffectError("- integer overflow".into()))
+    Ok(Value::Int(result))
 }
 
 fn numeric_divide(arguments: &[Value]) -> Result<Value, EffectError> {
-    let mut values = arguments.iter();
-    let first = values
-        .next()
-        .ok_or_else(|| EffectError("/ expects arguments".into()))?;
-    let first = number("/", first)?.0;
-    let result = if arguments.len() == 1 {
-        1.0 / first
-    } else {
-        values.try_fold(first, |left, right| {
-            Ok::<_, EffectError>(left / number("/", right)?.0)
-        })?
-    };
-    float_result("/", result)
+    exact("/", arguments, 2)?;
+    integer("/", &arguments[0])?
+        .checked_div(integer("/", &arguments[1])?)
+        .map(Value::Int)
+        .ok_or_else(|| EffectError("invalid integer division".into()))
 }
 
-fn float_result(name: &str, result: f64) -> Result<Value, EffectError> {
-    if result.is_finite() {
-        Ok(Value::Float(result))
-    } else {
-        Err(EffectError(format!("{name} produced a non-finite number")))
-    }
-}
-
-fn compare(
-    name: &str,
-    arguments: &[Value],
-    comparison: impl Fn(f64, f64) -> bool,
-) -> Result<Value, EffectError> {
+fn compare(name: &str, arguments: &[Value]) -> Result<Value, EffectError> {
     exact(name, arguments, 2)?;
-    Ok(Value::Bool(comparison(
-        number(name, &arguments[0])?.0,
-        number(name, &arguments[1])?.0,
-    )))
+    Ok(Value::Bool(
+        integer(name, &arguments[0])? < integer(name, &arguments[1])?,
+    ))
 }
 
 fn expect_list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], EffectError> {
@@ -358,7 +310,6 @@ pub fn display(value: &Value) -> String {
         Value::Nil => "nil".into(),
         Value::Bool(value) => value.to_string(),
         Value::Int(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
         Value::String(value) => value.clone(),
         Value::List(values) => format!(
             "({})",
