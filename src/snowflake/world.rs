@@ -72,6 +72,10 @@ impl Transaction {
         world.state = self.committed;
     }
 
+    pub fn rollback(&mut self, world: &mut World) {
+        world.state = self.committed.clone();
+    }
+
     pub fn with_committed<R>(
         &mut self,
         world: &mut World,
