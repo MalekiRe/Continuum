@@ -80,6 +80,7 @@ pub struct Chunk {
     pub arity: u16,
     pub locals: u16,
     pub max_stack: u16,
+    pub boxed: Vec<u16>,
     pub captures: Vec<Capture>,
     pub constants: Vec<Value>,
     pub code: Vec<Op>,
@@ -93,15 +94,31 @@ pub struct Symbols {
 }
 
 impl Symbols {
-    pub fn intern(&mut self, _name: &str) -> SymbolId {
-        todo!("intern or return an existing symbol")
+    pub fn intern(&mut self, name: &str) -> SymbolId {
+        if let Some(symbol) = self.index.get(name) {
+            return *symbol;
+        }
+        let id = u32::try_from(self.names.len()).expect("symbol table exhausted");
+        let symbol = SymbolId(id);
+        self.names.push(name.to_owned());
+        self.index.insert(name.to_owned(), symbol);
+        symbol
     }
 
-    pub fn name(&self, _symbol: SymbolId) -> Option<&str> {
-        todo!("resolve a symbol without panicking")
+    pub fn name(&self, symbol: SymbolId) -> Option<&str> {
+        self.names
+            .get(usize::try_from(symbol.0).ok()?)
+            .map(String::as_str)
     }
 
     pub fn rebuild_index(&mut self) {
-        todo!("rebuild the skipped reverse index after image load")
+        self.index.clear();
+        self.index
+            .extend(self.names.iter().enumerate().map(|(id, name)| {
+                (
+                    name.clone(),
+                    SymbolId(u32::try_from(id).expect("symbol table exhausted")),
+                )
+            }));
     }
 }
